@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rogue Radar Flasher</title>
+
+  <!-- ESP Web Tools -->
+  <script
+    type="module"
+    src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module">
+  </script>
+
+  <style>
+    :root {
+      --bg: #060608;
+      --bg2: #0d0912;
+      --panel: rgba(20, 14, 28, 0.82);
+      --panel-2: rgba(28, 18, 38, 0.88);
+      --border: rgba(255, 110, 220, 0.28);
+      --border-strong: rgba(255, 110, 220, 0.52);
+      --text: #f8ecff;
+      --muted: #c7afcf;
+      --pink: #ff48c8;
+      --pink-soft: #ff82df;
+      --violet: #9d4dff;
+      --violet-soft: #c59cff;
+      --shadow: 0 0 30px rgba(255, 72, 200, 0.15), 0 0 60px rgba(157, 77, 255, 0.1);
+      --radius: 18px;
+      --screen-radius: 14px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Inter, Arial, Helvetica, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(255, 72, 200, 0.12), transparent 26%),
+        radial-gradient(circle at top right, rgba(157, 77, 255, 0.14), transparent 24%),
+        linear-gradient(180deg, var(--bg2), var(--bg));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 28px 16px;
+    }
+
+    .page {
+      width: 100%;
+      max-width: 1200px;
+      display: grid;
+      gap: 26px;
+      justify-items: center;
+    }
+
+    .screen-ui.booting {
+      animation: screenBoot 1000ms ease-out 1;
+    }
+
+    .screen-ui.booting::after {
+      animation: scanSweep 1000ms ease-out 1;
+    }
+
+    .hero {
+      text-align: center;
+      max-width: 760px;
+    }
+
+    .hero h1 {
+      position: relative;
+      margin: 0 0 10px;
+      font-size: clamp(2rem, 4vw, 3.25rem);
+      letter-spacing: 0.02em;
+      color: #f8ecff;
+      text-shadow:
+        0 0 8px rgba(255, 72, 200, 0.35),
+        0 0 18px rgba(157, 77, 255, 0.28);
+    }
+
+    .hero h1::after {
+      content: "";
+      display: block;
+      width: 640px;
+      height: 3px;
+      margin: 12px auto 0;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #ff48c8, #9d4dff, #ff82df);
+      box-shadow: 0 0 10px rgba(255, 72, 200, 0.4);
+      animation: pulseLine 2.4s ease-in-out infinite;
+    }
+
+    @keyframes pulseLine {
+      0%,
+      100% {
+        opacity: 0.55;
+        transform: scaleX(0.92);
+      }
+      50% {
+        opacity: 1;
+        transform: scaleX(1.08);
+      }
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.55;
+    }
+
+    .hero-status {
+      margin: 14px auto 0;
+      width: min(100%, 420px);
+      border: 2px solid rgba(255, 110, 220, 0.16);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: rgba(255, 255, 255, 0.03);
+      box-shadow: 0 0 24px rgba(255, 72, 200, 0.08);
+      text-align: center;
+      font-weight: 400;
+    }
+
+    .device-wrap {
+      position: relative;
+      width: min(100%, 1040px);
+      filter: drop-shadow(0 20px 40px rgba(0, 0, 0, 0.48));
+    }
+
+    .device-img {
+      display: block;
+      width: 100%;
+      height: auto;
+      user-select: none;
+      pointer-events: none;
+    }
+
+    .screen-ui {
+      position: absolute;
+      left: 23.2%;
+      top: 22%;
+      width: 38.6%;
+      height: 56.8%;
+      border-radius: var(--screen-radius);
+      background: linear-gradient(180deg, rgba(20, 12, 28, 0.82), rgba(11, 9, 16, 0.92));
+      border: 1px solid rgba(255, 110, 220, 0.2);
+      box-shadow:
+        inset 0 0 18px rgba(255, 72, 200, 0.08),
+        inset 0 0 28px rgba(157, 77, 255, 0.08),
+        0 0 18px rgba(255, 72, 200, 0.08);
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      padding: 4.5% 5.5%;
+      overflow: hidden;
+      backdrop-filter: blur(3px);
+    }
+
+    .screen-ui::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 35%);
+      pointer-events: none;
+    }
+
+    .screen-ui::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(
+        180deg,
+        transparent 0%,
+        rgba(255, 255, 255, 0.12) 48%,
+        rgba(255, 255, 255, 0.02) 52%,
+        transparent 100%
+      );
+      transform: translateY(-120%);
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    @keyframes screenBoot {
+      0% {
+        opacity: 0.2;
+        filter: brightness(0.35) blur(1px);
+        transform: scale(0.985);
+      }
+      20% {
+        opacity: 0.45;
+        filter: brightness(1.4) blur(0.4px);
+      }
+      35% {
+        opacity: 0.28;
+        filter: brightness(0.6);
+      }
+      55% {
+        opacity: 0.85;
+        filter: brightness(1.25);
+      }
+      100% {
+        opacity: 1;
+        filter: brightness(1);
+        transform: scale(1);
+      }
+    }
+
+    @keyframes scanSweep {
+      0% {
+        transform: translateY(-120%);
+        opacity: 0;
+      }
+      20% {
+        opacity: 0.55;
+      }
+      100% {
+        transform: translateY(120%);
+        opacity: 0;
+      }
+    }
+
+    .screen-header,
+    .screen-body {
+      position: relative;
+      z-index: 1;
+      top: 0;
+    }
+
+    .screen-header {
+      margin-bottom: 10px;
+    }
+
+    .screen-title {
+      margin: 0;
+      font-size: clamp(0.72rem, 1.45vw, 1.15rem);
+      font-weight: 700;
+      line-height: 1.1;
+    }
+
+    .screen-subtitle {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: clamp(0.45rem, 0.95vw, 0.74rem);
+      line-height: 1.35;
+    }
+
+    .screen-body {
+      display: grid;
+      gap: 8px;
+      margin-top: 0;
+    }
+
+    .field-label {
+      font-size: clamp(0.42rem, 0.9vw, 0.68rem);
+      color: var(--pink-soft);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 3px;
+    }
+
+    .firmware-select,
+    .action-btn {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      min-height: 36px;
+      font-size: clamp(0.52rem, 1vw, 0.82rem);
+      box-shadow: var(--shadow);
+    }
+
+    .firmware-select {
+      padding: 0 12px;
+      outline: none;
+      appearance: none;
+      background-image:
+        linear-gradient(45deg, transparent 50%, var(--pink-soft) 50%),
+        linear-gradient(135deg, var(--pink-soft) 50%, transparent 50%),
+        linear-gradient(180deg, rgba(255, 72, 200, 0.08), rgba(157, 77, 255, 0.08));
+      background-position:
+        calc(100% - 16px) calc(50% - 3px),
+        calc(100% - 10px) calc(50% - 3px),
+        0 0;
+      background-size: 6px 6px, 6px 6px, 100% 100%;
+      background-repeat: no-repeat;
+      padding-right: 34px;
+    }
+
+    .action-btn {
+      cursor: pointer;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      transition:
+        transform 0.15s ease,
+        border-color 0.15s ease,
+        box-shadow 0.15s ease,
+        opacity 0.15s ease;
+    }
+
+    .action-btn:hover:not(:disabled) {
+      transform: translateY(-1px);
+      border-color: var(--border-strong);
+      box-shadow:
+        0 0 18px rgba(255, 72, 200, 0.18),
+        0 0 28px rgba(157, 77, 255, 0.12);
+    }
+
+    .action-btn.primary {
+      background: linear-gradient(135deg, rgba(255, 72, 200, 0.22), rgba(157, 77, 255, 0.24));
+    }
+
+    .action-btn.secondary {
+      background: linear-gradient(135deg, rgba(255, 255, 255, 0.04), rgba(255, 72, 200, 0.08));
+    }
+
+    .action-btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .status-label {
+      font-size: clamp(0.42rem, 0.88vw, 0.96rem);
+      letter-spacing: 0.12em;
+      color: var(--violet-soft);
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .status-text {
+      font-size: clamp(0.72rem, 1.05vw, 0.9rem);
+      color: var(--text);
+      line-height: 1.35;
+    }
+
+    .footer-note {
+      width: min(100%, 820px);
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 110, 220, 0.12);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+      color: var(--muted);
+      line-height: 1.5;
+      box-shadow: 0 0 24px rgba(255, 72, 200, 0.06);
+    }
+
+    .footer-note strong {
+      color: var(--text);
+    }
+
+    .hidden-install {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+    }
+
+    @media (max-width: 900px) {
+      .device-wrap {
+        width: min(100%, 920px);
+      }
+
+      .screen-ui {
+        padding: 4.2% 5.2%;
+      }
+    }
+
+    @media (max-width: 640px) {
+      body {
+        padding: 18px 10px 28px;
+      }
+
+      .device-wrap {
+        width: min(100%, 760px);
+      }
+
+      .screen-ui {
+        padding: 4% 5%;
+      }
+
+      .screen-title {
+        font-size: clamp(0.68rem, 2vw, 0.95rem);
+      }
+
+      .screen-subtitle {
+        font-size: clamp(0.42rem, 1.2vw, 0.62rem);
+      }
+
+      .field-label {
+        font-size: clamp(0.4rem, 1.1vw, 0.58rem);
+      }
+
+      .action-btn,
+      .firmware-select {
+        min-height: 30px;
+        border-radius: 10px;
+        font-size: clamp(0.48rem, 1.35vw, 0.7rem);
+      }
+
+      .hero-status {
+        width: min(100%, 360px);
+        padding: 9px 10px;
+      }
+
+      .status-label {
+        font-size: clamp(0.55rem, 2vw, 0.8rem);
+      }
+
+      .status-text {
+        font-size: clamp(0.68rem, 2.2vw, 0.84rem);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <h1>Rogue Radar Flasher</h1>
+      <p>
+        Browser-based firmware installer built for the T-Embed. This tool is to flash Rogue Radar.
+      </p>
+
+      <div class="hero-status">
+        <div class="status-label">Status</div>
+        <div class="status-text" id="statusText">Waiting for user...</div>
+      </div>
+    </section>
+
+    <section class="device-wrap" aria-label="Mock LilyGO T-Embed firmware flasher">
+      <img class="device-img" src="Images/lilygo-t-embed.png" alt="LilyGO T-Embed device" />
+
+      <div class="screen-ui">
+        <div class="screen-header">
+          <h2 class="screen-title">Rogue Radar Firmware</h2>
+          <p class="screen-subtitle">Built for the LilyGO T-Embed.</p>
+        </div>
+
+        <div class="screen-body">
+          <div>
+            <div class="field-label">Firmware</div>
+            <select class="firmware-select" id="firmwareSelect" aria-label="Firmware version selector">
+              <option value="">Choose firmware</option>
+              <option value="rogue-radar-v1.0.0">Stable v1.0.0</option>
+            </select>
+          </div>
+
+          <button class="action-btn secondary" id="connectBtn" type="button" disabled>
+            Connect
+          </button>
+
+          <esp-web-install-button class="hidden-install" id="installButton"></esp-web-install-button>
+        </div>
+      </div>
+    </section>
+
+    <section class="footer-note">
+      <strong>Instructions:</strong> Use the dropdown to choose firmware. Then use connect to choose the port your T-Embed is plugged into.
+    </section>
+  </main>
+
+  <script>
+    const firmwareSelect = document.getElementById("firmwareSelect");
+    const connectBtn = document.getElementById("connectBtn");
+    const installButton = document.getElementById("installButton");
+    const statusText = document.getElementById("statusText");
+
+    let selectedPort = null;
+    let readyToFlash = false;
+
+    firmwareSelect.addEventListener("change", (event) => {
+      const value = event.target.value;
+
+      selectedPort = null;
+      readyToFlash = false;
+
+      if (!value) {
+        installButton.manifest = "";
+        connectBtn.disabled = true;
+        connectBtn.textContent = "Connect";
+        connectBtn.classList.remove("primary");
+        connectBtn.classList.add("secondary");
+        statusText.textContent = "Choose a firmware to begin.";
+        return;
+      }
+
+      installButton.manifest = `web/manifest_${value}.json`;
+      connectBtn.disabled = false;
+      connectBtn.textContent = "Connect";
+      connectBtn.classList.remove("primary");
+      connectBtn.classList.add("secondary");
+      statusText.textContent = "Firmware selected. Press Connect.";
+    });
+
+    connectBtn.addEventListener("click", async () => {
+      if (!firmwareSelect.value) {
+        statusText.textContent = "Please choose a firmware first.";
+        return;
+      }
+
+      if (!("serial" in navigator)) {
+        statusText.textContent = "Web Serial is not supported in this browser.";
+        return;
+      }
+
+      if (!readyToFlash) {
+        try {
+          statusText.textContent = "Waiting for port selection...";
+          selectedPort = await navigator.serial.requestPort();
+
+          if (!selectedPort) {
+            statusText.textContent = "No port selected.";
+            return;
+          }
+
+          readyToFlash = true;
+          connectBtn.textContent = "Flash Now";
+          connectBtn.classList.remove("secondary");
+          connectBtn.classList.add("primary");
+          statusText.textContent = "Port selected. Press Flash Now.";
+        } catch (error) {
+          if (error && error.name === "NotFoundError") {
+            statusText.textContent = "Port selection canceled.";
+          } else {
+            statusText.textContent = "Could not open port picker.";
+            console.error(error);
+          }
+        }
+        return;
+      }
+
+      try {
+        statusText.textContent = "Launching ESP Web Tools flasher...";
+        installButton.click();
+      } catch (error) {
+        statusText.textContent = "Could not launch flasher.";
+        console.error(error);
+      }
+    });
+
+    window.addEventListener("load", () => {
+      const screen = document.querySelector(".screen-ui");
+      screen.classList.add("booting");
+
+      setTimeout(() => {
+        screen.classList.remove("booting");
+      }, 1000);
+    });
+  </script>
+</body>
+</html>
