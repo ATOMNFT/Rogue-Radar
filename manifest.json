@@ -1,0 +1,6 @@
+{
+  "name": "Rogue Radar",
+  "version": "1.0.0",
+  "description": "Rogue Radar is a handheld ESP32-S3 firmware built for the LilyGO T-Embed that combines multiple wireless and utility tools into one rotary-driven interface.",
+  "icon": "Images/tembed-icon.png"
+}
