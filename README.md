@@ -195,7 +195,14 @@ The APA102 LEDs are also used for menu color feedback and scan animations.
 
 ---
 
-## Installation
+## Web Flash Tool
+
+<a href="https://atomnft.github.io/Rogue-Radar/flash0.html" target="_blank" rel="noopener noreferrer">
+  <img src="Images/flash-button.png" alt="Flash-Tool" width="200" height="140">
+</a>
+
+
+## Arduino Installation
 
 __METHOD 1__
 1. Open the sketch in **Arduino IDE**.
