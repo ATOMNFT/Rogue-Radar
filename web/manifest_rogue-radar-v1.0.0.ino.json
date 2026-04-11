@@ -2,7 +2,7 @@
   "name": "rogue-radar-v1.0.0",
   "builds": [
     {
-      "chipFamily": "ESP32",
+      "chipFamily": "ESP32-S3",
       "improv": false,
       "parts": [
         { "path": "rogue-radar-v1.0.0.ino.bootloader.bin", "offset": 4096 },
