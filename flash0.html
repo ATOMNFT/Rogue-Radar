@@ -351,14 +351,14 @@
       color: var(--text);
     }
 
-    .hidden-install {
-      position: absolute;
-      opacity: 0;
-      pointer-events: none;
-      width: 1px;
-      height: 1px;
-      overflow: hidden;
-    }
+	#installButton {
+	  display: block;
+	  width: 100%;
+	}
+
+	#installButton:not([active]) {
+	  width: 100%;
+	}
 
     @media (max-width: 900px) {
       .device-wrap {
@@ -453,7 +453,11 @@
             Connect
           </button>
 
-          <esp-web-install-button class="hidden-install" id="installButton"></esp-web-install-button>
+          <esp-web-install-button id="installButton" manifest="">
+			  <button class="action-btn primary" id="flashBtn" slot="activate" type="button" hidden>
+				Flash Now
+			  </button>
+			</esp-web-install-button>
         </div>
       </div>
     </section>
@@ -463,93 +467,86 @@
     </section>
   </main>
 
-  <script>
-    const firmwareSelect = document.getElementById("firmwareSelect");
-    const connectBtn = document.getElementById("connectBtn");
-    const installButton = document.getElementById("installButton");
-    const statusText = document.getElementById("statusText");
+	<script>
+	  const firmwareSelect = document.getElementById("firmwareSelect");
+	  const connectBtn = document.getElementById("connectBtn");
+	  const installButton = document.getElementById("installButton");
+	  const flashBtn = document.getElementById("flashBtn");
+	  const statusText = document.getElementById("statusText");
 
-    let selectedPort = null;
-    let readyToFlash = false;
+	  let selectedPort = null;
+	  let readyToFlash = false;
 
-    firmwareSelect.addEventListener("change", (event) => {
-      const value = event.target.value;
+	  firmwareSelect.addEventListener("change", (event) => {
+		const value = event.target.value;
 
-      selectedPort = null;
-      readyToFlash = false;
+		selectedPort = null;
+		readyToFlash = false;
 
-      if (!value) {
-        installButton.manifest = "";
-        connectBtn.disabled = true;
-        connectBtn.textContent = "Connect";
-        connectBtn.classList.remove("primary");
-        connectBtn.classList.add("secondary");
-        statusText.textContent = "Choose a firmware to begin.";
-        return;
-      }
+		if (!value) {
+		  installButton.manifest = "";
+		  connectBtn.disabled = true;
+		  connectBtn.hidden = false;
+		  connectBtn.textContent = "Connect";
+		  connectBtn.classList.remove("primary");
+		  connectBtn.classList.add("secondary");
+		  flashBtn.hidden = true;
+		  statusText.textContent = "Choose a firmware to begin.";
+		  return;
+		}
 
-      installButton.manifest = `web/manifest_${value}.json`;
-      connectBtn.disabled = false;
-      connectBtn.textContent = "Connect";
-      connectBtn.classList.remove("primary");
-      connectBtn.classList.add("secondary");
-      statusText.textContent = "Firmware selected. Press Connect.";
-    });
+		installButton.manifest = `web/manifest_${value}.json`;
+		connectBtn.disabled = false;
+		connectBtn.hidden = false;
+		connectBtn.textContent = "Connect";
+		connectBtn.classList.remove("primary");
+		connectBtn.classList.add("secondary");
+		flashBtn.hidden = true;
+		statusText.textContent = "Firmware selected. Press Connect.";
+	  });
 
-    connectBtn.addEventListener("click", async () => {
-      if (!firmwareSelect.value) {
-        statusText.textContent = "Please choose a firmware first.";
-        return;
-      }
+	  connectBtn.addEventListener("click", async () => {
+		if (!firmwareSelect.value) {
+		  statusText.textContent = "Please choose a firmware first.";
+		  return;
+		}
 
-      if (!("serial" in navigator)) {
-        statusText.textContent = "Web Serial is not supported in this browser.";
-        return;
-      }
+		if (!("serial" in navigator)) {
+		  statusText.textContent = "Web Serial is not supported in this browser.";
+		  return;
+		}
 
-      if (!readyToFlash) {
-        try {
-          statusText.textContent = "Waiting for port selection...";
-          selectedPort = await navigator.serial.requestPort();
+		try {
+		  statusText.textContent = "Waiting for port selection...";
+		  selectedPort = await navigator.serial.requestPort();
 
-          if (!selectedPort) {
-            statusText.textContent = "No port selected.";
-            return;
-          }
+		  if (!selectedPort) {
+			statusText.textContent = "No port selected.";
+			return;
+		  }
 
-          readyToFlash = true;
-          connectBtn.textContent = "Flash Now";
-          connectBtn.classList.remove("secondary");
-          connectBtn.classList.add("primary");
-          statusText.textContent = "Port selected. Press Flash Now.";
-        } catch (error) {
-          if (error && error.name === "NotFoundError") {
-            statusText.textContent = "Port selection canceled.";
-          } else {
-            statusText.textContent = "Could not open port picker.";
-            console.error(error);
-          }
-        }
-        return;
-      }
+		  readyToFlash = true;
+		  connectBtn.hidden = true;
+		  flashBtn.hidden = false;
+		  statusText.textContent = "Port selected. Press Flash Now.";
+		} catch (error) {
+		  if (error && error.name === "NotFoundError") {
+			statusText.textContent = "Port selection canceled.";
+		  } else {
+			statusText.textContent = "Could not open port picker.";
+			console.error(error);
+		  }
+		}
+	  });
 
-      try {
-        statusText.textContent = "Launching ESP Web Tools flasher...";
-        installButton.click();
-      } catch (error) {
-        statusText.textContent = "Could not launch flasher.";
-        console.error(error);
-      }
-    });
+	  window.addEventListener("load", () => {
+		const screen = document.querySelector(".screen-ui");
+		screen.classList.add("booting");
 
-    window.addEventListener("load", () => {
-      const screen = document.querySelector(".screen-ui");
-      screen.classList.add("booting");
-
-      setTimeout(() => {
-        screen.classList.remove("booting");
-      }, 1000);
-    });
-  </script>
+		setTimeout(() => {
+		  screen.classList.remove("booting");
+		}, 1000);
+	  });
+	</script>
 </body>
 </html>
