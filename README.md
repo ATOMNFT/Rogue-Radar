@@ -211,9 +211,7 @@ __METHOD 2__ <br>
 
 ## Web Flash Tool
 
-<a href="https://atomnft.github.io/Rogue-Radar/flash0.html" target="_blank" rel="noopener noreferrer">
-  <img src="Images/flash-button.png" alt="Flash-Tool" width="450" height="200">
-</a>
+COMING SOON
 
 ---
 
