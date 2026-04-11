@@ -9,12 +9,6 @@
         { "path": "rogue-radar-v1.0.0.ino.partitions.bin", "offset": 32768 },
         { "path": "rogue-radar-v1.0.0.ino.bin", "offset": 65536 }
       ]
-    },
-    {
-      "chipFamily": "ESP8266",
-      "parts": [
-        { "path": "esp8266.bin", "offset": 0 }
-      ]
     }
   ]
 }
