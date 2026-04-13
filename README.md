@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">Rogue Radar</h1>
-<p align="center"><strong>ESP32-S3 multi-tool firmware for WiFi, BLE, GPS, and device utilities on the LilyGO T-Embed.</strong></p>
+<p align="center"><strong>ESP32-S3 multi-tool firmware for WiFi, BLE, GPS, and device utilities on the LilyGO T-Embed (non CC1101).</strong></p>
 
 ## 🧭 Version Tracker
 
