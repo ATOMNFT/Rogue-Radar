@@ -3,7 +3,8 @@
 </p>
 
 <h1 align="center">Rogue Radar</h1>
-<p align="center"><strong>ESP32-S3 multi-tool firmware for WiFi, BLE, GPS, and device utilities on the LilyGO T-Embed.</strong></p>
+<p align="center"><strong>ESP32 multi-tool firmware for WiFi, BLE, GPS, and device utilities.</strong></p>
+<p align="center">Supports: LilyGO T-Embed ESP32-S3 | CYD-2USB | NM-CYD-C5 (ESP32-C5)</p>
 
 ## 🧭 Version Tracker
 
@@ -67,30 +68,67 @@ It is designed around fast menu navigation, onboard scanning tools, live signal 
 
 ## Hardware Target
 
-This firmware is currently built around the **LilyGO T-Embed ESP32-S3**.
+This firmware supports multiple ESP32-based development boards:
 
-### Main hardware used
-- **ESP32-S3**
+### Supported Boards
+
+| Board | MCU | Display | Input | LED | GPS |
+|-------|-----|---------|-------|-----|-----|
+| **LilyGO T-Embed** | ESP32-S3 | 320x170 | Rotary Encoder | 7x APA102 | Built-in |
+| **CYD-2USB** | ESP32 | 320x240 | BOOT Button | None | None |
+| **NM-CYD-C5** | **ESP32-C5** (RISC-V) | 320x240 | BOOT Button | None | None |
+
+### LilyGO T-Embed (Original)
+- **ESP32-S3** (Xtensa LX7, Wi-Fi 4)
 - **ST7789 320x170 display**
 - **Rotary encoder + encoder push button**
 - **APA102 LED ring**
 - **GPS module over UART**
 - **MicroSD card on dedicated HSPI bus**
 
+### CYD-2USB / NM-CYD-C5
+- **ESP32** or **ESP32-C5** (RISC-V, Wi-Fi 6)
+- **ST7789 320x240 display**
+- **BOOT button (GPIO0)** for selection
+- **1x WS2812 RGB LED**
+- **MicroSD card on VSPI bus**
+- **GPS** (external module support, configurable)
+
+**Note**: See `rogue-radar/DEVICE_SUPPORT.md` for detailed configuration and wiring information.
+
 ---
 
 ## Arduino IDE Setup
 
-### Board settings
+### Device Selection
+Edit `rogue-radar/config.h` and select your device:
+```cpp
+// #define DEVICE_T_EMBED_S3    // LilyGO T-Embed ESP32-S3
+// #define DEVICE_CYD_2USB      // CYD-2USB ESP32
+#define DEVICE_NM_CYD_C5     // NM-CYD-C5 ESP32-C5 (RISC-V)
+```
+
+### Board Settings
+
+**LilyGO T-Embed:**
 - **Board:** `ESP32S3 Dev Module`
+- **Partition Scheme:** `Huge APP`
+
+**CYD-2USB:**
+- **Board:** `ESP32 Dev Module`
+- **Partition Scheme:** `Huge APP`
+
+**NM-CYD-C5:**
+- **Board:** `ESP32C5 Dev Module` (requires ESP32 Core >= 3.0.0)
 - **Partition Scheme:** `Huge APP`
 
 ### Required libraries
 - `TFT_eSPI`
 - `lvgl` (the sketch notes target **9.0.0**)
-- `RotaryEncoder` by mathertel
-- `APA102` by Pololu
-- `TinyGPSPlus`
+- `RotaryEncoder` by mathertel (T-Embed only)
+- `APA102` by Pololu (T-Embed only)
+- `Adafruit_NeoPixel` (CYD/C5 only - for WS2812 LED)
+- `TinyGPSPlus` (T-Embed only, optional for CYD/C5)
 
 ### ESP32 core features used
 - `WiFi`
@@ -118,8 +156,13 @@ Make sure your `lv_conf.h` has these enabled:
 
 ## TFT / Display Notes
 
-The firmware is written for a **320x170** layout and uses **TFT_eSPI**.
-You will need a correct `User_Setup.h` for your T-Embed display configuration.
+The firmware supports both **320x170** (T-Embed) and **320x240** (CYD) layouts using **TFT_eSPI**.
+
+You will need a correct `User_Setup.h` for your display configuration:
+- **T-Embed**: 320x170, specific SPI pins
+- **CYD-2USB/NM-CYD-C5**: 320x240, standard CYD SPI pins
+
+See `rogue-radar/DEVICE_SUPPORT.md` for detailed TFT_eSPI configuration.
 
 The sketch also includes a splash screen system using:
 - `splash.h`
@@ -128,6 +171,8 @@ The sketch also includes a splash screen system using:
 ---
 
 ## Pin Overview
+
+### LilyGO T-Embed
 
 <details>
 <summary><strong>GPS</strong></summary>
@@ -163,6 +208,84 @@ The sketch also includes a splash screen system using:
 
 - `APA102_DI  42`
 - `APA102_CLK 45`
+
+</details>
+
+### CYD-2USB
+
+<details>
+<summary><strong>Display (SPI)</strong></summary>
+
+- `TFT_SCLK  14`
+- `TFT_MOSI  13`
+- `TFT_MISO  12`
+- `TFT_CS    15`
+- `TFT_DC     2`
+- `TFT_BL    21` (CYD-2USB)
+
+</details>
+
+<details>
+<summary><strong>GPS</strong></summary>
+
+- `GPS_RX_PIN 3`
+- `GPS_TX_PIN 1`
+
+</details>
+
+<details>
+<summary><strong>SD Card (VSPI)</strong></summary>
+
+- `SD_CS    5`
+- `SD_SCLK  18`
+- `SD_MISO  19`
+- `SD_MOSI  23`
+
+</details>
+
+
+<details>
+<summary><strong>Input</strong></summary>
+
+- `BOOT_BTN 0` (used as select button)
+
+</details>
+
+### NM-CYD-C5
+
+<details>
+<summary><strong>Display (SPI)</strong></summary>
+
+- `TFT_SCLK  6`
+- `TFT_MOSI  7`
+- `TFT_MISO  2`
+- `TFT_CS    23`
+- `TFT_DC    24`
+- `TFT_BL    25`
+</details>
+
+<details>
+<summary><strong>GPS</strong></summary>
+
+- `GPS_RX_PIN 4`
+- `GPS_TX_PIN 5`
+
+</details>
+
+<details>
+<summary><strong>SD Card (VSPI)</strong></summary>
+
+- `SD_CS    10`
+- `SD_SCLK  6`
+- `SD_MISO  2`
+- `SD_MOSI  7`
+
+</details>
+
+<details>
+<summary><strong>Input</strong></summary>
+
+- `BOOT_BTN 0` (used as select button)
 
 </details>
 
@@ -237,4 +360,9 @@ This project is intended for educational, research, and defensive awareness purp
 
 ## Credits
 
+---
 
+## TODOs
+
+- [ ] NM-CYD-C5 support high WiFi Channel.
+- [ ] More detail Testing.

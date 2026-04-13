@@ -19,7 +19,7 @@
 //  - APA102 status LED support
 //
 //  Hardware Target:
-//  - LilyGO T-Embed ESP32-S3
+//  - LilyGO T-Embed ESP32-S3 / CYD-2USB / NM-CYD-C5
 //
 //  Arduino IDE Settings:
 //  - Board: ESP32S3 Dev Module
@@ -48,10 +48,16 @@
 #include "config.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <esp_mac.h>
+#include <esp_system.h>
+#include <esp_chip_info.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
 #include <RotaryEncoder.h>
 #include <APA102.h>
+#if HAS_WS2812_LED
+    #include <Adafruit_NeoPixel.h>
+#endif
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
@@ -59,13 +65,45 @@
 #include <SPI.h>
 #include <SD.h>
 #include <Update.h>
-#include "splash.h"
+// Optional: CYD 320x240 splash screen
+#ifdef DEVICE_T_EMBED_S3
+    #include "splash.h"
+#elif defined(DEVICE_CYD_2USB) || defined(DEVICE_NM_CYD_C5)
+    #include "splash_cyd.h"
+#endif
+
+#if HAS_CYD_TOUCH
+    #include <TFT_Touch.h>
+#endif
 
 
-static SPIClass sdSPI(HSPI);
+// ─── SPI Bus for SD Card ────────────────────────────────────────
+#if defined(DEVICE_NM_CYD_C5)  
+    static SPIClass sdSPI(SPI); // ESP32-C5 shares SPI bus for TFT and SD
+#else
+    static SPIClass sdSPI(HSPI);
+#endif
 
-static HardwareSerial gpsSerial(1);   // UART1 — free since BLE uses its own stack
-static TinyGPSPlus    gps;
+// ─── GPS Serial ─────────────────────────────────────────────────
+#if HAS_GPS
+    #if !CONFIG_IDF_TARGET_ESP32C5
+        HardwareSerial Serial2(GPS_SERIAL_INDEX);   // UART1 for S3, UART2 for CYD / NM-CYD-C5
+    #endif
+#endif
+
+#if HAS_GPS
+    static TinyGPSPlus gps;
+#endif
+
+// ─── GPS Detection ──────────────────────────────────────────────
+// Returns true if GPS is configured (pins are set) and should work
+static inline bool gpsIsConfigured() {
+    #if HAS_GPS
+        return (GPS_RX_PIN >= 0) && (GPS_TX_PIN >= 0);
+    #else
+        return false;
+    #endif
+}
 static const unsigned long SPLASH_TIME_MS = SPLASH_DURATION_MS;
 
 TFT_eSPI tft = TFT_eSPI();
@@ -76,12 +114,26 @@ static lv_color_t lvBuf2[SCREEN_W * LV_BUF_LINES];
 static lv_display_t *lvDisp  = nullptr;
 static lv_indev_t   *lvIndev = nullptr;
 
-// ─── Rotary Encoder ─────────────────────────────────────────────
-RotaryEncoder encoder(ENCODER_A, ENCODER_B, RotaryEncoder::LatchMode::TWO03);
+// ─── Rotary Encoder (Conditional) ───────────────────────────────
+#if HAS_ENCODER
+    RotaryEncoder encoder(ENCODER_A, ENCODER_B, RotaryEncoder::LatchMode::TWO03);
+#endif
 
-// ─── APA102 LEDs ────────────────────────────────────────────────
-APA102<APA102_DI, APA102_CLK> ledStrip;
-rgb_color ledBuf[NUM_LEDS];
+// ─── APA102 LEDs (Conditional) ──────────────────────────────────
+#if HAS_APA102_LED
+    APA102<APA102_DI, APA102_CLK> ledStrip;
+    rgb_color ledBuf[NUM_LEDS];
+#endif
+
+// ─── WS2812 LEDs (Conditional) ──────────────────────────────────
+#if HAS_WS2812_LED
+    Adafruit_NeoPixel ws2812Strip(NUM_LEDS, WS2812_PIN, NEO_GRB + NEO_KHZ800);
+#endif
+
+// ─── Touch Screen (Conditional) ─────────────────────────────────
+#if HAS_CYD_TOUCH
+    TFT_Touch ts = TFT_Touch(XPT2046_CS, XPT2046_CLK, XPT2046_MOSI, XPT2046_MISO);
+#endif
 
 struct MenuLED { uint8_t r, g, b; };
 const MenuLED MENU_COLORS[4] = {
@@ -250,15 +302,8 @@ static volatile bool    flockPendingReady = false;
 // ════════════════════════════════════════════════════════════════
 
 
-// Device type flags for scanner result colouring / filtering
-enum BLEDeviceType {
-    BLE_GENERIC  = 0,
-    BLE_AIRTAG   = 1,
-    BLE_FLIPPER  = 2,
-    BLE_APPLE    = 3,    // Apple but not an AirTag
-    BLE_SKIMMER  = 4,    // HC-03/HC-05/HC-06 skimmer module
-    BLE_META     = 5     // Meta/RayBan smart glasses
-};
+// Device type flags — defined in config.h so Arduino-generated
+// function prototypes can see the type before use.
 
 struct BLEEntry {
     char          name[33];    // advertised local name (or "<unknown>")
@@ -327,14 +372,59 @@ static void lvgl_flush_cb(lv_display_t *disp,
 
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
-    encoder.tick();
-    int pos = encoder.getPosition();
-    data->enc_diff = (int16_t)pos;
-    if (pos != 0) encoder.setPosition(0);
-    data->state = (digitalRead(ENCODER_BTN) == LOW)
-                  ? LV_INDEV_STATE_PRESSED
-                  : LV_INDEV_STATE_RELEASED;
+    #if HAS_ENCODER
+        encoder.tick();
+        int pos = encoder.getPosition();
+        data->enc_diff = (int16_t)pos;
+        if (pos != 0) encoder.setPosition(0);
+        data->state = (digitalRead(ENCODER_BTN) == LOW)
+                      ? LV_INDEV_STATE_PRESSED
+                      : LV_INDEV_STATE_RELEASED;
+    #else
+        // CYD devices: use alternative input method
+        // For now, return no movement and check for BOOT button (GPIO0) as select
+        data->enc_diff = 0;
+        // GPIO0 is the BOOT button on most ESP32 dev boards including CYD
+        data->state = (digitalRead(0) == LOW)
+                      ? LV_INDEV_STATE_PRESSED
+                      : LV_INDEV_STATE_RELEASED;
+        (void)indev;  // Suppress unused warning
+    #endif
 }
+
+// ─── Touch Screen Read Callback ─────────────────────────────────
+
+#ifdef HAS_CYD_TOUCH
+static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    bool touched = ts.Pressed();
+    if(!touched) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+    else {
+        data->state = LV_INDEV_STATE_PRESSED;
+        data->point.x = ts.X();
+        data->point.y = ts.Y();
+    }
+}
+#endif
+
+#if HAS_TOUCH
+static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    uint16_t touchX, touchY;
+    bool touched = tft.getTouch(&touchX, &touchY);
+    if (!touched) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    } else {
+        data->state = LV_INDEV_STATE_PRESSED;
+        data->point.x = touchX;
+        data->point.y = touchY;
+    }
+}
+#endif
 
 // ════════════════════════════════════════════════════════════════
 //  Splash Screen
@@ -342,12 +432,17 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 void showSplashScreen() {
     tft.fillScreen(TFT_BLACK);
 
-    tft.setSwapBytes(true);
-    // If image matches screen exactly:
-    tft.pushImage(0, 0, SCREEN_W, SCREEN_H, splash);
-
-    // Or centered if smaller
-    // tft.pushImage((SCREEN_W - SPLASH_W)/2, (SCREEN_H - SPLASH_H)/2, SPLASH_W, SPLASH_H, splash);
+    // Use configured swap bytes setting (TFT_SWAP_BYTES in config.h)
+    // Set to 0 if colors appear reversed (BGR instead of RGB)
+    tft.setSwapBytes(TFT_SWAP_BYTES);
+    
+    #ifdef DEVICE_T_EMBED_S3
+        // T-Embed: image matches screen exactly
+        tft.pushImage(0, 0, SCREEN_W, SCREEN_H, splash);
+    #elif defined(DEVICE_CYD_2USB) || defined(DEVICE_NM_CYD_C5)
+        // CYD/NM-CYD-C5 320x240: use full screen splash if available
+        tft.pushImage(0, 0, SCREEN_W, SCREEN_H, splash_cyd);
+    #endif
 
     delay(SPLASH_TIME_MS); 
 }
@@ -359,14 +454,30 @@ void showSplashScreen() {
 void setAllLEDs(uint8_t r, uint8_t g, uint8_t b,
                 uint8_t br = LED_BRIGHTNESS)
 {
-    for (int i = 0; i < NUM_LEDS; i++) ledBuf[i] = {r, g, b};
-    ledStrip.write(ledBuf, NUM_LEDS, br);
+    #if HAS_APA102_LED
+        for (int i = 0; i < NUM_LEDS; i++) ledBuf[i] = {r, g, b};
+        ledStrip.write(ledBuf, NUM_LEDS, br);
+    #elif HAS_WS2812_LED
+        // WS2812: apply brightness to color values (0-31 -> 0-255)
+        uint8_t scale = (br * 8) > 255 ? 255 : (br * 8);
+        uint8_t sr = (r * scale) >> 8;
+        uint8_t sg = (g * scale) >> 8;
+        uint8_t sb = (b * scale) >> 8;
+        for (int i = 0; i < NUM_LEDS; i++) {
+            ws2812Strip.setPixelColor(i, ws2812Strip.Color(sr, sg, sb));
+        }
+        ws2812Strip.show();
+    #else
+        (void)r; (void)g; (void)b; (void)br;  // Suppress unused warnings
+    #endif
 }
 
 void ledStartupFlash() {
-    setAllLEDs(255, 255, 255, 10); delay(300);
-    setAllLEDs(0, 0, 0, 0);       delay(150);
-    setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+    #if HAS_APA102_LED || HAS_WS2812_LED
+        setAllLEDs(255, 255, 255, 10); delay(300);
+        setAllLEDs(0, 0, 0, 0);       delay(150);
+        setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+    #endif
 }
 // ── LED Spinner Task ─────────────────────────────────────────────
 //  Runs on core 0 while core 1 blocks on a WiFi scan.
@@ -376,33 +487,64 @@ void ledStartupFlash() {
 //    Tail : 12% dimmed
 //    Rest : off
 static void ledSpinnerTask(void *param) {
-    uint8_t pos = 0;
-    rgb_color frame[NUM_LEDS];
+    #if HAS_APA102_LED
+        uint8_t pos = 0;
+        rgb_color frame[NUM_LEDS];
 
-    while (spinnerRunning) {
-        for (int i = 0; i < NUM_LEDS; i++) frame[i] = {0, 0, 0};
+        while (spinnerRunning) {
+            for (int i = 0; i < NUM_LEDS; i++) frame[i] = {0, 0, 0};
 
-        uint8_t head = pos % NUM_LEDS;
-        uint8_t mid  = (pos + NUM_LEDS - 1) % NUM_LEDS;
-        uint8_t tail = (pos + NUM_LEDS - 2) % NUM_LEDS;
+            uint8_t head = pos % NUM_LEDS;
+            uint8_t mid  = (pos + NUM_LEDS - 1) % NUM_LEDS;
+            uint8_t tail = (pos + NUM_LEDS - 2) % NUM_LEDS;
 
-        frame[head] = { spinnerColor.r,
-                        spinnerColor.g,
-                        spinnerColor.b };
-        frame[mid]  = { (uint8_t)(spinnerColor.r * 35 / 100),
-                        (uint8_t)(spinnerColor.g * 35 / 100),
-                        (uint8_t)(spinnerColor.b * 35 / 100) };
-        frame[tail] = { (uint8_t)(spinnerColor.r * 12 / 100),
-                        (uint8_t)(spinnerColor.g * 12 / 100),
-                        (uint8_t)(spinnerColor.b * 12 / 100) };
+            frame[head] = { spinnerColor.r,
+                            spinnerColor.g,
+                            spinnerColor.b };
+            frame[mid]  = { (uint8_t)(spinnerColor.r * 35 / 100),
+                            (uint8_t)(spinnerColor.g * 35 / 100),
+                            (uint8_t)(spinnerColor.b * 35 / 100) };
+            frame[tail] = { (uint8_t)(spinnerColor.r * 12 / 100),
+                            (uint8_t)(spinnerColor.g * 12 / 100),
+                            (uint8_t)(spinnerColor.b * 12 / 100) };
 
-        ledStrip.write(frame, NUM_LEDS, LED_BRIGHTNESS);
-        pos = (pos + 1) % NUM_LEDS;
-        vTaskDelay(pdMS_TO_TICKS(80));   // ~12 FPS chase speed
-    }
+            ledStrip.write(frame, NUM_LEDS, LED_BRIGHTNESS);
+            pos = (pos + 1) % NUM_LEDS;
+            vTaskDelay(pdMS_TO_TICKS(80));   // ~12 FPS chase speed
+        }
 
-    spinnerTaskHandle = nullptr;
-    vTaskDelete(nullptr);
+        spinnerTaskHandle = nullptr;
+        vTaskDelete(nullptr);
+    #elif HAS_WS2812_LED
+        // Single WS2812 LED: simple blink/pulse effect
+        uint8_t pulse = 0;
+        int8_t delta = 5;
+        
+        while (spinnerRunning) {
+            // Scale color by pulse brightness
+            uint8_t r = (spinnerColor.r * pulse) >> 8;
+            uint8_t g = (spinnerColor.g * pulse) >> 8;
+            uint8_t b = (spinnerColor.b * pulse) >> 8;
+            
+            for (int i = 0; i < NUM_LEDS; i++) {
+                ws2812Strip.setPixelColor(i, ws2812Strip.Color(r, g, b));
+            }
+            ws2812Strip.show();
+            
+            pulse += delta;
+            if (pulse >= 200) delta = -5;
+            if (pulse <= 20) delta = 5;
+            
+            vTaskDelay(pdMS_TO_TICKS(30));   // ~30 FPS pulse
+        }
+
+        spinnerTaskHandle = nullptr;
+        vTaskDelete(nullptr);
+    #else
+        (void)param;
+        spinnerTaskHandle = nullptr;
+        vTaskDelete(nullptr);
+    #endif
 }
 
 // Start the spinner with a given accent colour (call before blocking scan)
@@ -704,6 +846,47 @@ void createDeviceInfo() {
     uint32_t cpuMHz   = ESP.getCpuFreqMHz();
     const char *idfVer = ESP.getSdkVersion();
 
+    // Detect chip model at runtime using esp_chip_info()
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    
+    const char* chipModel;
+    switch (chip_info.model) {
+        case CHIP_ESP32:
+            chipModel = "ESP32";
+            break;
+        case CHIP_ESP32S2:
+            chipModel = "ESP32-S2";
+            break;
+        case CHIP_ESP32S3:
+            chipModel = "ESP32-S3";
+            break;
+        case CHIP_ESP32C2:
+            chipModel = "ESP32-C2";
+            break;
+        case CHIP_ESP32C3:
+            chipModel = "ESP32-C3";
+            break;
+        case CHIP_ESP32C5:
+            chipModel = "ESP32-C5";
+            break;
+        case CHIP_ESP32C6:
+            chipModel = "ESP32-C6";
+            break;
+        case CHIP_ESP32C61:
+            chipModel = "ESP32-C61";
+            break;
+        case CHIP_ESP32H2:
+            chipModel = "ESP32-H2";
+            break;
+        case CHIP_ESP32P4:
+            chipModel = "ESP32-P4";
+            break;
+        default:
+            chipModel = "Unknown";
+            break;
+    }
+
     // WiFi MAC
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -717,13 +900,14 @@ void createDeviceInfo() {
 
     char info[320];
     snprintf(info, sizeof(info),
-             "Chip : ESP32-S3  (%d cores)\n"
+             "Chip : %s  (%d cores)\n"
              "CPU  : %lu MHz\n"
              "Flash: %lu KB @ %lu MHz\n"
              "Heap : %lu B free\n"
              "MAC  : %s\n"
              "ID   : %s\n"
              "IDF  : %s",
+             chipModel,
              cores,
              (unsigned long)cpuMHz,
              (unsigned long)flash,
@@ -920,7 +1104,7 @@ static lv_obj_t *brightDownBtn  = nullptr;
 static lv_obj_t *brightUpBtn    = nullptr;
 
 static void applyBrightness() {
-    ledcWrite(LCD_BL_CH, lcdBrightness);
+    ledcWrite(LCD_BL_PIN, TFT_BL_INVERT ? (255 - lcdBrightness) : lcdBrightness);
     if (!brightBar || !brightPctLbl) return;
     int pct = (lcdBrightness * 100) / 255;
     lv_bar_set_value(brightBar, pct, LV_ANIM_ON);
@@ -1051,11 +1235,15 @@ static void cb_gpsToolBack(lv_event_t *e) {
 }
 
 static void cb_gpsToolSelected(lv_event_t *e) {
-    int t = (int)(intptr_t)lv_event_get_user_data(e);
-    switch (t) {
-        case 0: createGPSStats();    break;
-        case 1: createWiggleWars();  break;
-    }
+    #if HAS_GPS
+        int t = (int)(intptr_t)lv_event_get_user_data(e);
+        switch (t) {
+            case 0: createGPSStats();    break;
+            case 1: createWiggleWars();  break;
+        }
+    #else
+        (void)e;
+    #endif
 }
 
 void createGPSMenu() {
@@ -1076,14 +1264,37 @@ void createGPSMenu() {
     deleteGroup(&gpsMenuGroup);
     gpsMenuGroup = lv_group_create();
 
-    for (int i = 0; i < 2; i++) {
-        lv_obj_t *btn = lv_list_add_btn(list, nullptr, GPS_TOOL_LABELS[i]);
+    #if HAS_GPS
+        if (gpsIsConfigured()) {
+            // GPS pins are configured, show GPS tools
+            for (int i = 0; i < 2; i++) {
+                lv_obj_t *btn = lv_list_add_btn(list, nullptr, GPS_TOOL_LABELS[i]);
+                styleListBtn(btn);
+                lv_obj_set_height(btn, 30);
+                lv_obj_add_event_cb(btn, cb_gpsToolSelected, LV_EVENT_CLICKED,
+                                    (void *)(intptr_t)i);
+                lv_group_add_obj(gpsMenuGroup, btn);
+            }
+        } else {
+            // GPS support compiled but pins not configured
+            lv_obj_t *btn = lv_list_add_btn(list, LV_SYMBOL_WARNING, "GPS Not Configured");
+            styleListBtn(btn);
+            lv_obj_set_height(btn, 30);
+            lv_group_add_obj(gpsMenuGroup, btn);
+            
+            // Add hint label
+            lv_obj_t *hint = lv_label_create(list);
+            lv_label_set_text(hint, "Set GPS_RX_PIN/GPS_TX_PIN in config.h");
+            lv_obj_set_style_text_color(hint, lv_color_hex(0x8b949e), LV_PART_MAIN);
+            lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, LV_PART_MAIN);
+        }
+    #else
+        // No GPS support compiled in
+        lv_obj_t *btn = lv_list_add_btn(list, LV_SYMBOL_WARNING, "GPS Not Available");
         styleListBtn(btn);
         lv_obj_set_height(btn, 30);
-        lv_obj_add_event_cb(btn, cb_gpsToolSelected, LV_EVENT_CLICKED,
-                            (void *)(intptr_t)i);
         lv_group_add_obj(gpsMenuGroup, btn);
-    }
+    #endif
 
     lv_obj_t *backBtn = createBackBtn(gpsMenuScreen, cb_gpsMenuBack);
     lv_group_add_obj(gpsMenuGroup, backBtn);
@@ -1245,7 +1456,7 @@ static bool wiggleOpenFile() {
     if (!wiggleFile) return false;
 
     wiggleFile.println(
-        "WigleWifi-1.4,appRelease=1.0,model=T-Embed,release=1.0,"
+        "WigleWifi-1.4,appRelease=1.0,model=RogueRadar,release=1.0,"
         "device=ESP32-S3,display=TFT,board=ESP32-S3,brand=LilyGO");
     wiggleFile.println(
         "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,"
@@ -2540,7 +2751,7 @@ static uint16_t extract16BitFromUUID(String uuid) {
 static bool detectMeta(BLEAdvertisedDevice &dev) {
     // 1. Manufacturer data company ID
     if (dev.haveManufacturerData()) {
-        std::string m = dev.getManufacturerData();
+        String m = dev.getManufacturerData();
         if (m.length() >= 2) {
             uint16_t companyId = ((uint8_t)m[1] << 8) | (uint8_t)m[0];
             if (isBlockedIdentifier(companyId)) return false;
@@ -2575,7 +2786,7 @@ static bool detectMeta(BLEAdvertisedDevice &dev) {
 // Apple AirTag: Company ID 0x004C + Find My type byte 0x12 + subtype 0x19
 static bool detectAirTag(BLEAdvertisedDevice &dev) {
     if (!dev.haveManufacturerData()) return false;
-    std::string m = dev.getManufacturerData();
+    String m = dev.getManufacturerData();
     if (m.length() < 4) return false;
     return ((uint8_t)m[0] == 0x4C &&
             (uint8_t)m[1] == 0x00 &&
@@ -2586,7 +2797,7 @@ static bool detectAirTag(BLEAdvertisedDevice &dev) {
 // Apple device (any): Company ID 0x004C
 static bool detectApple(BLEAdvertisedDevice &dev) {
     if (!dev.haveManufacturerData()) return false;
-    std::string m = dev.getManufacturerData();
+    String m = dev.getManufacturerData();
     if (m.length() < 2) return false;
     return ((uint8_t)m[0] == 0x4C && (uint8_t)m[1] == 0x00);
 }
@@ -2620,7 +2831,9 @@ static bool detectFlipper(BLEAdvertisedDevice &dev) {
             BLEUUID uuid = dev.getServiceUUID(i);
             // Normalise to 16-bit if possible for comparison
             if (uuid.bitSize() == 16) {
-                if (uuid.getNative()->uuid.uuid16 == 0x3802) return true;
+                String uuidCheck = String(uuid.toString().c_str());
+                uuidCheck.toLowerCase();
+                if (uuidCheck.indexOf("3802") >= 0) return true;
             }
             // Also catch full 128-bit expansion of 0x3802
             String uuidStr = String(uuid.toString().c_str());
@@ -2630,10 +2843,10 @@ static bool detectFlipper(BLEAdvertisedDevice &dev) {
     }
 
     // ── Method 3: OUI check (bonus – rarely fires with random addr) ─
-    std::string mac = dev.getAddress().toString();
+    String mac = String(dev.getAddress().toString().c_str());
     if (mac.length() >= 8) {
-        std::string oui = mac.substr(0, 8);
-        for (char &c : oui) c = tolower(c);
+        String oui = mac.substring(0, 8);
+        oui.toLowerCase();
         if (oui == "0c:fa:22") return true;
     }
 
@@ -2672,12 +2885,12 @@ static int doBLEScan(int durationSec, BLEDeviceType filterType) {
     pScan->setInterval(150);   // was 100 — gives more time for scan responses
     pScan->setWindow(140);     // was 99
 
-    BLEScanResults results = pScan->start(durationSec, false);
-    int total = results.getCount();
+    BLEScanResults *results = pScan->start(durationSec, false);
+    int total = results->getCount();
 
     bleEntryCount = 0;
     for (int i = 0; i < total && bleEntryCount < MAX_BLE_RESULTS; i++) {
-        BLEAdvertisedDevice dev = results.getDevice(i);
+        BLEAdvertisedDevice dev = results->getDevice(i);
 
         // Classify device
         BLEDeviceType dtype = BLE_GENERIC;
@@ -3816,23 +4029,51 @@ void createMetaDetector() {
 
 void setup() {
     Serial.begin(115200);
-    gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    // Initialize GPS only if pins are configured
+    #if HAS_GPS
+        if (gpsIsConfigured()) {
+            Serial2.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+            Serial.println("[GPS] External GPS module enabled");
+        } else {
+            Serial.println("[GPS] GPS support compiled but pins not configured");
+        }
+    #endif
     // SD card on dedicated HSPI bus — must not share with TFT
     sdSPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
-    pinMode(POWER_PIN, OUTPUT);
-    digitalWrite(POWER_PIN, HIGH);
-    pinMode(ENCODER_BTN, INPUT_PULLUP);
+    #if defined(POWER_PIN) && (POWER_PIN >= 0)
+        pinMode(POWER_PIN, OUTPUT);
+        digitalWrite(POWER_PIN, HIGH);
+    #endif
+    #if HAS_ENCODER
+        pinMode(ENCODER_BTN, INPUT_PULLUP);
+    #else
+        // CYD devices: use BOOT button (GPIO0) as select
+        pinMode(0, INPUT_PULLUP);
+    #endif
 
     tft.begin();
     tft.writecommand(0x11);
     delay(120);
     tft.setRotation(1);
     // Backlight PWM via LEDC — allows smooth brightness control
-    ledcSetup(LCD_BL_CH, LCD_BL_FREQ, LCD_BL_RES);
-    ledcAttachPin(LCD_BL_PIN, LCD_BL_CH);
-    ledcWrite(LCD_BL_CH, lcdBrightness);
+    ledcAttach(LCD_BL_PIN, LCD_BL_FREQ, LCD_BL_RES);
+    ledcWrite(LCD_BL_PIN, TFT_BL_INVERT ? (255 - lcdBrightness) : lcdBrightness);
     tft.fillScreen(TFT_BLACK);
+#if HAS_CYD_TOUCH
+    ts.setCal(495, 3398, 721, 3448, 320, 240, 1);
+#endif
+#if HAS_TOUCH
+    uint16_t calData[5] = { 225, 3413, 403, 3334, 1 };
+    tft.setTouch(calData);
+#endif
+
     showSplashScreen();  // Splash Screen Call
+
+    // Initialize WS2812 LED if present
+    #if HAS_WS2812_LED
+        ws2812Strip.begin();
+        ws2812Strip.show();  // Initialize all pixels to 'off'
+    #endif
 
     lv_init();
     lv_tick_set_cb([]() -> uint32_t { return (uint32_t)millis(); });
@@ -3843,13 +4084,22 @@ void setup() {
                            sizeof(lvBuf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
 
     lvIndev = lv_indev_create();
-    lv_indev_set_type(lvIndev, LV_INDEV_TYPE_ENCODER);
-    lv_indev_set_read_cb(lvIndev, encoder_read_cb);
+    #if HAS_TOUCH || HAS_CYD_TOUCH
+        // Touch screen input
+        lv_indev_set_type(lvIndev, LV_INDEV_TYPE_POINTER);
+        lv_indev_set_read_cb(lvIndev, touch_read_cb);
+        Serial.println("[Input] Touch screen enabled");
+    #else
+        // Encoder or button input
+        lv_indev_set_type(lvIndev, LV_INDEV_TYPE_ENCODER);
+        lv_indev_set_read_cb(lvIndev, encoder_read_cb);
+        Serial.println("[Input] Encoder enabled");
+    #endif
 
     ledStartupFlash();
     createMainMenu();
 
-    Serial.println("[T-Embed] Boot complete.");
+    Serial.println("[Rogue Radar] Boot complete.");
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -3858,8 +4108,12 @@ void setup() {
 
 void loop() {
     // Feed all available GPS bytes into TinyGPS++ — non-blocking
-    while (gpsSerial.available())
-        gps.encode(gpsSerial.read());
+    #if HAS_GPS
+        if (gpsIsConfigured()) {
+            while (Serial2.available())
+                gps.encode(Serial2.read());
+        }
+    #endif
 
     lv_timer_handler();
 
@@ -3871,7 +4125,8 @@ void loop() {
         esp_wifi_set_channel(deauthChannel, WIFI_SECOND_CHAN_NONE);
     }
 
-    // Long-press power-off (hold encoder 5 s)
+    // Long-press power-off (hold encoder 5 s) - only for T-Embed
+    #if HAS_ENCODER
     if (!powerOffTriggered) {
         if (digitalRead(ENCODER_BTN) == LOW) {
             if (btnHoldStart == 0) btnHoldStart = millis();
@@ -3892,14 +4147,19 @@ void loop() {
                 lv_screen_load(offScr);
                 lv_timer_handler();
 
-                setAllLEDs(0, 0, 0, 0);
+                #if HAS_APA102_LED
+                    setAllLEDs(0, 0, 0, 0);
+                #endif
                 delay(1500);
-                digitalWrite(POWER_PIN, LOW);
+                #if defined(POWER_PIN) && (POWER_PIN >= 0)
+                    digitalWrite(POWER_PIN, LOW);
+                #endif
             }
         } else {
             btnHoldStart = 0;
         }
     }
+    #endif
 
     delay(5);
 }
