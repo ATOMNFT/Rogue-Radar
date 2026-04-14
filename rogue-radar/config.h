@@ -124,8 +124,6 @@
     #define TFT_RST         -1
     
     // ─── Touch Screen (XPT2046) ─────────────────────────────────
-    // Touch shares SPI bus with TFT (MISO/MOSI/SCK), separate CS
-    #define HAS_TOUCH        1
     #define HAS_CYD_TOUCH    1    // CYD-2USB has a touch screen (XPT2046)
     #define XPT2046_IRQ     36    // Optional: touch interrupt pin
     #define XPT2046_CLK     25
@@ -241,7 +239,11 @@ enum BLEDeviceType {
 #define OTA_FILENAME  "/update.bin"
 
 // ─── LVGL ───────────────────────────────────────────────────────
-#define LV_BUF_LINES  20   // DMA render buffer height in lines
+#ifdef DEVICE_CYD_2USB
+    #define LV_BUF_LINES  10   // DMA render buffer height in lines
+#else
+    #define LV_BUF_LINES  20   // T-Embed S3 has more RAM, can
+#endif
 
 // ─── APA102 LEDs ────────────────────────────────────────────────
 #define LED_BRIGHTNESS  6   // global brightness (0-31 for APA102)

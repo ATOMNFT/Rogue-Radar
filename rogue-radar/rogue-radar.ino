@@ -86,7 +86,7 @@
 
 // ─── GPS Serial ─────────────────────────────────────────────────
 #if HAS_GPS
-    #if !CONFIG_IDF_TARGET_ESP32C5
+    #if DEVICE_T_EMBED_S3
         HardwareSerial Serial2(GPS_SERIAL_INDEX);   // UART1 for S3, UART2 for CYD / NM-CYD-C5
     #endif
 #endif
@@ -410,7 +410,7 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 }
 #endif
 
-#if HAS_TOUCH
+#ifdef HAS_TOUCH
 static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     uint16_t touchX, touchY;

@@ -129,6 +129,7 @@ Edit `rogue-radar/config.h` and select your device:
 - `APA102` by Pololu (T-Embed only)
 - `Adafruit_NeoPixel` (CYD/C5 only - for WS2812 LED)
 - `TinyGPSPlus` (T-Embed only, optional for CYD/C5)
+- `TFT_Touch` (by Bodmer, url=https://github.com/Bodmer/TFT_Touch) CYD_2USB need
 
 ### ESP32 core features used
 - `WiFi`
@@ -161,6 +162,7 @@ The firmware supports both **320x170** (T-Embed) and **320x240** (CYD) layouts u
 You will need a correct `User_Setup.h` for your display configuration:
 - **T-Embed**: 320x170, specific SPI pins
 - **CYD-2USB/NM-CYD-C5**: 320x240, standard CYD SPI pins
+- To change the device, need change the `User_Setup.h` file.
 
 See `rogue-radar/DEVICE_SUPPORT.md` for detailed TFT_eSPI configuration.
 
@@ -327,7 +329,7 @@ __METHOD 1__
 4. Make sure your `lv_conf.h` options are enabled.
 5. Add your `splash.h` file if you are using the splash screen.
 6. Select **ESP32S3 Dev Module**.
-7. Set partition scheme to **Huge APP**.
+7. Set partition scheme to **Huge APP**. (3MB NO OTA/1MB SPIFFS); `NM-CYD-C5` use `8MB with spiffs (3MB APP/1.5MB SPIFFS)`
 8. Compile and flash.
 
 __METHOD 2__ <br>
