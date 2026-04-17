@@ -81,6 +81,17 @@ This firmware is currently built around the **LilyGO T-Embed ESP32-S3**.
 
 ## Arduino IDE Setup
 
+### User_Setup Files
+Make a backup of your files before replacing any. Drop the corresponding file/s (found above) for your device into `C:\Users\YOURUSERNAME\Documents\Arduino\libraries\TFT_eSPI-master`. And make sure you choose the correct file in the `User_Setup_Select.h` file.
+
+| File Name |
+|---|
+| `User_Setup_CYD.h` |
+| `User_Setup_CYD2USB.h` |
+| `User_Setup_LilyGo_T_Embed_S3.h` |
+| `User_Setup_nm_cyd_c5.h` |
+| `User_Setup_Select.h` |
+
 ### Board settings
 - **Board:** `ESP32S3 Dev Module`
 - **Partition Scheme:** `Huge APP`
