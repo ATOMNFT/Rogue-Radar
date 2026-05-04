@@ -9,16 +9,17 @@
 
 | Version | Status | Notes |
 |--------|--------|-------|
+| v1.0.1 | Stable | Adds display/LED dimming controls, scan defaults, rotation toggle, audio feedback, and improved Flock detection |
 | v1.0.0 | Stable | Initial public release of the Rogue Radar Firmware |
 
-> **Latest Release:** `v1.0.0` — Rogue Radar Firmware
+> **Latest Release:** `v1.0.1` — Rogue Radar Firmware
 ---
 
 ## Overview
 
 **Rogue Radar** is a handheld ESP32-S3 firmware built for the **LilyGO T-Embed** that combines multiple wireless and utility tools into one rotary-driven interface.
 
-The firmware uses **LVGL** for the UI, **TFT_eSPI** for the 320x170 ST7789 display, **BLE + WiFi** features from the ESP32 core, **TinyGPS++** for GPS data, and **APA102 LEDs** for visual status feedback.
+The firmware uses **LVGL** for the UI, **TFT_eSPI** for the 320x170 ST7789 display, **BLE + WiFi** features from the ESP32 core, **TinyGPS++** for GPS data, **APA102 LEDs** for visual status feedback, and optional I2S speaker output for alerts and menu feedback.
 
 It is designed around fast menu navigation, onboard scanning tools, live signal data, GPS stats, SD-based update support, and a clean embedded dashboard feel.
 
@@ -45,7 +46,7 @@ It is designed around fast menu navigation, onboard scanning tools, live signal 
 - **Channel Analyzer** – surveys channel activity and signal strength across WiFi channels.
 - **PineAP Hunter** – watches for BSSIDs cycling through many SSIDs across scans.
 - **Pwnagotchi Watch** – looks for Pwnagotchi beacon behavior and parses status data from beacon SSIDs.
-- **Flock Detector** – flags WiFi activity associated with networks containing `flock` in the SSID.
+- **Flock Detector** – flags WiFi activity associated with Flock-related SSID keywords, deduplicates hits by source MAC, and can show the source MAC in the results.
 
 ### BLE Tools
 - **BLE Scanner** – scans nearby Bluetooth Low Energy devices and lists signal details.
@@ -55,9 +56,16 @@ It is designed around fast menu navigation, onboard scanning tools, live signal 
 - **Meta Detector** – looks for Meta / Ray-Ban smart-glasses related BLE advertisements.
 
 ### Misc Tools
-- **Device Info** – shows chip, flash, heap, CPU, SDK, and MAC details.
+- **Device Info** – shows firmware version, chip, flash, heap, CPU, and MAC details.
 - **SD Update** – supports firmware update flow from SD card.
 - **Brightness** – adjusts the TFT backlight with PWM brightness control.
+- **Themes** – switches between the built-in UI color themes.
+- **Scan Defaults** – adjusts BLE scan time, WiFi scan time, WiFi result limit, and deauth hop timing for the current session.
+- **Dimming** – toggles inactivity-based screen and APA102 LED dimming.
+- **LEDs** – toggles the APA102 ring on or off at runtime.
+- **Rotation** – switches between normal and flipped landscape orientations.
+- **Alert Sound** – toggles detection alert chirps.
+- **Menu Sounds** – toggles encoder/menu feedback sounds separately from detection alerts.
 
 ### GPS Tools
 - **GPS Stats** – displays live latitude, longitude, speed, altitude, and satellite data.
@@ -76,6 +84,7 @@ This firmware is currently built around the **LilyGO T-Embed ESP32-S3**.
 - **APA102 LED ring**
 - **GPS module over UART**
 - **MicroSD card on dedicated HSPI bus**
+- **Optional I2S speaker output**
 
 ---
 
@@ -110,6 +119,7 @@ Make a backup of your files before replacing any. Drop the corresponding file/s 
 - `BLEScan`
 - `SD`
 - `Update`
+- `driver/i2s`
 
 ---
 
@@ -177,6 +187,15 @@ The sketch also includes a splash screen system using:
 
 </details>
 
+<details>
+<summary><strong>I2S Speaker</strong></summary>
+
+- `SOUND_I2S_BCLK 7`
+- `SOUND_I2S_WCLK 5`
+- `SOUND_I2S_DOUT 6`
+
+</details>
+
 ---
 
 ## UI / Controls
@@ -188,7 +207,7 @@ Rogue Radar is built around a **rotary encoder driven interface** using LVGL inp
 - **Press encoder** to select items
 - **Hold encoder button for 5 seconds** to trigger power-off handling
 
-The APA102 LEDs are also used for menu color feedback and scan animations.
+The APA102 LEDs are also used for menu color feedback and scan animations. Optional speaker feedback can provide detection chirps and quiet menu tick/click sounds.
 
 ---
 
@@ -199,8 +218,11 @@ The APA102 LEDs are also used for menu color feedback and scan animations.
 - BLE scanning and device-type detection
 - GPS live stats
 - SD card firmware update path
-- Adjustable display brightness
+- Adjustable display brightness and inactivity dimming
+- Runtime toggles for dimming, LEDs, sound, menu sounds, and display rotation
+- Session-adjustable scan defaults
 - LED ring startup and scanning effects
+- Optional detection alert chirps
 - Splash screen support
 - Embedded dashboard-style UI
 
@@ -231,11 +253,9 @@ __METHOD 2__ <br>
 ## Roadmap Ideas
 
 - Add logging/export for scan results
-- Add themes
 - Add richer BLE classification and filtering
 - Expand GPS tool set
 - Add more SD card utilities
-- Add configurable scan timing and thresholds
 - Add icon assets and polish for each tool page
 
 ---
