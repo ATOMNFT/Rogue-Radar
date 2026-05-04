@@ -1,5 +1,5 @@
 // ============================================================
-//  Rogue Radar v1.0.0 Firmware
+//  Rogue Radar v1.0.1 Firmware
 //  Check config.h for adjustable settings
 // ============================================================
 //
@@ -9,7 +9,7 @@
 //  BLE Tools:  BLE Scanner | AirTag Detector | Flipper Zero Detector
 //              Skimmer Detector | Meta Detector
 //  GPS Tools:  GPS Stats | Wiggle Wars
-//  Misc Tools: Device Info | SD Update | Brightness ADJ
+//  Misc Tools: Device Info | SD Update | Brightness ADJ | Themes | Scan Defaults | Dimming | Scan Times | LEDs | Detection Sounds | Menu Sounds | Rotation
 //
 //  Display / UI:
 //  - ST7789 320x170 display
@@ -42,6 +42,10 @@
 //    #define LV_USE_BTN             1
 //    #define LV_USE_BAR             1
 //
+//  Notes:
+//  - GPS uses UART on pins defined in this sketch
+//  - SD card uses HSPI pins defined in this sketch
+//  - Encoder button and rotary input drive menu navigation
 // ============================================================
 
 #include <Arduino.h>
@@ -59,13 +63,50 @@
 #include <SPI.h>
 #include <SD.h>
 #include <Update.h>
+#include <driver/i2s.h>
 #include "splash.h"
-
 
 static SPIClass sdSPI(HSPI);
 
 static HardwareSerial gpsSerial(1);   // UART1 — free since BLE uses its own stack
 static TinyGPSPlus    gps;
+
+// ─── UI Themes ──────────────────────────────────────────────────
+struct UITheme {
+    const char *name;
+    uint32_t bg;         // screen background
+    uint32_t card;       // card / panel background
+    uint32_t cardAlt;    // slightly lighter card (list buttons default)
+    uint32_t border;     // borders
+    uint32_t barBg;      // progress/RSSI bar track
+    uint32_t text;       // primary text
+    uint32_t textDim;    // secondary / inactive text
+    uint32_t accent;     // header labels, data highlights
+    uint32_t success;    // good/found state
+    uint32_t warn;       // scanning / amber warning
+    uint32_t alert;      // red alert
+    uint32_t btnDefault; // back button default bg
+    uint32_t btnFocus;   // focused button bg
+    uint32_t btnPress;   // pressed button bg
+    uint32_t actionBg;   // action button default bg
+    uint32_t actionFoc;  // action button focused bg
+    uint32_t actionBdr;  // action button border
+    uint32_t flashGreen; // flash/confirm button
+    uint32_t stopRed;    // stop button
+};
+
+static const UITheme THEMES[] = {
+    { THEME_DARK    },
+    { THEME_FLIPPER },
+    { THEME_MATRIX  },
+};
+static int currentTheme = DEFAULT_THEME;
+
+// Convenience macros so tool code reads cleanly
+#define TH       (THEMES[currentTheme])
+#define TC(x)    lv_color_hex(TH.x)
+
+// ─── Splash Duration — defined in config.h ──────────────────────
 static const unsigned long SPLASH_TIME_MS = SPLASH_DURATION_MS;
 
 TFT_eSPI tft = TFT_eSPI();
@@ -100,8 +141,46 @@ static SpinnerColor   spinnerColor       = {0, 200, 0};
 // ─── Global UI State ────────────────────────────────────────────
 static int            currentMenu       = 0;
 static bool           powerOffTriggered = false;
+static bool           powerButtonReleasedAfterBoot = false;  // safety: power-off hold is ignored until button is released once after boot
 static unsigned long  btnHoldStart      = 0;
-static int            lcdBrightness     = LCD_BL_DEFAULT;  // 0-255, default full
+static int            lcdBrightness     = LCD_BL_DEFAULT;
+
+// ─── Inactivity Dimmer State ───────────────────────────────────
+// Safe first step for sleep-timer behavior: no ESP32 sleep modes yet.
+// We only dim the TFT backlight and APA102 LED brightness after no
+// encoder/button activity.
+static unsigned long  lastActivityMs    = 0;
+static bool           backlightDimmed   = false;
+static bool           dimmingEnabled    = (DIMMING_ENABLED_DEFAULT != 0);
+static bool           ledsEnabled       = (LEDS_ENABLED_DEFAULT != 0);
+static lv_obj_t      *miscDimmingBtn    = nullptr;
+static lv_obj_t      *miscLedsBtn       = nullptr;
+static lv_obj_t      *miscSoundBtn      = nullptr;
+static lv_obj_t      *miscMenuSoundBtn  = nullptr;
+static lv_obj_t      *miscRotationBtn   = nullptr;
+
+// ─── I2S Speaker / Alert Chirp State ───────────────────────────
+static bool           soundEnabled      = (SOUND_ENABLED_DEFAULT != 0);
+static bool           soundReady        = false;
+static bool           menuFeedbackEnabled = (MENU_FEEDBACK_ENABLED_DEFAULT != 0);
+static unsigned long  lastDeauthSoundMs = 0;
+static unsigned long  lastFlockSoundMs  = 0;
+static unsigned long  lastPwnSoundMs    = 0;
+static unsigned long  lastFlipSoundMs   = 0;
+static unsigned long  lastBleSusSoundMs = 0;
+static unsigned long  lastMenuTickMs    = 0;
+static unsigned long  lastMenuClickMs   = 0;
+
+// Runtime display rotation. This is reset-after-reboot and only toggles
+// between the two landscape orientations so the 320x170 LVGL layout stays safe.
+static uint8_t displayRotation = DISPLAY_ROTATION_DEFAULT;
+
+// ─── Runtime Scan Defaults ─────────────────────────────────────
+// These start from config.h on each boot and reset after reboot.
+static int bleScanSeconds  = BLE_SCAN_SECS;
+static int wifiScanSeconds = WIFI_SCAN_SECS;
+static int wifiMaxResults  = MAX_WIFI_RESULTS;
+static int deauthHopMs     = DEAUTH_HOP_MS;
 
 // ─── Screen Pointers ────────────────────────────────────────────
 static lv_obj_t *mainScreen       = nullptr;
@@ -134,8 +213,6 @@ static lv_group_t *gpsToolGroup    = nullptr;
 // ════════════════════════════════════════════════════════════════
 //  WIFI DATA STRUCTURES
 // ════════════════════════════════════════════════════════════════
-
-
 struct WiFiEntry {
     char    ssid[33];
     char    bssid[18];
@@ -149,7 +226,6 @@ static WiFiEntry wifiEntries[MAX_WIFI_RESULTS];
 static int       wifiEntryCount = 0;
 
 // ── Deauth Detector ─────────────────────────────────────────────
-
 struct DeauthEvent {
     char     src[18];
     char     dst[18];
@@ -161,6 +237,7 @@ struct DeauthEvent {
 static DeauthEvent   deauthLog[MAX_DEAUTH];
 static volatile int  deauthHead    = 0;
 static volatile int  deauthTotal   = 0;
+static int           deauthSoundedTotal = 0;
 static volatile bool deauthActive  = false;
 static uint8_t       deauthChannel = 1;
 
@@ -171,14 +248,13 @@ static int8_t chanMaxRSSI[14];
 // LVGL timer handle for deauth refresh
 static lv_timer_t *deauthTimer = nullptr;
 
-// ── PineAP Hunter ─────────────────────────────────────────────── Ref. here: https://github.com/n0xa/m5stick-nemo/blob/main/pineap_hunter.h
+// ── PineAP Hunter ───────────────────────────────────────────────
 //
 //  Strategy: each WiFi scan returns one SSID per BSSID. A rogue
 //  Pineapple / KARMA AP cycles through many SSIDs across scans.
 //  We accumulate BSSID->SSID mappings over repeated scans. Any BSSID
 //  that exceeds PINEAP_THRESHOLD unique SSIDs is flagged as suspect.
 //
-
 struct PineAPEntry {
     char   bssid[18];            // XX:XX:XX:XX:XX:XX
     int8_t lastRSSI;
@@ -191,14 +267,13 @@ static int         pineapEntryCount = 0;   // how many BSSIDs tracked
 static int         pineapScanCount  = 0;   // how many scans performed
 static int         pineapFlagged    = 0;   // BSSIDs above threshold
 
-// ── Pwnagotchi Detector ───────────────────────────────────────── Ref. here: https://github.com/justcallmekoko/ESP32Marauder/wiki/detect-pwnagotchi
+// ── Pwnagotchi Detector ─────────────────────────────────────────
 //
 //  Pwnagotchis beacon with source MAC de:ad:be:ef:de:ad and encode
 //  their status (name, handshakes captured) as JSON in the SSID field.
 //  We run promiscuous mode, sniff beacon frames (0x80), verify the MAC,
 //  then extract name + pwnd_tot from the SSID JSON.
 //
-
 struct PwnEntry {
     char     name[33];   // parsed from JSON "name" field
     char     bssid[18];  // BSSID from beacon frame
@@ -218,14 +293,14 @@ static char            pwnPendingBSSID[18];
 static volatile int8_t pwnPendingRSSI  = 0;
 static volatile bool   pwnPendingReady = false;
 
-// ── Flock Safety Detector ──────────────────────────────────────── Ref. here: https://github.com/justcallmekoko/ESP32Marauder/wiki/flock-sniff
+// ── Flock Safety Detector ────────────────────────────────────────
 //
-//  Flock Safety LPR cameras connect to / advertise networks containing
-//  "flock" in the SSID. We watch beacon frames (subtype 8), probe
-//  responses (subtype 5), and probe requests (subtype 4) for that
-//  substring. Alerts are latching — stays red until tool is exited.
+//  Flock/Penguin-style devices may advertise WiFi SSIDs containing
+//  keywords such as "flock", "penguin", "pigvision", or
+//  "fs ext battery". We watch beacon frames (subtype 8), probe
+//  responses (subtype 5), and probe requests (subtype 4) for those
+//  substrings. Alerts are latching — stays red until tool is exited.
 //
-
 struct FlockHit {
     char    ssid[33];
     char    src[18];    // source MAC of the frame
@@ -248,8 +323,6 @@ static volatile bool    flockPendingReady = false;
 // ════════════════════════════════════════════════════════════════
 //  BLE DATA STRUCTURES
 // ════════════════════════════════════════════════════════════════
-
-
 // Device type flags for scanner result colouring / filtering
 enum BLEDeviceType {
     BLE_GENERIC  = 0,
@@ -291,6 +364,8 @@ void createMiscMenu();
 void createDeviceInfo();
 void createSDUpdate();
 void createBrightnessControl();
+void createThemePicker();
+void createScanDefaults();
 void createGPSMenu();
 void createGPSStats();
 void createWiggleWars();
@@ -309,9 +384,324 @@ static void cb_bleToolBack(lv_event_t *e);
 static void cb_bleDetailBack(lv_event_t *e);
 
 // ════════════════════════════════════════════════════════════════
+//  INACTIVITY BACKLIGHT + APA102 LED DIMMER
+// ════════════════════════════════════════════════════════════════
+static void applyBacklightLevel(uint8_t level) {
+    ledcWrite(LCD_BL_CH, level);
+}
+
+static uint8_t activeLedBrightness(uint8_t requestedBrightness = LED_BRIGHTNESS) {
+    // Runtime LED toggle: keep the APA102 ring dark while preserving
+    // the last requested colour/status internally.
+    if (!ledsEnabled) {
+        return 0;
+    }
+
+    // Keep explicit OFF requests off, but cap normal/status brightness while dimming is enabled and active.
+    if (dimmingEnabled && backlightDimmed && requestedBrightness > LED_DIM_BRIGHTNESS) {
+        return LED_DIM_BRIGHTNESS;
+    }
+    return requestedBrightness;
+}
+
+static void refreshCurrentLEDs(uint8_t requestedBrightness = LED_BRIGHTNESS) {
+    ledStrip.write(ledBuf, NUM_LEDS, activeLedBrightness(requestedBrightness));
+}
+
+static void resetInactivityTimer() {
+    lastActivityMs = millis();
+
+    // If the display/LEDs were dimmed, restore them on the first encoder
+    // movement or button press.
+    if (backlightDimmed) {
+        backlightDimmed = false;
+        applyBacklightLevel((uint8_t)lcdBrightness);
+        refreshCurrentLEDs(LED_BRIGHTNESS);
+    }
+}
+
+static void updateInactivityDimmer() {
+    // Runtime OFF means no dimming at all. If the device was already dimmed, wake it back up.
+    if (!dimmingEnabled) {
+        if (backlightDimmed) {
+            backlightDimmed = false;
+            applyBacklightLevel((uint8_t)lcdBrightness);
+            refreshCurrentLEDs(LED_BRIGHTNESS);
+        }
+        return;
+    }
+
+#if INACTIVITY_DIM_TIMEOUT_MS > 0
+    if (!backlightDimmed && (millis() - lastActivityMs >= INACTIVITY_DIM_TIMEOUT_MS)) {
+        backlightDimmed = true;
+        applyBacklightLevel((uint8_t)INACTIVITY_DIM_LEVEL);
+        refreshCurrentLEDs(LED_BRIGHTNESS);
+    }
+#endif
+}
+
+
+// ════════════════════════════════════════════════════════════════
+//  I2S SPEAKER ALERT CHIRPS
+//
+//  T-Embed uses an I2S speaker path, so these short chirps are generated
+//  directly as small PCM tone bursts. No audio files, SD access, or ESP32
+//  sleep modes are involved.
+// ════════════════════════════════════════════════════════════════
+#ifndef I2S_COMM_FORMAT_STAND_I2S
+#define I2S_COMM_FORMAT_STAND_I2S I2S_COMM_FORMAT_I2S
+#endif
+
+static bool soundCooldownReady(unsigned long &lastMs) {
+    unsigned long now = millis();
+    if (now - lastMs < SOUND_ALERT_COOLDOWN_MS) return false;
+    lastMs = now;
+    return true;
+}
+
+static void initSound() {
+    if (soundReady) return;
+
+    i2s_config_t i2sConfig = {};
+    i2sConfig.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    i2sConfig.sample_rate = SOUND_SAMPLE_RATE;
+    i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+    i2sConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+    i2sConfig.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    i2sConfig.intr_alloc_flags = 0;
+    i2sConfig.dma_buf_count = 4;
+    i2sConfig.dma_buf_len = 64;
+    i2sConfig.use_apll = false;
+    i2sConfig.tx_desc_auto_clear = true;
+    i2sConfig.fixed_mclk = 0;
+
+    if (i2s_driver_install(I2S_NUM_0, &i2sConfig, 0, nullptr) != ESP_OK) {
+        Serial.println("[Sound] I2S driver install failed");
+        soundReady = false;
+        return;
+    }
+
+    i2s_pin_config_t pinConfig = {};
+    pinConfig.bck_io_num = SOUND_I2S_BCLK;
+    pinConfig.ws_io_num = SOUND_I2S_WCLK;
+    pinConfig.data_out_num = SOUND_I2S_DOUT;
+    pinConfig.data_in_num = I2S_PIN_NO_CHANGE;
+
+    if (i2s_set_pin(I2S_NUM_0, &pinConfig) != ESP_OK) {
+        Serial.println("[Sound] I2S pin setup failed");
+        i2s_driver_uninstall(I2S_NUM_0);
+        soundReady = false;
+        return;
+    }
+
+    i2s_zero_dma_buffer(I2S_NUM_0);
+    soundReady = true;
+    Serial.println("[Sound] I2S alert chirps ready");
+}
+
+static bool ensureSoundReady(bool requireAlertSoundEnabled = true) {
+    // Lazy init: do not start I2S during boot.
+    // Detection alert chirps obey Misc > Sound ON/OFF.
+    // Menu feedback has its own config setting and can initialize I2S independently.
+    if (requireAlertSoundEnabled && !soundEnabled) return false;
+    if (!soundReady) initSound();
+    return soundReady;
+}
+
+static void soundTone(uint16_t freqHz, uint16_t durationMs, uint8_t volumePct = SOUND_VOLUME_PERCENT, bool requireAlertSoundEnabled = true) {
+    if (freqHz == 0 || durationMs == 0) return;
+    if (!ensureSoundReady(requireAlertSoundEnabled)) return;
+
+    if (volumePct > 100) volumePct = 100;
+    int16_t amp = (int16_t)((12000L * volumePct) / 100L);
+    if (amp < 300) amp = 300;
+
+    const uint16_t framesPerChunk = 64;
+    int16_t samples[framesPerChunk * 2]; // stereo: L/R
+    uint32_t totalFrames = ((uint32_t)SOUND_SAMPLE_RATE * durationMs) / 1000UL;
+    uint32_t halfPeriod = SOUND_SAMPLE_RATE / ((uint32_t)freqHz * 2UL);
+    if (halfPeriod == 0) halfPeriod = 1;
+
+    uint32_t frameIndex = 0;
+    while (frameIndex < totalFrames) {
+        uint16_t frames = framesPerChunk;
+        if (totalFrames - frameIndex < frames) frames = totalFrames - frameIndex;
+
+        for (uint16_t i = 0; i < frames; i++) {
+            int16_t sample = (((frameIndex + i) / halfPeriod) & 1) ? amp : -amp;
+            samples[i * 2]     = sample;
+            samples[i * 2 + 1] = sample;
+        }
+
+        size_t bytesWritten = 0;
+        i2s_write(I2S_NUM_0, samples, frames * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
+        frameIndex += frames;
+    }
+}
+
+static void soundSilence(uint16_t durationMs) {
+    if (!soundReady || durationMs == 0) return;
+    int16_t zeros[64 * 2] = {0};
+    uint32_t totalFrames = ((uint32_t)SOUND_SAMPLE_RATE * durationMs) / 1000UL;
+    while (totalFrames > 0) {
+        uint16_t frames = totalFrames > 64 ? 64 : totalFrames;
+        size_t bytesWritten = 0;
+        i2s_write(I2S_NUM_0, zeros, frames * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
+        totalFrames -= frames;
+    }
+}
+
+static void stopSoundDriverAfterChirp() {
+    if (!soundReady) return;
+
+    // The T-Embed encoder button uses GPIO0. On this board, leaving the
+    // I2S driver active after a chirp can make the button read as held,
+    // which triggers the existing long-press power-off path. Since these
+    // are only short alert chirps, shut I2S back down after each chirp.
+    soundSilence(25);
+    i2s_zero_dma_buffer(I2S_NUM_0);
+    i2s_driver_uninstall(I2S_NUM_0);
+    soundReady = false;
+
+    // Re-assert the encoder button input mode and require a fresh release
+    // before any long-press power-off can start counting again.
+    pinMode(ENCODER_BTN, INPUT_PULLUP);
+    btnHoldStart = 0;
+    powerButtonReleasedAfterBoot = false;
+}
+
+static void playDeauthChirp() {
+    if (!soundCooldownReady(lastDeauthSoundMs)) return;
+    soundTone(2100, 65, SOUND_VOLUME_PERCENT);
+    soundSilence(45);
+    soundTone(2100, 65, SOUND_VOLUME_PERCENT);
+    stopSoundDriverAfterChirp();
+}
+
+static void playFlockChirp() {
+    if (!soundCooldownReady(lastFlockSoundMs)) return;
+    soundTone(520, 170, SOUND_VOLUME_PERCENT);
+    soundSilence(50);
+    soundTone(390, 210, SOUND_VOLUME_PERCENT);
+    stopSoundDriverAfterChirp();
+}
+
+static void playPwnagotchiChirp() {
+    if (!soundCooldownReady(lastPwnSoundMs)) return;
+    soundTone(880, 80, SOUND_VOLUME_PERCENT);
+    soundSilence(35);
+    soundTone(1175, 80, SOUND_VOLUME_PERCENT);
+    soundSilence(35);
+    soundTone(1568, 110, SOUND_VOLUME_PERCENT);
+    stopSoundDriverAfterChirp();
+}
+
+static void playFlipperChirp() {
+    if (!soundCooldownReady(lastFlipSoundMs)) return;
+    soundTone(1200, 55, SOUND_VOLUME_PERCENT);
+    soundSilence(30);
+    soundTone(1600, 55, SOUND_VOLUME_PERCENT);
+    soundSilence(30);
+    soundTone(1000, 70, SOUND_VOLUME_PERCENT);
+    stopSoundDriverAfterChirp();
+}
+
+static void playBLESuspiciousChirp() {
+    if (!soundCooldownReady(lastBleSusSoundMs)) return;
+    soundTone(430, 120, SOUND_VOLUME_PERCENT);
+    soundSilence(80);
+    soundTone(430, 120, SOUND_VOLUME_PERCENT);
+    stopSoundDriverAfterChirp();
+}
+
+static bool menuFeedbackCooldownReady(unsigned long &lastMs, uint16_t cooldownMs) {
+    unsigned long now = millis();
+    if (now - lastMs < cooldownMs) return false;
+    lastMs = now;
+    return true;
+}
+
+static void playMenuTickFeedback() {
+    if (!menuFeedbackEnabled) return;
+    if (!menuFeedbackCooldownReady(lastMenuTickMs, MENU_FEEDBACK_TICK_COOLDOWN_MS)) return;
+
+    // Very short, quiet tick for encoder movement.
+    // This intentionally does not obey Misc > Sound ON/OFF; use
+    // Misc > Menu Sounds ON/OFF or MENU_FEEDBACK_ENABLED_DEFAULT to disable it.
+    soundTone(1450, 8, MENU_FEEDBACK_VOLUME_PERCENT, false);
+    stopSoundDriverAfterChirp();
+}
+
+static void playMenuClickFeedback() {
+    if (!menuFeedbackEnabled) return;
+    if (!menuFeedbackCooldownReady(lastMenuClickMs, 120)) return;
+
+    // Short click for button/select actions.
+    soundTone(950, 18, MENU_FEEDBACK_VOLUME_PERCENT, false);
+    stopSoundDriverAfterChirp();
+}
+
+static const char *getSoundMenuLabel() {
+    static char label[40];
+    snprintf(label, sizeof(label), LV_SYMBOL_BELL " Alert Sound: %s",
+             soundEnabled ? "ON" : "OFF");
+    return label;
+}
+
+static void updateSoundMenuLabel() {
+    if (!miscSoundBtn) return;
+
+    lv_obj_t *label = lv_obj_get_child(miscSoundBtn, 0);
+    if (label) {
+        lv_label_set_text(label, getSoundMenuLabel());
+    }
+}
+
+static void toggleSoundEnabled() {
+    soundEnabled = !soundEnabled;
+    resetInactivityTimer();
+
+    if (!soundEnabled && soundReady) {
+        stopSoundDriverAfterChirp();
+    }
+    // Do not call initSound() here. I2S is intentionally lazy-initialized
+    // by the first alert chirp so boot/menu input stays stable.
+
+    updateSoundMenuLabel();
+}
+
+static const char *getMenuSoundMenuLabel() {
+    static char label[44];
+    snprintf(label, sizeof(label), LV_SYMBOL_AUDIO "  Menu Sounds: %s",
+             menuFeedbackEnabled ? "ON" : "OFF");
+    return label;
+}
+
+static void updateMenuSoundMenuLabel() {
+    if (!miscMenuSoundBtn) return;
+
+    lv_obj_t *label = lv_obj_get_child(miscMenuSoundBtn, 0);
+    if (label) {
+        lv_label_set_text(label, getMenuSoundMenuLabel());
+    }
+}
+
+static void toggleMenuFeedbackEnabled() {
+    menuFeedbackEnabled = !menuFeedbackEnabled;
+    resetInactivityTimer();
+
+    // If a feedback tone somehow left the I2S driver active, shut it down
+    // before leaving the toggle. This keeps the GPIO0 power button stable.
+    if (!menuFeedbackEnabled && soundReady) {
+        stopSoundDriverAfterChirp();
+    }
+
+    updateMenuSoundMenuLabel();
+}
+
+// ════════════════════════════════════════════════════════════════
 //  LVGL FLUSH + ENCODER CALLBACKS
 // ════════════════════════════════════════════════════════════════
-
 static void lvgl_flush_cb(lv_display_t *disp,
                           const lv_area_t *area,
                           uint8_t *px_map)
@@ -329,11 +719,29 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     encoder.tick();
     int pos = encoder.getPosition();
+    bool pressed = (digitalRead(ENCODER_BTN) == LOW);
+
+    // Any encoder movement or button press counts as activity.
+    // This wakes the backlight before the UI action continues.
+    if (pos != 0 || pressed) {
+        resetInactivityTimer();
+    }
+
+    // Optional menu feedback sounds. These are intentionally short and
+    // shut I2S back down after each tick/click to avoid the GPIO0
+    // false power-off issue seen when I2S stayed active.
+    static bool wasPressed = false;
+    if (pos != 0) {
+        playMenuTickFeedback();
+    }
+    if (pressed && !wasPressed) {
+        playMenuClickFeedback();
+    }
+    wasPressed = pressed;
+
     data->enc_diff = (int16_t)pos;
     if (pos != 0) encoder.setPosition(0);
-    data->state = (digitalRead(ENCODER_BTN) == LOW)
-                  ? LV_INDEV_STATE_PRESSED
-                  : LV_INDEV_STATE_RELEASED;
+    data->state = pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -355,12 +763,11 @@ void showSplashScreen() {
 // ════════════════════════════════════════════════════════════════
 //  LED HELPERS
 // ════════════════════════════════════════════════════════════════
-
 void setAllLEDs(uint8_t r, uint8_t g, uint8_t b,
                 uint8_t br = LED_BRIGHTNESS)
 {
     for (int i = 0; i < NUM_LEDS; i++) ledBuf[i] = {r, g, b};
-    ledStrip.write(ledBuf, NUM_LEDS, br);
+    refreshCurrentLEDs(br);
 }
 
 void ledStartupFlash() {
@@ -396,7 +803,7 @@ static void ledSpinnerTask(void *param) {
                         (uint8_t)(spinnerColor.g * 12 / 100),
                         (uint8_t)(spinnerColor.b * 12 / 100) };
 
-        ledStrip.write(frame, NUM_LEDS, LED_BRIGHTNESS);
+        ledStrip.write(frame, NUM_LEDS, activeLedBrightness(LED_BRIGHTNESS));
         pos = (pos + 1) % NUM_LEDS;
         vTaskDelay(pdMS_TO_TICKS(80));   // ~12 FPS chase speed
     }
@@ -432,10 +839,9 @@ void stopLEDSpinner(uint8_t r, uint8_t g, uint8_t b) {
 // ════════════════════════════════════════════════════════════════
 //  UI STYLE HELPERS
 // ════════════════════════════════════════════════════════════════
-
 static void applyScreenStyle(lv_obj_t *scr) {
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0d1117), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(scr,   LV_OPA_COVER,           LV_PART_MAIN);
+    lv_obj_set_style_bg_color(scr, TC(bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr,   LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 }
 
@@ -443,14 +849,14 @@ static lv_obj_t *createHeader(lv_obj_t *parent, const char *text) {
     lv_obj_t *bar = lv_obj_create(parent);
     lv_obj_set_size(bar, SCREEN_W, 28);
     lv_obj_set_pos(bar, 0, 0);
-    lv_obj_set_style_bg_color(bar,     lv_color_hex(0x161b22), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(bar,       LV_OPA_COVER,           LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar,     TC(card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar,       LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(bar,       0, LV_PART_MAIN);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t *lbl = lv_label_create(bar);
     lv_label_set_text(lbl, text);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0x58a6ff), LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl, TC(accent), LV_PART_MAIN);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 8, 0);
     return bar;
 }
@@ -459,16 +865,16 @@ static lv_obj_t *createBackBtn(lv_obj_t *parent, lv_event_cb_t cb) {
     lv_obj_t *btn = lv_btn_create(parent);
     lv_obj_set_size(btn, 100, 26);
     lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, 6, -4);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x21262d), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x1f4f8f), LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x388bfd), LV_PART_MAIN | LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(btn, lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, TC(btnDefault), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn, TC(btnFocus),   LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(btn, TC(btnPress),   LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(btn, TC(border), LV_PART_MAIN);
     lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(btn, 5, LV_PART_MAIN);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0xe6edf3), LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl, TC(text), LV_PART_MAIN);
     lv_obj_center(lbl);
     return btn;
 }
@@ -479,30 +885,30 @@ static lv_obj_t *createActionBtn(lv_obj_t *parent,
     lv_obj_t *btn = lv_btn_create(parent);
     lv_obj_set_size(btn, 110, 26);
     lv_obj_align(btn, LV_ALIGN_BOTTOM_RIGHT, -6, -4);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x1a4a1a), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x1f6f1f), LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x3fb950), LV_PART_MAIN | LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(btn, lv_color_hex(0x3fb950), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, TC(actionBg),  LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn, TC(actionFoc), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(btn, TC(success),   LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(btn, TC(actionBdr), LV_PART_MAIN);
     lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(btn, 5, LV_PART_MAIN);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, label);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0xe6edf3), LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl, TC(text), LV_PART_MAIN);
     lv_obj_center(lbl);
     return btn;
 }
 
 static void styleListBtn(lv_obj_t *btn) {
     lv_obj_set_height(btn, 26);
-    lv_obj_set_style_bg_color(btn,   lv_color_hex(0x161b22), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER,           LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_color(btn, lv_color_hex(0xe6edf3), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(btn,   lv_color_hex(0x1f4f8f), LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER,           LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_color(btn, lv_color_hex(0x58a6ff), LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_bg_color(btn,   lv_color_hex(0x388bfd), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(btn,   TC(cardAlt),  LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(btn, TC(text),     LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn,   TC(btnFocus), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER, LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(btn, TC(accent), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(btn, 1,           LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(btn,   TC(btnPress), LV_PART_MAIN | LV_STATE_PRESSED);
     lv_obj_set_style_radius(btn, 4, LV_PART_MAIN);
     lv_obj_set_style_pad_left(btn, 8, LV_PART_MAIN);
 }
@@ -513,7 +919,6 @@ static void deleteGroup(lv_group_t **g)   { if (*g) { lv_group_delete(*g); *g = 
 // ════════════════════════════════════════════════════════════════
 //  MAIN MENU
 // ════════════════════════════════════════════════════════════════
-
 struct MenuItem { const char *icon; const char *label; const char *subTitle; };
 static const MenuItem MENU_ITEMS[4] = {
     { LV_SYMBOL_WIFI,      "WiFi Tools",  LV_SYMBOL_WIFI      "  WiFi Tools" },
@@ -546,11 +951,14 @@ void createMainMenu() {
     lv_obj_t *list = lv_list_create(mainScreen);
     lv_obj_set_size(list, SCREEN_W, SCREEN_H - 28);
     lv_obj_set_pos(list, 0, 28);
-    lv_obj_set_style_bg_color(list,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(list,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(list, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(list,      6, LV_PART_MAIN);
     lv_obj_set_style_pad_row(list,      4, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
 
     deleteGroup(&navGroup);
     navGroup = lv_group_create();
@@ -571,7 +979,6 @@ void createMainMenu() {
 // ════════════════════════════════════════════════════════════════
 //  PLACEHOLDER SUB-SCREEN  (BLE / Misc / GPS)
 // ════════════════════════════════════════════════════════════════
-
 static void cb_subBack(lv_event_t *e) {
     lv_screen_load_anim(mainScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
     deleteGroup(&subGroup);
@@ -589,7 +996,7 @@ void createSubScreen(int idx) {
 
     lv_obj_t *msg = lv_label_create(subScreen);
     lv_label_set_text_fmt(msg, "%s\nComing soon...", MENU_ITEMS[idx].label);
-    lv_obj_set_style_text_color(msg, lv_color_hex(0x8b949e), LV_PART_MAIN);
+    lv_obj_set_style_text_color(msg, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_align(msg, LV_ALIGN_CENTER, 0, -10);
 
@@ -608,12 +1015,115 @@ void createSubScreen(int idx) {
 //
 //  Follows the same menu → tool pattern as WiFi, BLE, and GPS.
 // ════════════════════════════════════════════════════════════════
-
-static const char *MISC_TOOL_LABELS[3] = {
+static const char *MISC_TOOL_LABELS[5] = {
     LV_SYMBOL_SETTINGS "  Device Info",
     LV_SYMBOL_UPLOAD   "  SD Update",
-    LV_SYMBOL_IMAGE    "  Brightness"
+    LV_SYMBOL_IMAGE    "  Brightness",
+    LV_SYMBOL_EDIT     "  Themes",
+    LV_SYMBOL_SETTINGS     "  Scan Defaults"
 };
+
+
+static bool isDisplayRotationFlipped() {
+    return displayRotation == DISPLAY_ROTATION_FLIPPED;
+}
+
+static const char *getRotationMenuLabel() {
+    static char label[40];
+    snprintf(label, sizeof(label), LV_SYMBOL_REFRESH "  Rotation: %s",
+             isDisplayRotationFlipped() ? "Flipped" : "Normal");
+    return label;
+}
+
+static void updateRotationMenuLabel() {
+    if (!miscRotationBtn) return;
+
+    lv_obj_t *label = lv_obj_get_child(miscRotationBtn, 0);
+    if (label) {
+        lv_label_set_text(label, getRotationMenuLabel());
+    }
+}
+
+static void applyDisplayRotation(bool redrawNow) {
+    // Keep LVGL's resolution fixed at SCREEN_W x SCREEN_H. We only allow
+    // landscape rotations, so the layout dimensions remain unchanged.
+    tft.setRotation(displayRotation);
+
+    if (lvDisp) {
+        lv_display_set_resolution(lvDisp, SCREEN_W, SCREEN_H);
+
+        lv_obj_t *active = lv_screen_active();
+        if (active) {
+            lv_obj_invalidate(active);
+        }
+
+        if (redrawNow) {
+            tft.fillScreen(TFT_BLACK);
+            lv_refr_now(lvDisp);
+        }
+    }
+}
+
+static void toggleDisplayRotation() {
+    displayRotation = isDisplayRotationFlipped()
+                    ? DISPLAY_ROTATION_NORMAL
+                    : DISPLAY_ROTATION_FLIPPED;
+
+    resetInactivityTimer();
+    applyDisplayRotation(true);
+    updateRotationMenuLabel();
+}
+
+static const char *getDimmingMenuLabel() {
+    static char label[32];
+    snprintf(label, sizeof(label), LV_SYMBOL_IMAGE "  Dimming: %s",
+             dimmingEnabled ? "ON" : "OFF");
+    return label;
+}
+
+static void updateDimmingMenuLabel() {
+    if (!miscDimmingBtn) return;
+
+    lv_obj_t *label = lv_obj_get_child(miscDimmingBtn, 0);
+    if (label) {
+        lv_label_set_text(label, getDimmingMenuLabel());
+    }
+}
+
+static void toggleDimmingEnabled() {
+    dimmingEnabled = !dimmingEnabled;
+
+    // Toggling counts as activity. If dimming was turned off while already dimmed,
+    // this immediately restores the TFT backlight and APA102 LED brightness.
+    resetInactivityTimer();
+    updateDimmingMenuLabel();
+}
+
+static const char *getLedsMenuLabel() {
+    static char label[32];
+    snprintf(label, sizeof(label), LV_SYMBOL_IMAGE "  LEDs: %s",
+             ledsEnabled ? "ON" : "OFF");
+    return label;
+}
+
+static void updateLedsMenuLabel() {
+    if (!miscLedsBtn) return;
+
+    lv_obj_t *label = lv_obj_get_child(miscLedsBtn, 0);
+    if (label) {
+        lv_label_set_text(label, getLedsMenuLabel());
+    }
+}
+
+static void toggleLedsEnabled() {
+    ledsEnabled = !ledsEnabled;
+
+    // Toggling counts as user activity and immediately applies the new
+    // APA102 visibility state to the current stored ring colour.
+    resetInactivityTimer();
+    refreshCurrentLEDs(LED_BRIGHTNESS);
+    updateLedsMenuLabel();
+}
 
 static void cb_miscMenuBack(lv_event_t *e) {
     miscMenuScreen = nullptr;
@@ -634,9 +1144,16 @@ static void cb_miscToolBack(lv_event_t *e) {
 static void cb_miscToolSelected(lv_event_t *e) {
     int t = (int)(intptr_t)lv_event_get_user_data(e);
     switch (t) {
-        case 0: createDeviceInfo(); break;
+        case 0: createDeviceInfo();        break;
         case 1: createSDUpdate();          break;
         case 2: createBrightnessControl(); break;
+        case 3: createThemePicker();       break;
+        case 4: createScanDefaults();      break;
+        case 5: toggleDimmingEnabled();    break;
+        case 6: toggleLedsEnabled();       break;
+        case 7: toggleSoundEnabled();      break;
+        case 8: toggleMenuFeedbackEnabled(); break;
+        case 9: toggleDisplayRotation();   break;
     }
 }
 
@@ -649,22 +1166,56 @@ void createMiscMenu() {
     lv_obj_t *list = lv_list_create(miscMenuScreen);
     lv_obj_set_size(list, SCREEN_W, SCREEN_H - 28 - 34);
     lv_obj_set_pos(list, 0, 28);
-    lv_obj_set_style_bg_color(list,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(list,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(list, 0,                      LV_PART_MAIN);
     lv_obj_set_style_pad_all(list,      6,                      LV_PART_MAIN);
     lv_obj_set_style_pad_row(list,      4,                      LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
 
     deleteGroup(&miscMenuGroup);
     miscMenuGroup = lv_group_create();
+    miscDimmingBtn = nullptr;
+    miscLedsBtn = nullptr;
+    miscSoundBtn = nullptr;
+    miscMenuSoundBtn = nullptr;
+    miscRotationBtn = nullptr;
 
-    for (int i = 0; i < 3; i++) {
-        lv_obj_t *btn = lv_list_add_btn(list, nullptr, MISC_TOOL_LABELS[i]);
+    for (int i = 0; i < 10; i++) {
+        const char *label = nullptr;
+        if (i < 5) {
+            label = MISC_TOOL_LABELS[i];
+        } else if (i == 5) {
+            label = getDimmingMenuLabel();
+        } else if (i == 6) {
+            label = getLedsMenuLabel();
+        } else if (i == 7) {
+            label = getSoundMenuLabel();
+        } else if (i == 8) {
+            label = getMenuSoundMenuLabel();
+        } else {
+            label = getRotationMenuLabel();
+        }
+        lv_obj_t *btn = lv_list_add_btn(list, nullptr, label);
         styleListBtn(btn);
         lv_obj_set_height(btn, 30);
         lv_obj_add_event_cb(btn, cb_miscToolSelected, LV_EVENT_CLICKED,
                             (void *)(intptr_t)i);
         lv_group_add_obj(miscMenuGroup, btn);
+
+        if (i == 5) {
+            miscDimmingBtn = btn;
+        } else if (i == 6) {
+            miscLedsBtn = btn;
+        } else if (i == 7) {
+            miscSoundBtn = btn;
+        } else if (i == 8) {
+            miscMenuSoundBtn = btn;
+        } else if (i == 9) {
+            miscRotationBtn = btn;
+        }
     }
 
     lv_obj_t *backBtn = createBackBtn(miscMenuScreen, cb_miscMenuBack);
@@ -676,7 +1227,6 @@ void createMiscMenu() {
 }
 
 // ── Misc Tool 1 — Device Info ────────────────────────────────────
-
 void createDeviceInfo() {
     if (miscToolScreen) { lv_obj_delete(miscToolScreen); miscToolScreen = nullptr; }
     miscToolScreen = lv_obj_create(nullptr);
@@ -687,22 +1237,21 @@ void createDeviceInfo() {
     lv_obj_t *card = lv_obj_create(miscToolScreen);
     lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 38);
     lv_obj_set_pos(card, 6, 30);
-    lv_obj_set_style_bg_color(card,     lv_color_hex(0x161b22), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(card,     lv_color_hex(TH.card), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(card,       LV_OPA_COVER,           LV_PART_MAIN);
-    lv_obj_set_style_border_color(card, lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(TH.border), LV_PART_MAIN);
     lv_obj_set_style_border_width(card, 1,                      LV_PART_MAIN);
     lv_obj_set_style_radius(card,       6,                      LV_PART_MAIN);
     lv_obj_set_style_pad_all(card,      6,                      LV_PART_MAIN);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Gather device info at build time
-    uint64_t chipId   = ESP.getEfuseMac();
+    // Gather device info at run time
     uint32_t heap     = ESP.getFreeHeap();
     uint32_t flash    = ESP.getFlashChipSize() / 1024;  // KB
     uint32_t flashSpd = ESP.getFlashChipSpeed() / 1000000; // MHz
     uint8_t cores     = ESP.getChipCores();
     uint32_t cpuMHz   = ESP.getCpuFreqMHz();
-    const char *idfVer = ESP.getSdkVersion();
+    const char *firmwareVer = FIRMWARE_VERSION;
 
     // WiFi MAC
     uint8_t mac[6];
@@ -711,33 +1260,26 @@ void createDeviceInfo() {
     snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    // Chip ID (lower 4 bytes of efuse MAC)
-    char chipIdStr[12];
-    snprintf(chipIdStr, sizeof(chipIdStr), "%08X", (uint32_t)(chipId >> 32));
-
     char info[320];
     snprintf(info, sizeof(info),
+             "FW   : %s\n"
              "Chip : ESP32-S3  (%d cores)\n"
              "CPU  : %lu MHz\n"
              "Flash: %lu KB @ %lu MHz\n"
              "Heap : %lu B free\n"
-             "MAC  : %s\n"
-             "ID   : %s\n"
-             "IDF  : %s",
+             "MAC  : %s",
+             firmwareVer,
              cores,
              (unsigned long)cpuMHz,
              (unsigned long)flash,
              (unsigned long)flashSpd,
              (unsigned long)heap,
-             macStr,
-             chipIdStr,
-             idfVer);
-
+             macStr);
     lv_obj_t *infoLbl = lv_label_create(card);
     lv_label_set_text(infoLbl, info);
     lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(infoLbl, SCREEN_W - 28);
-    lv_obj_set_style_text_color(infoLbl, lv_color_hex(0xe6edf3), LV_PART_MAIN);
+    lv_obj_set_style_text_color(infoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
     lv_obj_align(infoLbl, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *backBtn = createBackBtn(miscToolScreen, cb_miscToolBack);
@@ -760,8 +1302,6 @@ void createDeviceInfo() {
 //  Workflow: Arduino IDE → Sketch → Export Compiled Binary →
 //            rename to firmware.bin → copy to SD root → Flash.
 // ════════════════════════════════════════════════════════════════
-
-
 static lv_obj_t *otaStatusLbl = nullptr;
 static lv_obj_t *otaBar       = nullptr;
 static lv_obj_t *otaPctLbl    = nullptr;
@@ -778,14 +1318,14 @@ static void cb_doFlash(lv_event_t *e) {
     lv_obj_add_state(otaFlashBtn, LV_STATE_DISABLED);
 
     if (!SD.begin(SD_CS, sdSPI)) {
-        otaSetStatus(LV_SYMBOL_CLOSE "  SD card not found!", 0xf85149);
+        otaSetStatus(LV_SYMBOL_CLOSE "  SD card not found!", TH.alert);
         lv_obj_remove_state(otaFlashBtn, LV_STATE_DISABLED);
         return;
     }
 
     File f = SD.open(OTA_FILENAME, FILE_READ);
     if (!f) {
-        otaSetStatus(LV_SYMBOL_CLOSE "  firmware.bin not found!", 0xf85149);
+        otaSetStatus(LV_SYMBOL_CLOSE "  firmware.bin not found!", TH.alert);
         SD.end();
         lv_obj_remove_state(otaFlashBtn, LV_STATE_DISABLED);
         return;
@@ -793,17 +1333,17 @@ static void cb_doFlash(lv_event_t *e) {
 
     size_t fileSize = f.size();
     if (fileSize == 0) {
-        otaSetStatus(LV_SYMBOL_CLOSE "  firmware.bin is empty!", 0xf85149);
+        otaSetStatus(LV_SYMBOL_CLOSE "  firmware.bin is empty!", TH.alert);
         f.close();
         SD.end();
         lv_obj_remove_state(otaFlashBtn, LV_STATE_DISABLED);
         return;
     }
 
-    otaSetStatus(LV_SYMBOL_REFRESH "  Flashing...", 0xe3b341);
+    otaSetStatus(LV_SYMBOL_REFRESH "  Flashing...", TH.warn);
 
     if (!Update.begin(fileSize, U_FLASH)) {
-        otaSetStatus(LV_SYMBOL_CLOSE "  Update.begin() failed!", 0xf85149);
+        otaSetStatus(LV_SYMBOL_CLOSE "  Update.begin() failed!", TH.alert);
         f.close();
         SD.end();
         lv_obj_remove_state(otaFlashBtn, LV_STATE_DISABLED);
@@ -820,7 +1360,7 @@ static void cb_doFlash(lv_event_t *e) {
         size_t n = f.read(buf, toRead);
         if (Update.write(buf, n) != n) {
             Update.abort();
-            otaSetStatus(LV_SYMBOL_CLOSE "  Write error — aborted!", 0xf85149);
+            otaSetStatus(LV_SYMBOL_CLOSE "  Write error — aborted!", TH.alert);
             f.close();
             SD.end();
             lv_obj_remove_state(otaFlashBtn, LV_STATE_DISABLED);
@@ -838,14 +1378,14 @@ static void cb_doFlash(lv_event_t *e) {
     SD.end();
 
     if (!Update.end(true)) {
-        otaSetStatus(LV_SYMBOL_CLOSE "  Verification failed!", 0xf85149);
+        otaSetStatus(LV_SYMBOL_CLOSE "  Verification failed!", TH.alert);
         lv_obj_remove_state(otaFlashBtn, LV_STATE_DISABLED);
         return;
     }
 
     lv_bar_set_value(otaBar, 100, LV_ANIM_OFF);
     lv_label_set_text(otaPctLbl, "100%");
-    otaSetStatus(LV_SYMBOL_OK "  Done! Rebooting...", 0x3fb950);
+    otaSetStatus(LV_SYMBOL_OK "  Done! Rebooting...", TH.success);
     delay(1500);
     ESP.restart();
 }
@@ -865,7 +1405,7 @@ void createSDUpdate() {
     lv_label_set_text(otaStatusLbl,
         "Place firmware.bin in SD root\n"
         "then press Flash.");
-    lv_obj_set_style_text_color(otaStatusLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+    lv_obj_set_style_text_color(otaStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(otaStatusLbl, 8, 30);
 
     otaBar = lv_bar_create(miscToolScreen);
@@ -873,14 +1413,14 @@ void createSDUpdate() {
     lv_obj_set_pos(otaBar, 8, 78);
     lv_bar_set_range(otaBar, 0, 100);
     lv_bar_set_value(otaBar, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(otaBar, lv_color_hex(0x21262d), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(otaBar, lv_color_hex(0x3fb950), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(otaBar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(otaBar, lv_color_hex(TH.success), LV_PART_INDICATOR);
     lv_obj_set_style_radius(otaBar, 3, LV_PART_MAIN);
     lv_obj_set_style_radius(otaBar, 3, LV_PART_INDICATOR);
 
     otaPctLbl = lv_label_create(miscToolScreen);
     lv_label_set_text(otaPctLbl, "");
-    lv_obj_set_style_text_color(otaPctLbl, lv_color_hex(0x3fb950), LV_PART_MAIN);
+    lv_obj_set_style_text_color(otaPctLbl, lv_color_hex(TH.success), LV_PART_MAIN);
     lv_obj_set_pos(otaPctLbl, 8, 92);
 
     lv_obj_t *backBtn = createBackBtn(miscToolScreen, cb_miscToolBack);
@@ -888,7 +1428,7 @@ void createSDUpdate() {
     otaFlashBtn = lv_btn_create(miscToolScreen);
     lv_obj_set_size(otaFlashBtn, 90, 28);
     lv_obj_align(otaFlashBtn, LV_ALIGN_BOTTOM_MID, 30, -4);
-    lv_obj_set_style_bg_color(otaFlashBtn, lv_color_hex(0x238636), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(otaFlashBtn, lv_color_hex(TH.flashGreen), LV_PART_MAIN);
     lv_obj_set_style_radius(otaFlashBtn, 6, LV_PART_MAIN);
     lv_obj_add_event_cb(otaFlashBtn, cb_doFlash, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *flashLbl = lv_label_create(otaFlashBtn);
@@ -907,20 +1447,143 @@ void createSDUpdate() {
 }
 
 // ════════════════════════════════════════════════════════════════
+//  MISC TOOL – SCAN DEFAULTS
+//
+//  Session-only settings. Values start from config.h on boot and reset
+//  after reboot. No Preferences/NVS writes are used here.
+// ════════════════════════════════════════════════════════════════
+static lv_obj_t *scanDefaultsBleBtn    = nullptr;
+static lv_obj_t *scanDefaultsWifiBtn   = nullptr;
+static lv_obj_t *scanDefaultsResultBtn = nullptr;
+static lv_obj_t *scanDefaultsHopBtn    = nullptr;
+
+static const int BLE_TIME_OPTIONS[]    = {5, 8, 10, 15, 20};
+static const int WIFI_TIME_OPTIONS[]   = {5, 10, 15, 20};
+static const int WIFI_RESULT_OPTIONS[] = {10, 20, 30};
+static const int DEAUTH_HOP_OPTIONS[]  = {100, 200, 500, 1000};
+
+static int nextOptionValue(const int *options, int count, int currentValue) {
+    for (int i = 0; i < count; i++) {
+        if (options[i] == currentValue) return options[(i + 1) % count];
+    }
+    return options[0];
+}
+
+static void setBtnText(lv_obj_t *btn, const char *txt) {
+    if (!btn) return;
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (label) lv_label_set_text(label, txt);
+}
+
+static void updateScanDefaultsLabels() {
+    char buf[48];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_BLUETOOTH "  BLE Time: %d sec", bleScanSeconds);
+    setBtnText(scanDefaultsBleBtn, buf);
+    snprintf(buf, sizeof(buf), LV_SYMBOL_WIFI "  WiFi Time: %d sec", wifiScanSeconds);
+    setBtnText(scanDefaultsWifiBtn, buf);
+    snprintf(buf, sizeof(buf), LV_SYMBOL_SETTINGS "  WiFi Results: %d", wifiMaxResults);
+    setBtnText(scanDefaultsResultBtn, buf);
+    snprintf(buf, sizeof(buf), LV_SYMBOL_REFRESH "  Deauth Hop: %d ms", deauthHopMs);
+    setBtnText(scanDefaultsHopBtn, buf);
+}
+
+static void cb_scanDefaultsBle(lv_event_t *e) {
+    bleScanSeconds = nextOptionValue(BLE_TIME_OPTIONS, sizeof(BLE_TIME_OPTIONS) / sizeof(BLE_TIME_OPTIONS[0]), bleScanSeconds);
+    resetInactivityTimer();
+    updateScanDefaultsLabels();
+}
+
+static void cb_scanDefaultsWifiTime(lv_event_t *e) {
+    wifiScanSeconds = nextOptionValue(WIFI_TIME_OPTIONS, sizeof(WIFI_TIME_OPTIONS) / sizeof(WIFI_TIME_OPTIONS[0]), wifiScanSeconds);
+    resetInactivityTimer();
+    updateScanDefaultsLabels();
+}
+
+static void cb_scanDefaultsWifiResults(lv_event_t *e) {
+    wifiMaxResults = nextOptionValue(WIFI_RESULT_OPTIONS, sizeof(WIFI_RESULT_OPTIONS) / sizeof(WIFI_RESULT_OPTIONS[0]), wifiMaxResults);
+    if (wifiMaxResults > MAX_WIFI_RESULTS) wifiMaxResults = MAX_WIFI_RESULTS;
+    resetInactivityTimer();
+    updateScanDefaultsLabels();
+}
+
+static void cb_scanDefaultsDeauthHop(lv_event_t *e) {
+    deauthHopMs = nextOptionValue(DEAUTH_HOP_OPTIONS, sizeof(DEAUTH_HOP_OPTIONS) / sizeof(DEAUTH_HOP_OPTIONS[0]), deauthHopMs);
+    resetInactivityTimer();
+    updateScanDefaultsLabels();
+}
+
+void createScanDefaults() {
+    if (miscToolScreen) { lv_obj_delete(miscToolScreen); miscToolScreen = nullptr; }
+    miscToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(miscToolScreen);
+    createHeader(miscToolScreen, LV_SYMBOL_SETTINGS "  Scan Defaults");
+
+    lv_obj_t *list = lv_list_create(miscToolScreen);
+    lv_obj_set_size(list, SCREEN_W, SCREEN_H - 28 - 34);
+    lv_obj_set_pos(list, 0, 28);
+    lv_obj_set_style_bg_color(list,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(list,       LV_OPA_COVER,           LV_PART_MAIN);
+    lv_obj_set_style_border_width(list, 0,                      LV_PART_MAIN);
+    lv_obj_set_style_pad_all(list,      6,                      LV_PART_MAIN);
+    lv_obj_set_style_pad_row(list,      4,                      LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
+
+    scanDefaultsBleBtn = lv_list_add_btn(list, nullptr, "");
+    styleListBtn(scanDefaultsBleBtn);
+    lv_obj_set_height(scanDefaultsBleBtn, 30);
+    lv_obj_add_event_cb(scanDefaultsBleBtn, cb_scanDefaultsBle, LV_EVENT_CLICKED, nullptr);
+
+    scanDefaultsWifiBtn = lv_list_add_btn(list, nullptr, "");
+    styleListBtn(scanDefaultsWifiBtn);
+    lv_obj_set_height(scanDefaultsWifiBtn, 30);
+    lv_obj_add_event_cb(scanDefaultsWifiBtn, cb_scanDefaultsWifiTime, LV_EVENT_CLICKED, nullptr);
+
+    scanDefaultsResultBtn = lv_list_add_btn(list, nullptr, "");
+    styleListBtn(scanDefaultsResultBtn);
+    lv_obj_set_height(scanDefaultsResultBtn, 30);
+    lv_obj_add_event_cb(scanDefaultsResultBtn, cb_scanDefaultsWifiResults, LV_EVENT_CLICKED, nullptr);
+
+    scanDefaultsHopBtn = lv_list_add_btn(list, nullptr, "");
+    styleListBtn(scanDefaultsHopBtn);
+    lv_obj_set_height(scanDefaultsHopBtn, 30);
+    lv_obj_add_event_cb(scanDefaultsHopBtn, cb_scanDefaultsDeauthHop, LV_EVENT_CLICKED, nullptr);
+
+    updateScanDefaultsLabels();
+
+    lv_obj_t *backBtn = createBackBtn(miscToolScreen, cb_miscToolBack);
+
+    deleteGroup(&miscToolGroup);
+    miscToolGroup = lv_group_create();
+    lv_group_add_obj(miscToolGroup, scanDefaultsBleBtn);
+    lv_group_add_obj(miscToolGroup, scanDefaultsWifiBtn);
+    lv_group_add_obj(miscToolGroup, scanDefaultsResultBtn);
+    lv_group_add_obj(miscToolGroup, scanDefaultsHopBtn);
+    lv_group_add_obj(miscToolGroup, backBtn);
+    setGroup(miscToolGroup);
+
+    setAllLEDs(MENU_COLORS[2].r, MENU_COLORS[2].g, MENU_COLORS[2].b, LED_BRIGHTNESS);
+    lv_screen_load_anim(miscToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+// ════════════════════════════════════════════════════════════════
 //  MISC TOOL 3 – BRIGHTNESS CONTROL
 //
 //  Controls TFT backlight via LEDC PWM on IO15.
 //  Rotary encoder scrolls the bar up/down in 5% steps.
 //  Level persists in lcdBrightness global for the session.
 // ════════════════════════════════════════════════════════════════
-
 static lv_obj_t *brightBar      = nullptr;
 static lv_obj_t *brightPctLbl   = nullptr;
 static lv_obj_t *brightDownBtn  = nullptr;
 static lv_obj_t *brightUpBtn    = nullptr;
 
 static void applyBrightness() {
-    ledcWrite(LCD_BL_CH, lcdBrightness);
+    // A manual brightness change also counts as activity and should restore
+    // the screen if it was auto-dimmed.
+    resetInactivityTimer();
+    applyBacklightLevel((uint8_t)lcdBrightness);
     if (!brightBar || !brightPctLbl) return;
     int pct = (lcdBrightness * 100) / 255;
     lv_bar_set_value(brightBar, pct, LV_ANIM_ON);
@@ -954,7 +1617,7 @@ void createBrightnessControl() {
 
     // Current percentage label
     brightPctLbl = lv_label_create(miscToolScreen);
-    lv_obj_set_style_text_color(brightPctLbl, lv_color_hex(0xe6edf3), LV_PART_MAIN);
+    lv_obj_set_style_text_color(brightPctLbl, lv_color_hex(TH.text), LV_PART_MAIN);
     lv_obj_align(brightPctLbl, LV_ALIGN_CENTER, 0, -30);
 
     // Brightness bar
@@ -962,8 +1625,8 @@ void createBrightnessControl() {
     lv_obj_set_size(brightBar, SCREEN_W - 32, 16);
     lv_obj_align(brightBar, LV_ALIGN_CENTER, 0, 0);
     lv_bar_set_range(brightBar, 0, 100);
-    lv_obj_set_style_bg_color(brightBar, lv_color_hex(0x21262d), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(brightBar, lv_color_hex(0xe3b341), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(brightBar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(brightBar, lv_color_hex(TH.warn), LV_PART_INDICATOR);
     lv_obj_set_style_radius(brightBar, 4, LV_PART_MAIN);
     lv_obj_set_style_radius(brightBar, 4, LV_PART_INDICATOR);
 
@@ -971,7 +1634,7 @@ void createBrightnessControl() {
     brightDownBtn = lv_btn_create(miscToolScreen);
     lv_obj_set_size(brightDownBtn, 52, 30);
     lv_obj_align(brightDownBtn, LV_ALIGN_CENTER, -46, 36);
-    lv_obj_set_style_bg_color(brightDownBtn, lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(brightDownBtn, lv_color_hex(TH.border), LV_PART_MAIN);
     lv_obj_set_style_radius(brightDownBtn, 6, LV_PART_MAIN);
     lv_obj_add_event_cb(brightDownBtn, cb_brightDown, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *dLbl = lv_label_create(brightDownBtn);
@@ -982,7 +1645,7 @@ void createBrightnessControl() {
     brightUpBtn = lv_btn_create(miscToolScreen);
     lv_obj_set_size(brightUpBtn, 52, 30);
     lv_obj_align(brightUpBtn, LV_ALIGN_CENTER, 46, 36);
-    lv_obj_set_style_bg_color(brightUpBtn, lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(brightUpBtn, lv_color_hex(TH.border), LV_PART_MAIN);
     lv_obj_set_style_radius(brightUpBtn, 6, LV_PART_MAIN);
     lv_obj_add_event_cb(brightUpBtn, cb_brightUp, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *uLbl = lv_label_create(brightUpBtn);
@@ -1006,13 +1669,83 @@ void createBrightnessControl() {
 }
 
 // ════════════════════════════════════════════════════════════════
+//  MISC TOOL 4 – THEME PICKER
+//
+//  Displays the 3 available themes as a list. Selecting one sets
+//  currentTheme and navigates back to the misc menu, which redraws
+//  using the new theme. All subsequent screens pick up the new
+//  colors since they are recreated fresh on every navigation.
+// ════════════════════════════════════════════════════════════════
+void createThemePicker() {
+    if (miscToolScreen) { lv_obj_delete(miscToolScreen); miscToolScreen = nullptr; }
+    miscToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(miscToolScreen);
+    createHeader(miscToolScreen, LV_SYMBOL_EDIT "  Themes");
+
+    lv_obj_t *list = lv_list_create(miscToolScreen);
+    lv_obj_set_size(list, SCREEN_W, SCREEN_H - 28 - 34);
+    lv_obj_set_pos(list, 0, 28);
+    lv_obj_set_style_bg_color(list,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(list,       LV_OPA_COVER,        LV_PART_MAIN);
+    lv_obj_set_style_border_width(list, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(list,      6, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(list,      4, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
+
+    deleteGroup(&miscToolGroup);
+    miscToolGroup = lv_group_create();
+
+    int numThemes = (int)(sizeof(THEMES) / sizeof(THEMES[0]));
+    for (int i = 0; i < numThemes; i++) {
+        // Build label — mark active theme with a checkmark
+        char label[32];
+        snprintf(label, sizeof(label), "%s%s",
+                 (i == currentTheme) ? LV_SYMBOL_OK "  " : "    ",
+                 THEMES[i].name);
+
+        lv_obj_t *btn = lv_list_add_btn(list, nullptr, label);
+        styleListBtn(btn);
+        lv_obj_set_height(btn, 30);
+
+        // Active theme in accent color, others in dim
+        lv_obj_set_style_text_color(btn,
+            (i == currentTheme) ? lv_color_hex(TH.accent) : lv_color_hex(TH.textDim),
+            LV_PART_MAIN | LV_STATE_DEFAULT);
+
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            int idx = (int)(intptr_t)lv_event_get_user_data(ev);
+            currentTheme = idx;
+            miscToolScreen = nullptr;
+            deleteGroup(&miscToolGroup);
+            setAllLEDs(MENU_COLORS[2].r, MENU_COLORS[2].g, MENU_COLORS[2].b, 3);
+            // Rebuild main menu with new theme so it recolors too
+            // (createMainMenu calls lv_screen_load so mainScreen is refreshed)
+            if (mainScreen) { lv_obj_delete(mainScreen); mainScreen = nullptr; }
+            createMainMenu();
+            // Then navigate to the freshly themed misc menu
+            createMiscMenu();
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        lv_group_add_obj(miscToolGroup, btn);
+    }
+
+    lv_obj_t *backBtn = createBackBtn(miscToolScreen, cb_miscToolBack);
+    lv_group_add_obj(miscToolGroup, backBtn);
+    setGroup(miscToolGroup);
+
+    setAllLEDs(MENU_COLORS[2].r, MENU_COLORS[2].g, MENU_COLORS[2].b, LED_BRIGHTNESS);
+    lv_screen_load_anim(miscToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+// ════════════════════════════════════════════════════════════════
 //  GPS TOOLS
 //
 //  Follows the same menu → tool pattern as WiFi and BLE.
 //  GPS data is fed non-blocking in loop() via TinyGPS++.
 //  UART1: GPIO44 RX, GPIO43 TX, 9600 baud.
 // ════════════════════════════════════════════════════════════════
-
 static const char *GPS_TOOL_LABELS[2] = {
     LV_SYMBOL_GPS     "  GPS Stats",
     LV_SYMBOL_SAVE    "  Wiggle Wars"
@@ -1067,11 +1800,14 @@ void createGPSMenu() {
     lv_obj_t *list = lv_list_create(gpsMenuScreen);
     lv_obj_set_size(list, SCREEN_W, SCREEN_H - 28 - 34);
     lv_obj_set_pos(list, 0, 28);
-    lv_obj_set_style_bg_color(list,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(list,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(list, 0,                      LV_PART_MAIN);
     lv_obj_set_style_pad_all(list,      6,                      LV_PART_MAIN);
     lv_obj_set_style_pad_row(list,      4,                      LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
 
     deleteGroup(&gpsMenuGroup);
     gpsMenuGroup = lv_group_create();
@@ -1094,7 +1830,6 @@ void createGPSMenu() {
 }
 
 // ── GPS Stats ────────────────────────────────────────────────────
-
 static lv_obj_t *gpsFixLbl = nullptr;
 static lv_obj_t *gpsLatLbl = nullptr;
 static lv_obj_t *gpsLngLbl = nullptr;
@@ -1109,7 +1844,7 @@ static void gps_refresh_cb(lv_timer_t *) {
 
     if (!hasFix) {
         lv_label_set_text(gpsFixLbl, LV_SYMBOL_WARNING "  Searching for fix...");
-        lv_obj_set_style_text_color(gpsFixLbl, lv_color_hex(0xe3b341), LV_PART_MAIN);
+        lv_obj_set_style_text_color(gpsFixLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
         lv_label_set_text(gpsLatLbl, "Lat:  ---.------");
         lv_label_set_text(gpsLngLbl, "Lng:  ---.------");
         lv_label_set_text(gpsSpdLbl, "Spd:  --- km/h");
@@ -1121,7 +1856,7 @@ static void gps_refresh_cb(lv_timer_t *) {
     }
 
     lv_label_set_text(gpsFixLbl, LV_SYMBOL_GPS "  Fix acquired");
-    lv_obj_set_style_text_color(gpsFixLbl, lv_color_hex(0x3fb950), LV_PART_MAIN);
+    lv_obj_set_style_text_color(gpsFixLbl, lv_color_hex(TH.success), LV_PART_MAIN);
 
     char buf[40];
     snprintf(buf, sizeof(buf), "Lat:  %.6f", gps.location.lat());
@@ -1152,9 +1887,9 @@ void createGPSStats() {
     lv_obj_t *card = lv_obj_create(gpsToolScreen);
     lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 38);
     lv_obj_set_pos(card, 6, 30);
-    lv_obj_set_style_bg_color(card,     lv_color_hex(0x161b22), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(card,     lv_color_hex(TH.card), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(card,       LV_OPA_COVER,           LV_PART_MAIN);
-    lv_obj_set_style_border_color(card, lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(TH.border), LV_PART_MAIN);
     lv_obj_set_style_border_width(card, 1,                      LV_PART_MAIN);
     lv_obj_set_style_radius(card,       6,                      LV_PART_MAIN);
     lv_obj_set_style_pad_all(card,      6,                      LV_PART_MAIN);
@@ -1164,32 +1899,32 @@ void createGPSStats() {
 
     gpsFixLbl = lv_label_create(card);
     lv_label_set_text(gpsFixLbl, LV_SYMBOL_WARNING "  Searching for fix...");
-    lv_obj_set_style_text_color(gpsFixLbl, lv_color_hex(0xe3b341), LV_PART_MAIN);
+    lv_obj_set_style_text_color(gpsFixLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
     lv_obj_set_pos(gpsFixLbl, 0, 0);
 
     gpsLatLbl = lv_label_create(card);
     lv_label_set_text(gpsLatLbl, "Lat:  ---.------");
-    lv_obj_set_style_text_color(gpsLatLbl, lv_color_hex(0x58a6ff), LV_PART_MAIN);
+    lv_obj_set_style_text_color(gpsLatLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
     lv_obj_set_pos(gpsLatLbl, 0, rowH * 1 + 4);
 
     gpsLngLbl = lv_label_create(card);
     lv_label_set_text(gpsLngLbl, "Lng:  ---.------");
-    lv_obj_set_style_text_color(gpsLngLbl, lv_color_hex(0x58a6ff), LV_PART_MAIN);
+    lv_obj_set_style_text_color(gpsLngLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
     lv_obj_set_pos(gpsLngLbl, 0, rowH * 2 + 4);
 
     gpsSpdLbl = lv_label_create(card);
     lv_label_set_text(gpsSpdLbl, "Spd:  --- km/h");
-    lv_obj_set_style_text_color(gpsSpdLbl, lv_color_hex(0x3fb950), LV_PART_MAIN);
+    lv_obj_set_style_text_color(gpsSpdLbl, lv_color_hex(TH.success), LV_PART_MAIN);
     lv_obj_set_pos(gpsSpdLbl, 0, rowH * 3 + 4);
 
     gpsAltLbl = lv_label_create(card);
     lv_label_set_text(gpsAltLbl, "Alt:  --- m");
-    lv_obj_set_style_text_color(gpsAltLbl, lv_color_hex(0x3fb950), LV_PART_MAIN);
+    lv_obj_set_style_text_color(gpsAltLbl, lv_color_hex(TH.success), LV_PART_MAIN);
     lv_obj_set_pos(gpsAltLbl, 0, rowH * 4 + 4);
 
     gpsSatLbl = lv_label_create(card);
     lv_label_set_text(gpsSatLbl, "Sats: 0");
-    lv_obj_set_style_text_color(gpsSatLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+    lv_obj_set_style_text_color(gpsSatLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(gpsSatLbl, 0, rowH * 5 + 4);
 
     lv_obj_t *backBtn = createBackBtn(gpsToolScreen, cb_gpsToolBack);
@@ -1217,7 +1952,6 @@ void createGPSStats() {
 //  File named: /wigle_YYYYMMDD_HHMMSS.csv
 //  Requires GPS fix before scanning starts.
 // ════════════════════════════════════════════════════════════════
-
 static lv_obj_t   *wiggleStatusLbl  = nullptr;
 static lv_obj_t   *wiggleScanLbl    = nullptr;
 static lv_obj_t   *wiggleNetLbl     = nullptr;
@@ -1321,7 +2055,7 @@ static void wiggle_refresh_cb(lv_timer_t *) {
         lv_label_set_text(wiggleStatusLbl,
             LV_SYMBOL_WARNING "  Waiting for GPS fix...");
         lv_obj_set_style_text_color(wiggleStatusLbl,
-            lv_color_hex(0xe3b341), LV_PART_MAIN);
+            lv_color_hex(TH.warn), LV_PART_MAIN);
         return;
     }
 
@@ -1335,7 +2069,7 @@ static void wiggle_refresh_cb(lv_timer_t *) {
         lv_label_set_text(wiggleStatusLbl,
             LV_SYMBOL_REFRESH "  Scanning...");
         lv_obj_set_style_text_color(wiggleStatusLbl,
-            lv_color_hex(0x58a6ff), LV_PART_MAIN);
+            lv_color_hex(TH.accent), LV_PART_MAIN);
         return;
     }
 
@@ -1352,7 +2086,7 @@ static void wiggle_refresh_cb(lv_timer_t *) {
                  (int)gps.satellites.value());
         lv_label_set_text(wiggleStatusLbl, buf);
         lv_obj_set_style_text_color(wiggleStatusLbl,
-            lv_color_hex(0x3fb950), LV_PART_MAIN);
+            lv_color_hex(TH.success), LV_PART_MAIN);
 
         snprintf(buf, sizeof(buf), "Scans: %d", wiggleScanCount);
         lv_label_set_text(wiggleScanLbl, buf);
@@ -1370,7 +2104,7 @@ static void cb_wiggleStart(lv_event_t *e) {
         lv_label_set_text(wiggleStatusLbl,
             LV_SYMBOL_CLOSE "  SD card not found!");
         lv_obj_set_style_text_color(wiggleStatusLbl,
-            lv_color_hex(0xf85149), LV_PART_MAIN);
+            lv_color_hex(TH.alert), LV_PART_MAIN);
         return;
     }
 
@@ -1379,7 +2113,7 @@ static void cb_wiggleStart(lv_event_t *e) {
         lv_label_set_text(wiggleStatusLbl,
             LV_SYMBOL_WARNING "  Need GPS fix first!");
         lv_obj_set_style_text_color(wiggleStatusLbl,
-            lv_color_hex(0xe3b341), LV_PART_MAIN);
+            lv_color_hex(TH.warn), LV_PART_MAIN);
         return;
     }
 
@@ -1387,7 +2121,7 @@ static void cb_wiggleStart(lv_event_t *e) {
         lv_label_set_text(wiggleStatusLbl,
             LV_SYMBOL_CLOSE "  Failed to create file!");
         lv_obj_set_style_text_color(wiggleStatusLbl,
-            lv_color_hex(0xf85149), LV_PART_MAIN);
+            lv_color_hex(TH.alert), LV_PART_MAIN);
         return;
     }
 
@@ -1428,7 +2162,7 @@ static void cb_wiggleStop(lv_event_t *e) {
     lv_label_set_text(wiggleStatusLbl,
         LV_SYMBOL_OK "  Stopped — file saved");
     lv_obj_set_style_text_color(wiggleStatusLbl,
-        lv_color_hex(0x3fb950), LV_PART_MAIN);
+        lv_color_hex(TH.success), LV_PART_MAIN);
 
     lv_obj_remove_state(wiggleStartBtn, LV_STATE_DISABLED);
     lv_obj_add_state(wiggleStopBtn, LV_STATE_DISABLED);
@@ -1456,16 +2190,16 @@ void createWiggleWars() {
     lv_label_set_text(wiggleStatusLbl,
         LV_SYMBOL_GPS "  Press Start to begin");
     lv_obj_set_style_text_color(wiggleStatusLbl,
-        lv_color_hex(0x8b949e), LV_PART_MAIN);
+        lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(wiggleStatusLbl, 8, 30);
 
     // Stats card
     lv_obj_t *card = lv_obj_create(gpsToolScreen);
     lv_obj_set_size(card, SCREEN_W - 12, 56);
     lv_obj_set_pos(card, 6, 50);
-    lv_obj_set_style_bg_color(card,     lv_color_hex(0x161b22), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(card,     lv_color_hex(TH.card), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(card,       LV_OPA_COVER,           LV_PART_MAIN);
-    lv_obj_set_style_border_color(card, lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(TH.border), LV_PART_MAIN);
     lv_obj_set_style_border_width(card, 1,                      LV_PART_MAIN);
     lv_obj_set_style_radius(card,       6,                      LV_PART_MAIN);
     lv_obj_set_style_pad_all(card,      5,                      LV_PART_MAIN);
@@ -1474,19 +2208,19 @@ void createWiggleWars() {
     wiggleScanLbl = lv_label_create(card);
     lv_label_set_text(wiggleScanLbl, "Scans: 0");
     lv_obj_set_style_text_color(wiggleScanLbl,
-        lv_color_hex(0x58a6ff), LV_PART_MAIN);
+        lv_color_hex(TH.accent), LV_PART_MAIN);
     lv_obj_set_pos(wiggleScanLbl, 0, 0);
 
     wiggleNetLbl = lv_label_create(card);
     lv_label_set_text(wiggleNetLbl, "Nets logged: 0");
     lv_obj_set_style_text_color(wiggleNetLbl,
-        lv_color_hex(0x3fb950), LV_PART_MAIN);
+        lv_color_hex(TH.success), LV_PART_MAIN);
     lv_obj_set_pos(wiggleNetLbl, 0, 18);
 
     wiggleFileLbl = lv_label_create(card);
     lv_label_set_text(wiggleFileLbl, "File: none");
     lv_obj_set_style_text_color(wiggleFileLbl,
-        lv_color_hex(0x8b949e), LV_PART_MAIN);
+        lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(wiggleFileLbl, 0, 36);
 
     // Start / Stop buttons alongside Back
@@ -1497,7 +2231,7 @@ void createWiggleWars() {
     lv_obj_set_size(wiggleStartBtn, 70, 28);
     lv_obj_align(wiggleStartBtn, LV_ALIGN_BOTTOM_MID, -12, -4);
     lv_obj_set_style_bg_color(wiggleStartBtn,
-        lv_color_hex(0x238636), LV_PART_MAIN);
+        lv_color_hex(TH.flashGreen), LV_PART_MAIN);
     lv_obj_set_style_radius(wiggleStartBtn, 6, LV_PART_MAIN);
     lv_obj_add_event_cb(wiggleStartBtn, cb_wiggleStart, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *startLbl = lv_label_create(wiggleStartBtn);
@@ -1509,7 +2243,7 @@ void createWiggleWars() {
     lv_obj_set_size(wiggleStopBtn, 70, 28);
     lv_obj_align(wiggleStopBtn, LV_ALIGN_BOTTOM_MID, 62, -4);
     lv_obj_set_style_bg_color(wiggleStopBtn,
-        lv_color_hex(0xb62324), LV_PART_MAIN);
+        lv_color_hex(TH.stopRed), LV_PART_MAIN);
     lv_obj_set_style_radius(wiggleStopBtn, 6, LV_PART_MAIN);
     lv_obj_add_state(wiggleStopBtn, LV_STATE_DISABLED);
     lv_obj_add_event_cb(wiggleStopBtn, cb_wiggleStop, LV_EVENT_CLICKED, nullptr);
@@ -1532,7 +2266,6 @@ void createWiggleWars() {
 // ════════════════════════════════════════════════════════════════
 //  WIFI MENU
 // ════════════════════════════════════════════════════════════════
-
 static const char *WIFI_TOOL_LABELS[6] = {
     LV_SYMBOL_WIFI     "  Network Scanner",
     LV_SYMBOL_WARNING  "  Deauth Detector",
@@ -1570,11 +2303,14 @@ void createWiFiMenu() {
     lv_obj_t *list = lv_list_create(wifiMenuScreen);
     lv_obj_set_size(list, SCREEN_W, SCREEN_H - 28 - 34);
     lv_obj_set_pos(list, 0, 28);
-    lv_obj_set_style_bg_color(list,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(list,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(list, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(list,      6, LV_PART_MAIN);
     lv_obj_set_style_pad_row(list,      4, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
 
     deleteGroup(&wifiMenuGroup);
     wifiMenuGroup = lv_group_create();
@@ -1599,7 +2335,6 @@ void createWiFiMenu() {
 // ════════════════════════════════════════════════════════════════
 //  WIFI UTILITY FUNCTIONS
 // ════════════════════════════════════════════════════════════════
-
 static const char *authModeStr(wifi_auth_mode_t m) {
     switch (m) {
         case WIFI_AUTH_OPEN:          return "Open";
@@ -1613,9 +2348,9 @@ static const char *authModeStr(wifi_auth_mode_t m) {
 }
 
 static lv_color_t rssiColor(int8_t rssi) {
-    if (rssi >= -55) return lv_color_hex(0x3fb950);
-    if (rssi >= -70) return lv_color_hex(0xe3b341);
-    return              lv_color_hex(0xf85149);
+    if (rssi >= -55) return lv_color_hex(TH.success);
+    if (rssi >= -70) return lv_color_hex(TH.warn);
+    return              lv_color_hex(TH.alert);
 }
 
 static const char *rssiQuality(int8_t rssi) {
@@ -1639,9 +2374,34 @@ static int doWiFiScan() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     delay(100);
-    int n = WiFi.scanNetworks(false, true);
+
+    // Runtime WiFi scan time is reset-after-reboot and controlled from Misc > Scan Defaults.
+    // Arduino WiFi scanning is async here so the configured time can act as a soft timeout.
+    WiFi.scanDelete();
+    WiFi.scanNetworks(true, true);  // async=true, show_hidden=true
+
+    int n = WIFI_SCAN_RUNNING;
+    unsigned long startMs = millis();
+    unsigned long timeoutMs = (unsigned long)wifiScanSeconds * 1000UL;
+    while ((millis() - startMs) < timeoutMs) {
+        n = WiFi.scanComplete();
+        if (n >= 0) break;
+        lv_timer_handler();
+        delay(25);
+    }
+
+    if (n == WIFI_SCAN_RUNNING) {
+        esp_wifi_scan_stop();
+        delay(25);
+        n = WiFi.scanComplete();
+    }
+
     if (n < 0) n = 0;
-    if (n > MAX_WIFI_RESULTS) n = MAX_WIFI_RESULTS;
+
+    // wifiEntries[] is compiled to MAX_WIFI_RESULTS, so runtime value is safely capped.
+    int resultLimit = wifiMaxResults;
+    if (resultLimit > MAX_WIFI_RESULTS) resultLimit = MAX_WIFI_RESULTS;
+    if (n > resultLimit) n = resultLimit;
     wifiEntryCount = n;
 
     for (int i = 0; i < n; i++) {
@@ -1669,7 +2429,6 @@ static int doWiFiScan() {
 // ════════════════════════════════════════════════════════════════
 //  SHARED BACK CALLBACKS
 // ════════════════════════════════════════════════════════════════
-
 static void cb_wifiToolBack(lv_event_t *e) {
     if (deauthActive) {
         deauthActive = false;
@@ -1708,7 +2467,6 @@ static void cb_wifiDetailBack(lv_event_t *e) {
 // ════════════════════════════════════════════════════════════════
 //  TOOL 1 – NETWORK SCANNER
 // ════════════════════════════════════════════════════════════════
-
 static lv_obj_t *scanList      = nullptr;
 static lv_obj_t *scanStatusLbl = nullptr;
 static lv_obj_t *scanBackBtn   = nullptr;   // saved so rebuildScanList can rebuild the group
@@ -1746,7 +2504,7 @@ static void rebuildScanList() {
 
 static void cb_doScan(lv_event_t *e) {
     lv_label_set_text(scanStatusLbl, LV_SYMBOL_REFRESH "  Scanning...");
-    lv_obj_set_style_text_color(scanStatusLbl, lv_color_hex(0xe3b341), LV_PART_MAIN);
+    lv_obj_set_style_text_color(scanStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
     lv_timer_handler();
 
     // Green spinner while scan blocks core 1
@@ -1759,7 +2517,7 @@ static void cb_doScan(lv_event_t *e) {
              found, found == 1 ? "" : "s");
     lv_label_set_text(scanStatusLbl, buf);
     lv_obj_set_style_text_color(scanStatusLbl,
-        found > 0 ? lv_color_hex(0x3fb950) : lv_color_hex(0x8b949e),
+        found > 0 ? lv_color_hex(TH.success) : lv_color_hex(TH.textDim),
         LV_PART_MAIN);
 
     rebuildScanList();
@@ -1773,14 +2531,14 @@ void createNetworkScanner() {
 
     scanStatusLbl = lv_label_create(wifiToolScreen);
     lv_label_set_text(scanStatusLbl, "Press Scan to start");
-    lv_obj_set_style_text_color(scanStatusLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+    lv_obj_set_style_text_color(scanStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(scanStatusLbl, 8, 30);
 
     // List: header(28) + status(18) + bottom bar(34) = 80 used; rest for list
     scanList = lv_list_create(wifiToolScreen);
     lv_obj_set_size(scanList, SCREEN_W, SCREEN_H - 80);
     lv_obj_set_pos(scanList, 0, 48);
-    lv_obj_set_style_bg_color(scanList,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(scanList,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scanList,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(scanList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(scanList,      2, LV_PART_MAIN);
@@ -1802,7 +2560,6 @@ void createNetworkScanner() {
 // ════════════════════════════════════════════════════════════════
 //  NETWORK DETAIL SCREEN
 // ════════════════════════════════════════════════════════════════
-
 void createNetworkDetail(int idx) {
     if (wifiDetailScreen) { lv_obj_delete(wifiDetailScreen); wifiDetailScreen = nullptr; }
     wifiDetailScreen = lv_obj_create(nullptr);
@@ -1816,9 +2573,9 @@ void createNetworkDetail(int idx) {
     lv_obj_t *card = lv_obj_create(wifiDetailScreen);
     lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
     lv_obj_set_pos(card, 6, 30);
-    lv_obj_set_style_bg_color(card,      lv_color_hex(0x161b22), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(card,      lv_color_hex(TH.card), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(card,        LV_OPA_COVER,           LV_PART_MAIN);
-    lv_obj_set_style_border_color(card,  lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_border_color(card,  lv_color_hex(TH.border), LV_PART_MAIN);
     lv_obj_set_style_border_width(card,  1, LV_PART_MAIN);
     lv_obj_set_style_radius(card,        6, LV_PART_MAIN);
     lv_obj_set_style_pad_all(card,       6, LV_PART_MAIN);
@@ -1842,7 +2599,7 @@ void createNetworkDetail(int idx) {
     lv_label_set_text(infoLbl, info);
     lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(infoLbl, SCREEN_W - 28);
-    lv_obj_set_style_text_color(infoLbl, lv_color_hex(0xe6edf3), LV_PART_MAIN);
+    lv_obj_set_style_text_color(infoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
     lv_obj_align(infoLbl, LV_ALIGN_TOP_LEFT, 0, 0);
 
     // RSSI bar (requires LV_USE_BAR 1 in lv_conf.h)
@@ -1851,7 +2608,7 @@ void createNetworkDetail(int idx) {
     lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
     lv_bar_set_range(bar, -100, -30);
     lv_bar_set_value(bar, rssi, LV_ANIM_ON);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0x21262d), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
     lv_obj_set_style_bg_color(bar, rssiColor(rssi),        LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar,   3, LV_PART_MAIN);
     lv_obj_set_style_radius(bar,   3, LV_PART_INDICATOR);
@@ -1874,7 +2631,6 @@ void createNetworkDetail(int idx) {
 //    0xA0 = Disassociation    (Management, subtype 10)
 //  Channel hops 1-13 every 200 ms in loop() below.
 // ════════════════════════════════════════════════════════════════
-
 typedef struct {
     uint8_t  frameCtrl[2];
     uint16_t duration;
@@ -1919,12 +2675,17 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 static void deauth_refresh_cb(lv_timer_t *) {
     if (!deauthCountLbl || !deauthEventList) return;
 
+    if (deauthTotal > deauthSoundedTotal) {
+        playDeauthChirp();
+        deauthSoundedTotal = deauthTotal;
+    }
+
     char buf[56];
     snprintf(buf, sizeof(buf),
              LV_SYMBOL_WARNING "  Deauth frames: %d", deauthTotal);
     lv_label_set_text(deauthCountLbl, buf);
     lv_obj_set_style_text_color(deauthCountLbl,
-        deauthTotal > 0 ? lv_color_hex(0xf85149) : lv_color_hex(0x3fb950),
+        deauthTotal > 0 ? lv_color_hex(TH.alert) : lv_color_hex(TH.success),
         LV_PART_MAIN);
 
     lv_obj_clean(deauthEventList);
@@ -1932,7 +2693,7 @@ static void deauth_refresh_cb(lv_timer_t *) {
 
     if (total == 0) {
         lv_obj_t *e = lv_list_add_text(deauthEventList, "No frames detected yet...");
-        if (e) lv_obj_set_style_text_color(e, lv_color_hex(0x8b949e), LV_PART_MAIN);
+        if (e) lv_obj_set_style_text_color(e, lv_color_hex(TH.textDim), LV_PART_MAIN);
         return;
     }
 
@@ -1945,7 +2706,7 @@ static void deauth_refresh_cb(lv_timer_t *) {
                  deauthLog[slot].reason);
         lv_obj_t *entry = lv_list_add_text(deauthEventList, row);
         if (entry)
-            lv_obj_set_style_text_color(entry, lv_color_hex(0xf85149), LV_PART_MAIN);
+            lv_obj_set_style_text_color(entry, lv_color_hex(TH.alert), LV_PART_MAIN);
     }
 }
 
@@ -1958,18 +2719,18 @@ void createDeauthDetector() {
     deauthCountLbl = lv_label_create(wifiToolScreen);
     lv_label_set_text(deauthCountLbl,
                       LV_SYMBOL_WARNING "  Deauth frames: 0");
-    lv_obj_set_style_text_color(deauthCountLbl, lv_color_hex(0x3fb950), LV_PART_MAIN);
+    lv_obj_set_style_text_color(deauthCountLbl, lv_color_hex(TH.success), LV_PART_MAIN);
     lv_obj_set_pos(deauthCountLbl, 8, 30);
 
     lv_obj_t *hopLbl = lv_label_create(wifiToolScreen);
     lv_label_set_text(hopLbl, "Hopping ch 1-13");
-    lv_obj_set_style_text_color(hopLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+    lv_obj_set_style_text_color(hopLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_align(hopLbl, LV_ALIGN_TOP_RIGHT, -8, 30);
 
     deauthEventList = lv_list_create(wifiToolScreen);
     lv_obj_set_size(deauthEventList, SCREEN_W, SCREEN_H - 80);
     lv_obj_set_pos(deauthEventList, 0, 48);
-    lv_obj_set_style_bg_color(deauthEventList, lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(deauthEventList, lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(deauthEventList,   LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(deauthEventList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(deauthEventList,  2, LV_PART_MAIN);
@@ -1978,7 +2739,7 @@ void createDeauthDetector() {
     lv_obj_t *initLbl =
         lv_list_add_text(deauthEventList, "Monitoring... (no events yet)");
     if (initLbl)
-        lv_obj_set_style_text_color(initLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+        lv_obj_set_style_text_color(initLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
 
     lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
     deleteGroup(&wifiToolGroup);
@@ -1989,6 +2750,7 @@ void createDeauthDetector() {
     // Start sniffer
     deauthTotal  = 0;
     deauthHead   = 0;
+    deauthSoundedTotal = 0;
     deauthActive = true;
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -2006,7 +2768,6 @@ void createDeauthDetector() {
 // ════════════════════════════════════════════════════════════════
 //  TOOL 3 – CHANNEL ANALYZER
 // ════════════════════════════════════════════════════════════════
-
 static lv_obj_t *chanStatusLbl = nullptr;
 static lv_obj_t *chanChartArea = nullptr;
 
@@ -2032,10 +2793,10 @@ static void buildChannelBars() {
         int y    = maxBarH - barH;
 
         lv_color_t col;
-        if      (chanNetCount[ch] == 0) col = lv_color_hex(0x21262d);
-        else if (chanNetCount[ch] <= 2) col = lv_color_hex(0x3fb950);
-        else if (chanNetCount[ch] <= 4) col = lv_color_hex(0xe3b341);
-        else                            col = lv_color_hex(0xf85149);
+        if      (chanNetCount[ch] == 0) col = lv_color_hex(TH.barBg);
+        else if (chanNetCount[ch] <= 2) col = lv_color_hex(TH.success);
+        else if (chanNetCount[ch] <= 4) col = lv_color_hex(TH.warn);
+        else                            col = lv_color_hex(TH.alert);
 
         lv_obj_t *bar = lv_obj_create(chanChartArea);
         lv_obj_set_size(bar, barW, barH);
@@ -2051,7 +2812,7 @@ static void buildChannelBars() {
         char cb[4];
         snprintf(cb, sizeof(cb), "%d", ch);
         lv_label_set_text(chLbl, cb);
-        lv_obj_set_style_text_color(chLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+        lv_obj_set_style_text_color(chLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
         lv_obj_set_pos(chLbl, x, maxBarH + 2);
 
         // Count label above bar
@@ -2060,7 +2821,7 @@ static void buildChannelBars() {
             char cnt[4];
             snprintf(cnt, sizeof(cnt), "%d", chanNetCount[ch]);
             lv_label_set_text(cLbl, cnt);
-            lv_obj_set_style_text_color(cLbl, lv_color_hex(0xe6edf3), LV_PART_MAIN);
+            lv_obj_set_style_text_color(cLbl, lv_color_hex(TH.text), LV_PART_MAIN);
             lv_obj_set_pos(cLbl, x, y > 12 ? y - 12 : 0);
         }
     }
@@ -2068,7 +2829,7 @@ static void buildChannelBars() {
 
 static void cb_doChannelScan(lv_event_t *e) {
     lv_label_set_text(chanStatusLbl, LV_SYMBOL_REFRESH "  Scanning channels...");
-    lv_obj_set_style_text_color(chanStatusLbl, lv_color_hex(0xe3b341), LV_PART_MAIN);
+    lv_obj_set_style_text_color(chanStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
     if (chanChartArea) lv_obj_clean(chanChartArea);
     lv_timer_handler();
 
@@ -2104,7 +2865,7 @@ static void cb_doChannelScan(lv_event_t *e) {
              n, occupied, occupied == 1 ? "" : "s");
     lv_label_set_text(chanStatusLbl, buf);
     lv_obj_set_style_text_color(chanStatusLbl,
-        n > 0 ? lv_color_hex(0x3fb950) : lv_color_hex(0x8b949e),
+        n > 0 ? lv_color_hex(TH.success) : lv_color_hex(TH.textDim),
         LV_PART_MAIN);
 
     buildChannelBars();
@@ -2118,15 +2879,15 @@ void createChannelAnalyzer() {
 
     chanStatusLbl = lv_label_create(wifiToolScreen);
     lv_label_set_text(chanStatusLbl, "Press Scan to analyze channels 1-13");
-    lv_obj_set_style_text_color(chanStatusLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+    lv_obj_set_style_text_color(chanStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(chanStatusLbl, 8, 30);
 
     chanChartArea = lv_obj_create(wifiToolScreen);
     lv_obj_set_size(chanChartArea, SCREEN_W - 12, SCREEN_H - 80);
     lv_obj_set_pos(chanChartArea, 6, 48);
-    lv_obj_set_style_bg_color(chanChartArea, lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(chanChartArea, lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(chanChartArea,   LV_OPA_COVER,           LV_PART_MAIN);
-    lv_obj_set_style_border_color(chanChartArea, lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_border_color(chanChartArea, lv_color_hex(TH.border), LV_PART_MAIN);
     lv_obj_set_style_border_width(chanChartArea, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(chanChartArea, 4, LV_PART_MAIN);
     lv_obj_set_style_pad_all(chanChartArea, 4, LV_PART_MAIN);
@@ -2134,7 +2895,7 @@ void createChannelAnalyzer() {
 
     lv_obj_t *ph = lv_label_create(chanChartArea);
     lv_label_set_text(ph, "Channels 1-13");
-    lv_obj_set_style_text_color(ph, lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_text_color(ph, lv_color_hex(TH.border), LV_PART_MAIN);
     lv_obj_align(ph, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
@@ -2152,8 +2913,8 @@ void createChannelAnalyzer() {
 }
 
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-//  TOOL 4 – PINEAP HUNTER  Credit: https://github.com/n0xa
+// ════════════════════════════════════════════════════════════════
+//  TOOL 4 – PINEAP HUNTER
 //
 //  Detects rogue WiFi Pineapple / KARMA attacks by tracking how many
 //  unique SSIDs each BSSID advertises across repeated scans.
@@ -2174,8 +2935,7 @@ void createChannelAnalyzer() {
 //
 //  Data persists for the lifetime of the tool screen so the list grows
 //  with each successive scan. Navigating back clears all state.
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
+// ════════════════════════════════════════════════════════════════
 static lv_obj_t *pineapStatusLbl = nullptr;
 static lv_obj_t *pineapList      = nullptr;
 static lv_obj_t *pineapBackBtn   = nullptr;   // saved so rebuildPineAPList can rebuild the group
@@ -2264,7 +3024,7 @@ static void rebuildPineAPList() {
 
     if (pineapEntryCount == 0) {
         lv_obj_t *e = lv_list_add_text(pineapList, "No BSSIDs seen yet — press Scan");
-        if (e) lv_obj_set_style_text_color(e, lv_color_hex(0x8b949e), LV_PART_MAIN);
+        if (e) lv_obj_set_style_text_color(e, lv_color_hex(TH.textDim), LV_PART_MAIN);
         return;
     }
 
@@ -2282,8 +3042,8 @@ static void rebuildPineAPList() {
         styleListBtn(btn);
 
         // Flagged = red (suspect Pineapple), normal = dim grey
-        lv_color_t col = flagged ? lv_color_hex(0xf85149)
-                                 : lv_color_hex(0x8b949e);
+        lv_color_t col = flagged ? lv_color_hex(TH.alert)
+                                 : lv_color_hex(TH.textDim);
         lv_obj_set_style_text_color(btn, col, LV_PART_MAIN | LV_STATE_DEFAULT);
 
         lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
@@ -2299,7 +3059,7 @@ static void cb_doPineAPScan(lv_event_t *e) {
     snprintf(buf, sizeof(buf),
              LV_SYMBOL_REFRESH "  Scanning...  (pass %d)", pineapScanCount + 1);
     lv_label_set_text(pineapStatusLbl, buf);
-    lv_obj_set_style_text_color(pineapStatusLbl, lv_color_hex(0xe3b341), LV_PART_MAIN);
+    lv_obj_set_style_text_color(pineapStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
     lv_timer_handler();
 
     // Amber spinner — distinct from generic green WiFi scans
@@ -2311,13 +3071,13 @@ static void cb_doPineAPScan(lv_event_t *e) {
         snprintf(buf, sizeof(buf),
                  LV_SYMBOL_WARNING "  %d suspect AP%s!  (%d scans)",
                  pineapFlagged, pineapFlagged == 1 ? "" : "s", pineapScanCount);
-        lv_obj_set_style_text_color(pineapStatusLbl, lv_color_hex(0xf85149), LV_PART_MAIN);
+        lv_obj_set_style_text_color(pineapStatusLbl, lv_color_hex(TH.alert), LV_PART_MAIN);
     } else {
         snprintf(buf, sizeof(buf),
                  LV_SYMBOL_WIFI "  %d BSSID%s tracked  (%d scans)",
                  pineapEntryCount, pineapEntryCount == 1 ? "" : "s", pineapScanCount);
         lv_obj_set_style_text_color(pineapStatusLbl,
-            pineapEntryCount > 0 ? lv_color_hex(0x3fb950) : lv_color_hex(0x8b949e),
+            pineapEntryCount > 0 ? lv_color_hex(TH.success) : lv_color_hex(TH.textDim),
             LV_PART_MAIN);
     }
     lv_label_set_text(pineapStatusLbl, buf);
@@ -2345,13 +3105,13 @@ void createPineAPHunter() {
     lv_label_set_text(pineapStatusLbl,
         "Scan repeatedly — flags BSSIDs\n"
         "with " LV_SYMBOL_WARNING " 5+ unique SSIDs (KARMA/Pineapple)");
-    lv_obj_set_style_text_color(pineapStatusLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+    lv_obj_set_style_text_color(pineapStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(pineapStatusLbl, 8, 30);
 
     pineapList = lv_list_create(wifiToolScreen);
     lv_obj_set_size(pineapList, SCREEN_W, SCREEN_H - 80);
     lv_obj_set_pos(pineapList, 0, 48);
-    lv_obj_set_style_bg_color(pineapList,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(pineapList,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(pineapList,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(pineapList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(pineapList,      2, LV_PART_MAIN);
@@ -2390,9 +3150,9 @@ void createPineAPDetail(int idx) {
     lv_obj_t *card = lv_obj_create(wifiDetailScreen);
     lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
     lv_obj_set_pos(card, 6, 30);
-    lv_obj_set_style_bg_color(card,     lv_color_hex(0x161b22), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(card,     lv_color_hex(TH.card), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(card,       LV_OPA_COVER,           LV_PART_MAIN);
-    lv_obj_set_style_border_color(card, lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(TH.border), LV_PART_MAIN);
     lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(card,       6, LV_PART_MAIN);
     lv_obj_set_style_pad_all(card,      6, LV_PART_MAIN);
@@ -2402,10 +3162,10 @@ void createPineAPDetail(int idx) {
     lv_obj_t *badgeLbl = lv_label_create(card);
     if (flagged) {
         lv_label_set_text(badgeLbl, LV_SYMBOL_WARNING "  SUSPECTED PINEAPPLE / KARMA");
-        lv_obj_set_style_text_color(badgeLbl, lv_color_hex(0xf85149), LV_PART_MAIN);
+        lv_obj_set_style_text_color(badgeLbl, lv_color_hex(TH.alert), LV_PART_MAIN);
     } else {
         lv_label_set_text(badgeLbl, LV_SYMBOL_WIFI "  Normal AP (below threshold)");
-        lv_obj_set_style_text_color(badgeLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+        lv_obj_set_style_text_color(badgeLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     }
     lv_obj_align(badgeLbl, LV_ALIGN_TOP_LEFT, 0, 0);
 
@@ -2424,7 +3184,7 @@ void createPineAPDetail(int idx) {
     lv_label_set_text(statsLbl, stats);
     lv_label_set_long_mode(statsLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(statsLbl, SCREEN_W - 28);
-    lv_obj_set_style_text_color(statsLbl, lv_color_hex(0xe6edf3), LV_PART_MAIN);
+    lv_obj_set_style_text_color(statsLbl, lv_color_hex(TH.text), LV_PART_MAIN);
     lv_obj_align(statsLbl, LV_ALIGN_TOP_LEFT, 0, 16);
 
     // Collected SSIDs
@@ -2448,7 +3208,7 @@ void createPineAPDetail(int idx) {
     lv_label_set_long_mode(ssidLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(ssidLbl, SCREEN_W - 28);
     lv_obj_set_style_text_color(ssidLbl,
-        flagged ? lv_color_hex(0xff9900) : lv_color_hex(0x8b949e),
+        flagged ? lv_color_hex(0xff9900) : lv_color_hex(TH.textDim),
         LV_PART_MAIN);
     lv_obj_align(ssidLbl, LV_ALIGN_TOP_LEFT, 0, 68);
 
@@ -2458,9 +3218,9 @@ void createPineAPDetail(int idx) {
     lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
     lv_bar_set_range(bar, -100, -30);
     lv_bar_set_value(bar, pineapEntries[idx].lastRSSI, LV_ANIM_ON);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0x21262d), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
     lv_obj_set_style_bg_color(bar,
-        flagged ? lv_color_hex(0xf85149) : rssiColor(pineapEntries[idx].lastRSSI),
+        flagged ? lv_color_hex(TH.alert) : rssiColor(pineapEntries[idx].lastRSSI),
         LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
     lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
@@ -2478,7 +3238,6 @@ void createPineAPDetail(int idx) {
 // ════════════════════════════════════════════════════════════════
 //  BLE UTILITY FUNCTIONS
 // ════════════════════════════════════════════════════════════════
-
 // One-time BLE stack init (safe to call multiple times)
 static void ensureBLEInit() {
     if (!bleInitialized) {
@@ -2498,7 +3257,7 @@ static void sortBLEByRSSI() {
             }
 }
 
-// ── Meta / RayBan identifier tables (from Marauder, https://github.com/justcallmekoko/ESP32Marauder/wiki/meta-detect) ──────────
+// ── Meta / RayBan identifier tables (from Marauder, credit: NullPxl) ──────────
 static const uint16_t META_IDENTIFIERS[6] = {
     0xFD5F,   // Meta
     0xFEB7,   // Meta
@@ -2572,15 +3331,72 @@ static bool detectMeta(BLEAdvertisedDevice &dev) {
     return false;
 }
 
-// Apple AirTag: Company ID 0x004C + Find My type byte 0x12 + subtype 0x19
+// Apple AirTag detection — catches both operating states:
+//
+//  STATE 1 — Offline / Lost mode (separated from owner):
+//    Broadcasts a 31-byte Find My payload. NimBLE getManufacturerData()
+//    returns bytes starting from the company ID, so the pattern is:
+//    [0x4C 0x00 0x12 0x19 ...]
+//    We also do a sliding memcmp across the raw payload in case the AD
+//    structure is presented differently by the BLE stack (Marauder approach).
+//
+//  STATE 2 — Nearby / Paired mode (near owner's iPhone):
+//    Broadcasts a short nearby-interaction packet. Pattern:
+//    [0x4C 0x00 0x07 0x05 ...] — type 0x07 = nearby interaction
+//    This is what most "close by" AirTags will actually be broadcasting.
+//
+//  UUID fallback — AirTags advertise service UUID 0xFD44 (Apple's
+//    proprietary continuity service) in both modes.
+//
 static bool detectAirTag(BLEAdvertisedDevice &dev) {
-    if (!dev.haveManufacturerData()) return false;
-    std::string m = dev.getManufacturerData();
-    if (m.length() < 4) return false;
-    return ((uint8_t)m[0] == 0x4C &&
-            (uint8_t)m[1] == 0x00 &&
-            (uint8_t)m[2] == 0x12 &&
-            (uint8_t)m[3] == 0x19);
+    // ── Check 1: manufacturer data patterns ─────────────────────
+    if (dev.haveManufacturerData()) {
+        std::string m = dev.getManufacturerData();
+        size_t len = m.length();
+
+        if (len >= 4) {
+            uint8_t b0 = (uint8_t)m[0];
+            uint8_t b1 = (uint8_t)m[1];
+            uint8_t b2 = (uint8_t)m[2];
+
+            // Must be Apple company ID (0x004C little-endian)
+            if (b0 == 0x4C && b1 == 0x00) {
+                // Lost/offline mode: type 0x12 = Find My network
+                if (b2 == 0x12) return true;
+                // Nearby/paired mode: type 0x07 = nearby interaction
+                // AirTag uses subtype 0x05, but match type only to
+                // be safe against minor firmware variations
+                if (b2 == 0x07) return true;
+            }
+        }
+
+        // Sliding window search for the raw Find My signature
+        // [0x4C 0x00 0x12 0x19] anywhere in the payload —
+        // catches cases where NimBLE presents the full AD frame
+        if (len >= 4) {
+            for (size_t i = 0; i <= len - 4; i++) {
+                if ((uint8_t)m[i]   == 0x4C &&
+                    (uint8_t)m[i+1] == 0x00 &&
+                    (uint8_t)m[i+2] == 0x12 &&
+                    (uint8_t)m[i+3] == 0x19) return true;
+            }
+        }
+    }
+
+    // ── Check 2: AirTag service UUID 0xFD44 ─────────────────────
+    // AirTags advertise this UUID in both lost and paired modes.
+    // It is Apple's proprietary "Continuity" service used by Find My.
+    if (dev.haveServiceUUID()) {
+        int count = dev.getServiceUUIDCount();
+        for (int i = 0; i < count; i++) {
+            String uuid = dev.getServiceUUID(i).toString().c_str();
+            uuid.toLowerCase();
+            // Short UUID form: "fd44" — look for it in the string
+            if (uuid.indexOf("fd44") != -1) return true;
+        }
+    }
+
+    return false;
 }
 
 // Apple device (any): Company ID 0x004C
@@ -2593,39 +3409,51 @@ static bool detectApple(BLEAdvertisedDevice &dev) {
 
 // Flipper Zero detection — three independent signals, any match wins:
 //
-//  1. Advertised name contains "flipper" (case-insensitive).
-//     Works when Flipper is on home screen with BLE enabled.
+//  1. Advertised name contains one of the configured Flipper strings
+//     from config.h (case-insensitive).
 //
-//  2. GATT Service UUID 0x3802 — Flipper Zero's primary serial/RPC
-//     service. Present in ad packet regardless of name or MAC.
-//     This is the most reliable passive indicator.
+//  2. Advertised service UUID matches one of the common Flipper BLE
+//     UUIDs: 0x3081, 0x3082, or 0x3083.
 //
 //  3. OUI prefix 0C:FA:22 — only valid for non-random/static addresses.
-//     Kept as a bonus check but Flipper defaults to random private
-//     addresses so this rarely fires.
+//     Kept as a weak fallback because Flipper often uses private BLE
+//     addresses, so this may not always fire.
 //
 static bool detectFlipper(BLEAdvertisedDevice &dev) {
 
-    // ── Method 1: Name check ─────────────────────────────────────
+    // ── Method 1: Configurable name check ────────────────────────
     if (dev.haveName()) {
         String n = String(dev.getName().c_str());
         n.toLowerCase();
-        if (n.indexOf("flipper") >= 0) return true;
+
+        for (int i = 0; i < FLIPPER_NAME_MATCH_COUNT; i++) {
+            String token = String(FLIPPER_NAME_MATCHES[i]);
+            token.toLowerCase();
+            if (token.length() && n.indexOf(token) >= 0) return true;
+        }
     }
 
-    // ── Method 2: Service UUID 0x3802 ────────────────────────────
+    // ── Method 2: Common Flipper service UUIDs ───────────────────
     if (dev.haveServiceUUID()) {
         int uuidCount = dev.getServiceUUIDCount();
         for (int i = 0; i < uuidCount; i++) {
             BLEUUID uuid = dev.getServiceUUID(i);
-            // Normalise to 16-bit if possible for comparison
+
             if (uuid.bitSize() == 16) {
-                if (uuid.getNative()->uuid.uuid16 == 0x3802) return true;
+                uint16_t u16 = uuid.getNative()->uuid.uuid16;
+                if (u16 == 0x3081 || u16 == 0x3082 || u16 == 0x3083) return true;
             }
-            // Also catch full 128-bit expansion of 0x3802
+
             String uuidStr = String(uuid.toString().c_str());
             uuidStr.toLowerCase();
-            if (uuidStr.indexOf("00003802") >= 0) return true;
+            if (uuidStr == "00003081-0000-1000-8000-00805f9b34fb") return true;
+            if (uuidStr == "00003082-0000-1000-8000-00805f9b34fb") return true;
+            if (uuidStr == "00003083-0000-1000-8000-00805f9b34fb") return true;
+
+            // Fallback in case the UUID string is shortened differently
+            if (uuidStr.indexOf("3081") >= 0) return true;
+            if (uuidStr.indexOf("3082") >= 0) return true;
+            if (uuidStr.indexOf("3083") >= 0) return true;
         }
     }
 
@@ -2654,9 +3482,9 @@ static const char *mfgHintStr(BLEDeviceType t) {
 
 // RSSI colour (reuse WiFi palette)
 static lv_color_t bleRssiColor(int8_t rssi) {
-    if (rssi >= -55) return lv_color_hex(0x3fb950);
-    if (rssi >= -70) return lv_color_hex(0xe3b341);
-    return              lv_color_hex(0xf85149);
+    if (rssi >= -55) return lv_color_hex(TH.success);
+    if (rssi >= -70) return lv_color_hex(TH.warn);
+    return              lv_color_hex(TH.alert);
 }
 
 // Blocking BLE scan — fills bleEntries[], returns count
@@ -2718,8 +3546,8 @@ static int doBLEScan(int durationSec, BLEDeviceType filterType) {
     return bleEntryCount;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
-//  TOOL 5 – PWNAGOTCHI WATCH  Credit: https://github.com/justcallmekoko
+// ════════════════════════════════════════════════════════════════
+//  TOOL 5 – PWNAGOTCHI WATCH
 //
 //  Pwnagotchi broadcasts 802.11 beacon frames with a hardcoded
 //  source MAC of de:ad:be:ef:de:ad. The SSID field carries a JSON
@@ -2735,8 +3563,7 @@ static int doBLEScan(int durationSec, BLEDeviceType filterType) {
 //    [36]    Tag 0x00 = SSID tag
 //    [37]    SSID length
 //    [38..]  SSID bytes     ← JSON payload
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
-
+// ════════════════════════════════════════════════════════════════
 static lv_obj_t *pwnStatusLbl = nullptr;
 static lv_obj_t *pwnList      = nullptr;
 
@@ -2822,6 +3649,7 @@ static void processPwnPending() {
     pwnEntries[pwnCount].rssi      = rssi;
     pwnEntries[pwnCount].lastSeen  = millis();
     pwnCount++;
+    playPwnagotchiChirp();
 }
 
 static void pwn_refresh_cb(lv_timer_t *) {
@@ -2834,7 +3662,7 @@ static void pwn_refresh_cb(lv_timer_t *) {
         lv_label_set_text(pwnStatusLbl,
             LV_SYMBOL_EYE_OPEN "  Watching... no Pwnagotchi seen");
         lv_obj_set_style_text_color(pwnStatusLbl,
-            lv_color_hex(0x8b949e), LV_PART_MAIN);
+            lv_color_hex(TH.textDim), LV_PART_MAIN);
     } else {
         char buf[56];
         snprintf(buf, sizeof(buf),
@@ -2842,7 +3670,7 @@ static void pwn_refresh_cb(lv_timer_t *) {
                  pwnCount, pwnCount == 1 ? "" : "s");
         lv_label_set_text(pwnStatusLbl, buf);
         lv_obj_set_style_text_color(pwnStatusLbl,
-            lv_color_hex(0xf85149), LV_PART_MAIN);
+            lv_color_hex(TH.alert), LV_PART_MAIN);
     }
 
     // Rebuild list
@@ -2851,7 +3679,7 @@ static void pwn_refresh_cb(lv_timer_t *) {
         lv_obj_t *e = lv_list_add_text(pwnList,
             "Hopping ch 1-13 — waiting for beacon...");
         if (e) lv_obj_set_style_text_color(e,
-                    lv_color_hex(0x8b949e), LV_PART_MAIN);
+                    lv_color_hex(TH.textDim), LV_PART_MAIN);
         return;
     }
 
@@ -2866,7 +3694,7 @@ static void pwn_refresh_cb(lv_timer_t *) {
         lv_obj_t *entry = lv_list_add_text(pwnList, row);
         if (entry)
             lv_obj_set_style_text_color(entry,
-                lv_color_hex(0xf85149), LV_PART_MAIN);
+                lv_color_hex(TH.alert), LV_PART_MAIN);
     }
 }
 
@@ -2888,13 +3716,13 @@ void createPwnagotchiDetector() {
         "Sniffs beacons from de:ad:be:ef:de:ad\n"
         "Parses name + pwnd_tot from SSID JSON");
     lv_obj_set_style_text_color(pwnStatusLbl,
-        lv_color_hex(0x8b949e), LV_PART_MAIN);
+        lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(pwnStatusLbl, 8, 30);
 
     pwnList = lv_list_create(wifiToolScreen);
     lv_obj_set_size(pwnList, SCREEN_W, SCREEN_H - 80);
     lv_obj_set_pos(pwnList, 0, 48);
-    lv_obj_set_style_bg_color(pwnList,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(pwnList,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(pwnList,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(pwnList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(pwnList,      2, LV_PART_MAIN);
@@ -2904,7 +3732,7 @@ void createPwnagotchiDetector() {
         lv_list_add_text(pwnList, "Hopping ch 1-13 — waiting for beacon...");
     if (initLbl)
         lv_obj_set_style_text_color(initLbl,
-            lv_color_hex(0x8b949e), LV_PART_MAIN);
+            lv_color_hex(TH.textDim), LV_PART_MAIN);
 
     lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
     deleteGroup(&wifiToolGroup);
@@ -2933,29 +3761,42 @@ void createPwnagotchiDetector() {
 // ════════════════════════════════════════════════════════════════
 //  TOOL 6 – FLOCK SAFETY DETECTOR
 //
-//  Flock Safety LPR cameras beacon / probe with "flock" in the SSID.
-//  We sniff beacon frames (mgmt subtype 8), probe responses (5), and
-//  probe requests (4), parse the SSID IE, and alert on any case-
-//  insensitive match for "flock". Alerts are latching — stays red
-//  until you navigate back. Hops all 2.4 GHz channels (1-13).
+//  Flock/Penguin-style devices can beacon / probe with SSIDs containing
+//  Flock-related keywords. We sniff beacon frames (mgmt subtype 8),
+//  probe responses (5), and probe requests (4), parse the SSID IE,
+//  and alert on configured case-insensitive keyword matches. Alerts are
+//  latching — stays red until you navigate back. Hops all 2.4 GHz channels.
 //  Reference: github.com/GainSec/Flock-Safety-Trap-Shooter-Sniffer-Alarm
 // ════════════════════════════════════════════════════════════════
-
 static lv_obj_t *flockStatusLbl = nullptr;
 static lv_obj_t *flockList      = nullptr;
 
-// Case-insensitive substring search (no strstr in IRAM-safe code)
-static bool IRAM_ATTR containsFlock(const char *ssid) {
-    // "flock" = f,l,o,c,k
+// Small IRAM-safe helpers for case-insensitive keyword matching.
+// Avoids strstr/strcasecmp inside the promiscuous sniffer callback.
+static char IRAM_ATTR flockToLower(char c) {
+    if (c >= 'A' && c <= 'Z') return c + 32;
+    return c;
+}
+
+static bool IRAM_ATTR flockContainsKeyword(const char *ssid, const char *keyword) {
+    if (!ssid || !keyword || !keyword[0]) return false;
+
     for (int i = 0; ssid[i]; i++) {
-        if ((ssid[i]   == 'f' || ssid[i]   == 'F') &&
-            (ssid[i+1] == 'l' || ssid[i+1] == 'L') &&
-            (ssid[i+2] == 'o' || ssid[i+2] == 'O') &&
-            (ssid[i+3] == 'c' || ssid[i+3] == 'C') &&
-            (ssid[i+4] == 'k' || ssid[i+4] == 'K'))
-            return true;
+        int j = 0;
+        while (keyword[j] && ssid[i + j] &&
+               flockToLower(ssid[i + j]) == flockToLower(keyword[j])) {
+            j++;
+        }
+        if (keyword[j] == '\0') return true;
     }
     return false;
+}
+
+static bool IRAM_ATTR containsFlockKeyword(const char *ssid) {
+    return flockContainsKeyword(ssid, FLOCK_KEYWORD_1) ||
+           flockContainsKeyword(ssid, FLOCK_KEYWORD_2) ||
+           flockContainsKeyword(ssid, FLOCK_KEYWORD_3) ||
+           flockContainsKeyword(ssid, FLOCK_KEYWORD_4);
 }
 
 static void IRAM_ATTR flock_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
@@ -2995,7 +3836,7 @@ static void IRAM_ATTR flock_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t ty
             memcpy(ssid, ie + 2, n);
             ssid[n] = '\0';
 
-            if (containsFlock(ssid)) {
+            if (containsFlockKeyword(ssid)) {
                 memcpy(flockPendingSSID, ssid, n + 1);
                 snprintf(flockPendingSrc, sizeof(flockPendingSrc),
                          "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -3023,10 +3864,20 @@ static void flock_refresh_cb(lv_timer_t *) {
         memcpy(src,  flockPendingSrc,  18);
         flockPendingReady = false;
 
-        // Deduplicate by SSID
+        // Deduplicate hits. MAC-based dedupe prevents repeated frames from
+        // the same device from inflating the count, while still allowing
+        // multiple devices that share the same SSID to be listed separately.
         bool found = false;
         for (int i = 0; i < flockHitCount; i++) {
-            if (strcmp(flockHits[i].ssid, ssid) == 0) {
+#if FLOCK_DEDUPE_BY_MAC
+            bool sameHit = (strcmp(flockHits[i].src, src) == 0);
+#else
+            bool sameHit = (strcmp(flockHits[i].ssid, ssid) == 0);
+#endif
+            if (sameHit) {
+                strncpy(flockHits[i].ssid, ssid, 32);
+                flockHits[i].ssid[32] = '\0';
+                flockHits[i].frameType = ft;
                 flockHits[i].rssi = rssi;   // update RSSI
                 found = true;
                 break;
@@ -3040,6 +3891,7 @@ static void flock_refresh_cb(lv_timer_t *) {
             flockHits[flockHitCount].frameType = ft;
             flockHits[flockHitCount].rssi      = rssi;
             flockHitCount++;
+            playFlockChirp();
         }
     }
 
@@ -3048,15 +3900,15 @@ static void flock_refresh_cb(lv_timer_t *) {
         lv_label_set_text(flockStatusLbl,
             LV_SYMBOL_EYE_OPEN "  Watching... no Flock seen");
         lv_obj_set_style_text_color(flockStatusLbl,
-            lv_color_hex(0x8b949e), LV_PART_MAIN);
+            lv_color_hex(TH.textDim), LV_PART_MAIN);
     } else {
         char buf[56];
         snprintf(buf, sizeof(buf),
-                 LV_SYMBOL_WARNING "  %d Flock SSID%s detected!",
+                 LV_SYMBOL_WARNING "  %d Flock hit%s detected!",
                  flockHitCount, flockHitCount == 1 ? "" : "s");
         lv_label_set_text(flockStatusLbl, buf);
         lv_obj_set_style_text_color(flockStatusLbl,
-            lv_color_hex(0xf85149), LV_PART_MAIN);
+            lv_color_hex(TH.alert), LV_PART_MAIN);
     }
 
     // Rebuild list
@@ -3065,19 +3917,27 @@ static void flock_refresh_cb(lv_timer_t *) {
         lv_obj_t *e = lv_list_add_text(flockList,
             "Hopping ch 1-13 — watching beacons & probes...");
         if (e) lv_obj_set_style_text_color(e,
-                    lv_color_hex(0x8b949e), LV_PART_MAIN);
+                    lv_color_hex(TH.textDim), LV_PART_MAIN);
         return;
     }
     for (int i = 0; i < flockHitCount; i++) {
-        char row[64];
+        char row[104];
+#if FLOCK_SHOW_SOURCE_MAC
+        snprintf(row, sizeof(row), "%s  %s  %ddBm\n%s",
+                 flockHits[i].frameType ? "PROBE" : "BEACON",
+                 flockHits[i].ssid,
+                 flockHits[i].rssi,
+                 flockHits[i].src);
+#else
         snprintf(row, sizeof(row), "%s  %s  %ddBm",
                  flockHits[i].frameType ? "PROBE" : "BEACON",
                  flockHits[i].ssid,
                  flockHits[i].rssi);
+#endif
         lv_obj_t *entry = lv_list_add_text(flockList, row);
         if (entry)
             lv_obj_set_style_text_color(entry,
-                lv_color_hex(0xf85149), LV_PART_MAIN);
+                lv_color_hex(TH.alert), LV_PART_MAIN);
     }
 }
 
@@ -3096,16 +3956,16 @@ void createFlockDetector() {
 
     flockStatusLbl = lv_label_create(wifiToolScreen);
     lv_label_set_text(flockStatusLbl,
-        "Sniffs beacons & probes for \"flock\"\n"
-        "in SSID — flags Flock Safety cameras");
+        "Sniffs beacons & probes for Flock keywords\n"
+        "flock / penguin / pigvision / fs battery");
     lv_obj_set_style_text_color(flockStatusLbl,
-        lv_color_hex(0x8b949e), LV_PART_MAIN);
+        lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(flockStatusLbl, 8, 30);
 
     flockList = lv_list_create(wifiToolScreen);
     lv_obj_set_size(flockList, SCREEN_W, SCREEN_H - 80);
     lv_obj_set_pos(flockList, 0, 48);
-    lv_obj_set_style_bg_color(flockList,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(flockList,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(flockList,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(flockList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(flockList,      2, LV_PART_MAIN);
@@ -3115,7 +3975,7 @@ void createFlockDetector() {
         lv_list_add_text(flockList, "Hopping ch 1-13 — watching beacons & probes...");
     if (initLbl)
         lv_obj_set_style_text_color(initLbl,
-            lv_color_hex(0x8b949e), LV_PART_MAIN);
+            lv_color_hex(TH.textDim), LV_PART_MAIN);
 
     lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
     deleteGroup(&wifiToolGroup);
@@ -3144,7 +4004,6 @@ void createFlockDetector() {
 // ════════════════════════════════════════════════════════════════
 //  BLE SHARED BACK CALLBACKS
 // ════════════════════════════════════════════════════════════════
-
 static void cb_bleToolBack(lv_event_t *e) {
     bleToolScreen = nullptr;
     deleteGroup(&bleToolGroup);
@@ -3163,7 +4022,6 @@ static void cb_bleDetailBack(lv_event_t *e) {
 // ════════════════════════════════════════════════════════════════
 //  BLE MENU
 // ════════════════════════════════════════════════════════════════
-
 static const char *BLE_TOOL_LABELS[5] = {
     LV_SYMBOL_BLUETOOTH "  BLE Scanner",
     "\xEF\x80\xA6"      "  AirTag Detector",   // apple-ish symbol fallback
@@ -3199,11 +4057,14 @@ void createBLEMenu() {
     lv_obj_t *list = lv_list_create(bleMenuScreen);
     lv_obj_set_size(list, SCREEN_W, SCREEN_H - 28 - 34);
     lv_obj_set_pos(list, 0, 28);
-    lv_obj_set_style_bg_color(list,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(list,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(list, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(list,      6, LV_PART_MAIN);
     lv_obj_set_style_pad_row(list,      4, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
 
     deleteGroup(&bleMenuGroup);
     bleMenuGroup = lv_group_create();
@@ -3228,7 +4089,6 @@ void createBLEMenu() {
 // ════════════════════════════════════════════════════════════════
 //  TOOL 1 – BLE SCANNER
 // ════════════════════════════════════════════════════════════════
-
 static lv_obj_t *bleScanList      = nullptr;
 static lv_obj_t *bleScanStatusLbl = nullptr;
 static lv_obj_t *bleScanBackBtn   = nullptr;   // saved so rebuildBLEScanList can rebuild the group
@@ -3264,7 +4124,7 @@ static void rebuildBLEScanList() {
         switch (bleEntries[i].type) {
             case BLE_AIRTAG:  col = lv_color_hex(0xf0f0f0); break; // white-ish
             case BLE_FLIPPER: col = lv_color_hex(0xff9900); break; // orange
-            case BLE_APPLE:   col = lv_color_hex(0x58a6ff); break; // blue accent
+            case BLE_APPLE:   col = lv_color_hex(TH.accent); break; // blue accent
             default:          col = bleRssiColor(bleEntries[i].rssi); break;
         }
         lv_obj_set_style_text_color(btn, col, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -3277,14 +4137,23 @@ static void rebuildBLEScanList() {
 }
 
 static void cb_doBLEScan(lv_event_t *e) {
-    lv_label_set_text(bleScanStatusLbl, LV_SYMBOL_REFRESH "  Scanning 5s...");
-    lv_obj_set_style_text_color(bleScanStatusLbl, lv_color_hex(0xe3b341), LV_PART_MAIN);
+    char scanMsg[40];
+    snprintf(scanMsg, sizeof(scanMsg), LV_SYMBOL_REFRESH "  Scanning %ds...", bleScanSeconds);
+    lv_label_set_text(bleScanStatusLbl, scanMsg);
+    lv_obj_set_style_text_color(bleScanStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
     lv_timer_handler();
 
     // Blue spinner while BLE scan blocks core 1
     startLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
-    int found = doBLEScan(BLE_SCAN_SECS, BLE_GENERIC);
+    int found = doBLEScan(bleScanSeconds, BLE_GENERIC);
     stopLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
+
+    for (int i = 0; i < found; i++) {
+        if (bleEntries[i].type == BLE_SKIMMER) {
+            playBLESuspiciousChirp();
+            break;
+        }
+    }
 
     char buf[48];
     snprintf(buf, sizeof(buf),
@@ -3292,7 +4161,7 @@ static void cb_doBLEScan(lv_event_t *e) {
              found, found == 1 ? "" : "s");
     lv_label_set_text(bleScanStatusLbl, buf);
     lv_obj_set_style_text_color(bleScanStatusLbl,
-        found > 0 ? lv_color_hex(0x3fb950) : lv_color_hex(0x8b949e),
+        found > 0 ? lv_color_hex(TH.success) : lv_color_hex(TH.textDim),
         LV_PART_MAIN);
 
     rebuildBLEScanList();
@@ -3305,14 +4174,16 @@ void createBLEScanner() {
     createHeader(bleToolScreen, LV_SYMBOL_BLUETOOTH "  BLE Scanner");
 
     bleScanStatusLbl = lv_label_create(bleToolScreen);
-    lv_label_set_text(bleScanStatusLbl, "Press Scan to start  (5s)");
-    lv_obj_set_style_text_color(bleScanStatusLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+    char readyMsg[48];
+    snprintf(readyMsg, sizeof(readyMsg), "Press Scan to start  (%ds)", bleScanSeconds);
+    lv_label_set_text(bleScanStatusLbl, readyMsg);
+    lv_obj_set_style_text_color(bleScanStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(bleScanStatusLbl, 8, 30);
 
     bleScanList = lv_list_create(bleToolScreen);
     lv_obj_set_size(bleScanList, SCREEN_W, SCREEN_H - 80);
     lv_obj_set_pos(bleScanList, 0, 48);
-    lv_obj_set_style_bg_color(bleScanList,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bleScanList,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bleScanList,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(bleScanList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(bleScanList,      2, LV_PART_MAIN);
@@ -3335,7 +4206,6 @@ void createBLEScanner() {
 // ════════════════════════════════════════════════════════════════
 //  BLE DEVICE DETAIL SCREEN
 // ════════════════════════════════════════════════════════════════
-
 void createBLEDetail(int idx) {
     if (bleDetailScreen) { lv_obj_delete(bleDetailScreen); bleDetailScreen = nullptr; }
     bleDetailScreen = lv_obj_create(nullptr);
@@ -3348,7 +4218,7 @@ void createBLEDetail(int idx) {
 
     // Determine badge text + colour by type
     const char *badge     = "";
-    lv_color_t  badgeCol  = lv_color_hex(0x8b949e);
+    lv_color_t  badgeCol  = lv_color_hex(TH.textDim);
     switch (bleEntries[idx].type) {
         case BLE_AIRTAG:
             badge    = "  Apple AirTag (Find My)";
@@ -3360,19 +4230,19 @@ void createBLEDetail(int idx) {
             break;
         case BLE_SKIMMER:
             badge    = "  POSSIBLE SKIMMER";
-            badgeCol = lv_color_hex(0xf85149);
+            badgeCol = lv_color_hex(TH.alert);
             break;
         case BLE_META:
             badge    = "  Meta / RayBan Device";
-            badgeCol = lv_color_hex(0x58a6ff);
+            badgeCol = lv_color_hex(TH.accent);
             break;
         case BLE_APPLE:
             badge    = "  Apple Device";
-            badgeCol = lv_color_hex(0x58a6ff);
+            badgeCol = lv_color_hex(TH.accent);
             break;
         default:
             badge    = "  Generic BLE";
-            badgeCol = lv_color_hex(0x8b949e);
+            badgeCol = lv_color_hex(TH.textDim);
             break;
     }
 
@@ -3380,9 +4250,9 @@ void createBLEDetail(int idx) {
     lv_obj_t *card = lv_obj_create(bleDetailScreen);
     lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
     lv_obj_set_pos(card, 6, 30);
-    lv_obj_set_style_bg_color(card,      lv_color_hex(0x161b22), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(card,      lv_color_hex(TH.card), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(card,        LV_OPA_COVER,           LV_PART_MAIN);
-    lv_obj_set_style_border_color(card,  lv_color_hex(0x30363d), LV_PART_MAIN);
+    lv_obj_set_style_border_color(card,  lv_color_hex(TH.border), LV_PART_MAIN);
     lv_obj_set_style_border_width(card,  1, LV_PART_MAIN);
     lv_obj_set_style_radius(card,        6, LV_PART_MAIN);
     lv_obj_set_style_pad_all(card,       6, LV_PART_MAIN);
@@ -3414,7 +4284,7 @@ void createBLEDetail(int idx) {
     lv_label_set_text(infoLbl, info);
     lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(infoLbl, SCREEN_W - 28);
-    lv_obj_set_style_text_color(infoLbl, lv_color_hex(0xe6edf3), LV_PART_MAIN);
+    lv_obj_set_style_text_color(infoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
     lv_obj_align(infoLbl, LV_ALIGN_TOP_LEFT, 0, 16);
 
     // RSSI bar
@@ -3423,7 +4293,7 @@ void createBLEDetail(int idx) {
     lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
     lv_bar_set_range(bar, -100, -30);
     lv_bar_set_value(bar, rssi, LV_ANIM_ON);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0x21262d), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
     lv_obj_set_style_bg_color(bar, bleRssiColor(rssi),     LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
     lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
@@ -3438,33 +4308,32 @@ void createBLEDetail(int idx) {
     lv_screen_load_anim(bleDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
-// ══════════════════════════════════════════════════════════════════════════════════════════════════════
-//  TOOL 2 – AIRTAG DETECTOR  Credit: https://github.com/justcallmekoko/ESP32Marauder/wiki/airtag-sniff
-// ══════════════════════════════════════════════════════════════════════════════════════════════════════
-
+// ════════════════════════════════════════════════════════════════
+//  TOOL 2 – AIRTAG DETECTOR
+// ════════════════════════════════════════════════════════════════
 static lv_obj_t *airtagStatusLbl = nullptr;
 static lv_obj_t *airtagList      = nullptr;
 
 static void cb_doAirTagScan(lv_event_t *e) {
     lv_label_set_text(airtagStatusLbl, LV_SYMBOL_REFRESH "  Scanning 8s...");
-    lv_obj_set_style_text_color(airtagStatusLbl, lv_color_hex(0xe3b341), LV_PART_MAIN);
+    lv_obj_set_style_text_color(airtagStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
     lv_obj_clean(airtagList);
     lv_timer_handler();
 
     // White spinner for AirTag scan (Apple = white/silver)
     startLEDSpinner(200, 200, 200);
-    int found = doBLEScan(BLE_SCAN_SECS, BLE_AIRTAG);
+    int found = doBLEScan(bleScanSeconds, BLE_AIRTAG);
     stopLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
 
     if (found == 0) {
         lv_label_set_text(airtagStatusLbl,
                           LV_SYMBOL_BLUETOOTH "  No AirTags detected");
         lv_obj_set_style_text_color(airtagStatusLbl,
-                                    lv_color_hex(0x3fb950), LV_PART_MAIN);
+                                    lv_color_hex(TH.success), LV_PART_MAIN);
         lv_obj_t *empty = lv_list_add_text(airtagList,
                                             "No Apple AirTags in range");
         if (empty)
-            lv_obj_set_style_text_color(empty, lv_color_hex(0x8b949e), LV_PART_MAIN);
+            lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
         return;
     }
 
@@ -3473,7 +4342,7 @@ static void cb_doAirTagScan(lv_event_t *e) {
              LV_SYMBOL_WARNING "  %d AirTag%s detected!",
              found, found == 1 ? "" : "s");
     lv_label_set_text(airtagStatusLbl, buf);
-    lv_obj_set_style_text_color(airtagStatusLbl, lv_color_hex(0xf85149), LV_PART_MAIN);
+    lv_obj_set_style_text_color(airtagStatusLbl, lv_color_hex(TH.alert), LV_PART_MAIN);
 
     for (int i = 0; i < found; i++) {
         char row[52];
@@ -3496,13 +4365,13 @@ void createAirTagScanner() {
         "Scans for Apple AirTag Find My\n"
         "advertisements  (Company ID 0x004C\n"
         "type 0x12 subtype 0x19)");
-    lv_obj_set_style_text_color(airtagStatusLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+    lv_obj_set_style_text_color(airtagStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(airtagStatusLbl, 8, 30);
 
     airtagList = lv_list_create(bleToolScreen);
     lv_obj_set_size(airtagList, SCREEN_W, SCREEN_H - 80);
     lv_obj_set_pos(airtagList, 0, 48);
-    lv_obj_set_style_bg_color(airtagList,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(airtagList,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(airtagList,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(airtagList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(airtagList,      2, LV_PART_MAIN);
@@ -3522,35 +4391,36 @@ void createAirTagScanner() {
     lv_screen_load_anim(bleToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
-//  TOOL 3 – FLIPPER ZERO DETECTOR  Credit: https://github.com/justcallmekoko/ESP32Marauder/wiki/flipper-sniff
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
-
+// ════════════════════════════════════════════════════════════════
+//  TOOL 3 – FLIPPER ZERO DETECTOR
+// ════════════════════════════════════════════════════════════════
 static lv_obj_t *flipperStatusLbl = nullptr;
 static lv_obj_t *flipperList      = nullptr;
 
 static void cb_doFlipperScan(lv_event_t *e) {
     lv_label_set_text(flipperStatusLbl, LV_SYMBOL_REFRESH "  Scanning 8s...");
-    lv_obj_set_style_text_color(flipperStatusLbl, lv_color_hex(0xe3b341), LV_PART_MAIN);
+    lv_obj_set_style_text_color(flipperStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
     lv_obj_clean(flipperList);
     lv_timer_handler();
 
     // Orange spinner for Flipper
     startLEDSpinner(220, 100, 0);
-    int found = doBLEScan(BLE_SCAN_SECS, BLE_FLIPPER);
+    int found = doBLEScan(bleScanSeconds, BLE_FLIPPER);
     stopLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
 
     if (found == 0) {
         lv_label_set_text(flipperStatusLbl,
                           LV_SYMBOL_BLUETOOTH "  No Flipper Zero detected");
         lv_obj_set_style_text_color(flipperStatusLbl,
-                                    lv_color_hex(0x3fb950), LV_PART_MAIN);
+                                    lv_color_hex(TH.success), LV_PART_MAIN);
         lv_obj_t *empty = lv_list_add_text(flipperList,
                                             "No Flipper Zero in range");
         if (empty)
-            lv_obj_set_style_text_color(empty, lv_color_hex(0x8b949e), LV_PART_MAIN);
+            lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
         return;
     }
+
+    playFlipperChirp();
 
     char buf[48];
     snprintf(buf, sizeof(buf),
@@ -3572,7 +4442,7 @@ static void cb_doFlipperScan(lv_event_t *e) {
         snprintf(macRow, sizeof(macRow), "  %s", bleEntries[i].mac);
         lv_obj_t *macEntry = lv_list_add_text(flipperList, macRow);
         if (macEntry)
-            lv_obj_set_style_text_color(macEntry, lv_color_hex(0x8b949e), LV_PART_MAIN);
+            lv_obj_set_style_text_color(macEntry, lv_color_hex(TH.textDim), LV_PART_MAIN);
     }
 }
 
@@ -3584,15 +4454,16 @@ void createFlipperScanner() {
 
     flipperStatusLbl = lv_label_create(bleToolScreen);
     lv_label_set_text(flipperStatusLbl,
-        "OUI: 0C:FA:22 (IEEE prefix)\n"
-        "or name containing \"Flipper\"");
-    lv_obj_set_style_text_color(flipperStatusLbl, lv_color_hex(0x8b949e), LV_PART_MAIN);
+        "Names: config.h list\n"
+        "UUIDs: 3081 / 3082 / 3083\n"
+        "OUI: 0C:FA:22 (fallback)");
+    lv_obj_set_style_text_color(flipperStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(flipperStatusLbl, 8, 30);
 
     flipperList = lv_list_create(bleToolScreen);
     lv_obj_set_size(flipperList, SCREEN_W, SCREEN_H - 80);
     lv_obj_set_pos(flipperList, 0, 48);
-    lv_obj_set_style_bg_color(flipperList,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(flipperList,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(flipperList,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(flipperList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(flipperList,      2, LV_PART_MAIN);
@@ -3612,42 +4483,43 @@ void createFlipperScanner() {
     lv_screen_load_anim(bleToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-//  BLE TOOL 4 – SKIMMER DETECTOR  Credit: https://github.com/justcallmekoko/ESP32Marauder/wiki/detect-card-skimmers
+// ════════════════════════════════════════════════════════════════
+//  BLE TOOL 4 – SKIMMER DETECTOR
 //
 //  Scans for Bluetooth devices with names matching known skimmer
 //  modules: HC-03, HC-05, HC-06. These cheap hobbyist boards are
 //  commonly found inside gas pump card skimmers.
 //  Reference: github.com/sparkfunX/Skimmer_Scanner
 //             github.com/justcallmekoko/ESP32Marauder
-//  ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-
+// ════════════════════════════════════════════════════════════════
 static lv_obj_t *skimmerStatusLbl = nullptr;
 static lv_obj_t *skimmerList      = nullptr;
 
 static void cb_doSkimmerScan(lv_event_t *e) {
     lv_label_set_text(skimmerStatusLbl, LV_SYMBOL_REFRESH "  Scanning 8s...");
-    lv_obj_set_style_text_color(skimmerStatusLbl, lv_color_hex(0xe3b341), LV_PART_MAIN);
+    lv_obj_set_style_text_color(skimmerStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
     lv_obj_clean(skimmerList);
     lv_timer_handler();
 
     // Red spinner — danger colour for skimmers
     startLEDSpinner(220, 0, 0);
-    int found = doBLEScan(BLE_SCAN_SECS, BLE_SKIMMER);
+    int found = doBLEScan(bleScanSeconds, BLE_SKIMMER);
     stopLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
 
     if (found == 0) {
         lv_label_set_text(skimmerStatusLbl,
             LV_SYMBOL_OK "  No skimmer modules detected");
         lv_obj_set_style_text_color(skimmerStatusLbl,
-            lv_color_hex(0x3fb950), LV_PART_MAIN);
+            lv_color_hex(TH.success), LV_PART_MAIN);
         lv_obj_t *empty = lv_list_add_text(skimmerList,
             "No HC-03 / HC-05 / HC-06 in range");
         if (empty)
             lv_obj_set_style_text_color(empty,
-                lv_color_hex(0x8b949e), LV_PART_MAIN);
+                lv_color_hex(TH.textDim), LV_PART_MAIN);
         return;
     }
+
+    playBLESuspiciousChirp();
 
     char buf[56];
     snprintf(buf, sizeof(buf),
@@ -3655,7 +4527,7 @@ static void cb_doSkimmerScan(lv_event_t *e) {
              found, found == 1 ? "" : "s");
     lv_label_set_text(skimmerStatusLbl, buf);
     lv_obj_set_style_text_color(skimmerStatusLbl,
-        lv_color_hex(0xf85149), LV_PART_MAIN);
+        lv_color_hex(TH.alert), LV_PART_MAIN);
 
     for (int i = 0; i < found; i++) {
         char row[52];
@@ -3666,7 +4538,7 @@ static void cb_doSkimmerScan(lv_event_t *e) {
         lv_obj_t *entry = lv_list_add_text(skimmerList, row);
         if (entry)
             lv_obj_set_style_text_color(entry,
-                lv_color_hex(0xf85149), LV_PART_MAIN);
+                lv_color_hex(TH.alert), LV_PART_MAIN);
     }
 }
 
@@ -3684,13 +4556,13 @@ void createSkimmerScanner() {
         "Scans for HC-03 / HC-05 / HC-06\n"
         "Bluetooth modules used in skimmers");
     lv_obj_set_style_text_color(skimmerStatusLbl,
-        lv_color_hex(0x8b949e), LV_PART_MAIN);
+        lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(skimmerStatusLbl, 8, 30);
 
     skimmerList = lv_list_create(bleToolScreen);
     lv_obj_set_size(skimmerList, SCREEN_W, SCREEN_H - 80);
     lv_obj_set_pos(skimmerList, 0, 48);
-    lv_obj_set_style_bg_color(skimmerList,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(skimmerList,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(skimmerList,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(skimmerList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(skimmerList,      2, LV_PART_MAIN);
@@ -3710,7 +4582,7 @@ void createSkimmerScanner() {
     lv_screen_load_anim(bleToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
-// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  BLE TOOL 5 – META / RAYBAN DETECTOR
 //
 //  Detects Meta smart glasses (Ray-Ban Meta, Quest, etc.) by
@@ -3718,34 +4590,33 @@ void createSkimmerScanner() {
 //  service UUIDs, and service-data UUIDs, while filtering out
 //  common non-Meta identifiers (Apple, Samsung, Microsoft).
 //
-//  Identifier tables credit: https://github.com/justcallmekoko/ESP32Marauder/wiki/meta-detect
+//  Identifier tables credit: NullPxl / justcallmekoko Marauder
 //  Key IDs: 0xFD5F, 0xFEB7, 0xFEB8, 0x01AB, 0x058E, 0x0D53
-// ══════════════════════════════════════════════════════════════════════════════════════════════
-
+// ════════════════════════════════════════════════════════════════
 static lv_obj_t *metaStatusLbl = nullptr;
 static lv_obj_t *metaList      = nullptr;
 
 static void cb_doMetaScan(lv_event_t *e) {
     lv_label_set_text(metaStatusLbl, LV_SYMBOL_REFRESH "  Scanning 8s...");
-    lv_obj_set_style_text_color(metaStatusLbl, lv_color_hex(0xe3b341), LV_PART_MAIN);
+    lv_obj_set_style_text_color(metaStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
     lv_obj_clean(metaList);
     lv_timer_handler();
 
     // Blue spinner for Meta (brand colour)
     startLEDSpinner(0, 100, 255);
-    int found = doBLEScan(BLE_SCAN_SECS, BLE_META);
+    int found = doBLEScan(bleScanSeconds, BLE_META);
     stopLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
 
     if (found == 0) {
         lv_label_set_text(metaStatusLbl,
             LV_SYMBOL_OK "  No Meta devices detected");
         lv_obj_set_style_text_color(metaStatusLbl,
-            lv_color_hex(0x3fb950), LV_PART_MAIN);
+            lv_color_hex(TH.success), LV_PART_MAIN);
         lv_obj_t *empty = lv_list_add_text(metaList,
             "No Ray-Ban / Quest in range");
         if (empty)
             lv_obj_set_style_text_color(empty,
-                lv_color_hex(0x8b949e), LV_PART_MAIN);
+                lv_color_hex(TH.textDim), LV_PART_MAIN);
         return;
     }
 
@@ -3755,7 +4626,7 @@ static void cb_doMetaScan(lv_event_t *e) {
              found, found == 1 ? "" : "s");
     lv_label_set_text(metaStatusLbl, buf);
     lv_obj_set_style_text_color(metaStatusLbl,
-        lv_color_hex(0x58a6ff), LV_PART_MAIN);
+        lv_color_hex(TH.accent), LV_PART_MAIN);
 
     for (int i = 0; i < found; i++) {
         char row[52];
@@ -3766,7 +4637,7 @@ static void cb_doMetaScan(lv_event_t *e) {
         lv_obj_t *entry = lv_list_add_text(metaList, row);
         if (entry)
             lv_obj_set_style_text_color(entry,
-                lv_color_hex(0x58a6ff), LV_PART_MAIN);
+                lv_color_hex(TH.accent), LV_PART_MAIN);
     }
 }
 
@@ -3784,13 +4655,13 @@ void createMetaDetector() {
         "Detects Ray-Ban Meta / Quest via\n"
         "BLE manufacturer & service UUIDs");
     lv_obj_set_style_text_color(metaStatusLbl,
-        lv_color_hex(0x8b949e), LV_PART_MAIN);
+        lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(metaStatusLbl, 8, 30);
 
     metaList = lv_list_create(bleToolScreen);
     lv_obj_set_size(metaList, SCREEN_W, SCREEN_H - 80);
     lv_obj_set_pos(metaList, 0, 48);
-    lv_obj_set_style_bg_color(metaList,     lv_color_hex(0x0d1117), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(metaList,     lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(metaList,       LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(metaList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(metaList,      2, LV_PART_MAIN);
@@ -3810,10 +4681,97 @@ void createMetaDetector() {
     lv_screen_load_anim(bleToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
+
+// ════════════════════════════════════════════════════════════════
+//  AUTO-RETURN HOME
+// ════════════════════════════════════════════════════════════════
+static void deleteIfInactiveScreen(lv_obj_t *&scr, lv_obj_t *activeScr) {
+    // Only delete screens that are not currently active. The active screen is
+    // handled by lv_screen_load_anim(..., auto_del=true) when returning home.
+    if (scr && scr != activeScr && scr != mainScreen) {
+        lv_obj_delete(scr);
+        scr = nullptr;
+    }
+}
+
+static void cleanupForAutoReturnHome(lv_obj_t *activeScr) {
+    // Stop any WiFi promiscuous tools cleanly before jumping home.
+    if (deauthActive || pwnActive || flockActive) {
+        deauthActive = false;
+        pwnActive    = false;
+        flockActive  = false;
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(nullptr);
+    }
+
+    if (deauthTimer) { lv_timer_delete(deauthTimer); deauthTimer = nullptr; }
+    if (pwnTimer)    { lv_timer_delete(pwnTimer);    pwnTimer    = nullptr; }
+    if (flockTimer)  { lv_timer_delete(flockTimer);  flockTimer  = nullptr; }
+
+    // Stop GPS/Wiggle Wars timers safely if one of those tools is open.
+    if (gpsTimer) { lv_timer_delete(gpsTimer); gpsTimer = nullptr; }
+    if (wiggleRunning) {
+        wiggleRunning = false;
+        WiFi.scanDelete();
+        SD.end();
+    }
+    if (wiggleTimer) { lv_timer_delete(wiggleTimer); wiggleTimer = nullptr; }
+
+    // Delete inactive screens that would otherwise stay hidden in memory.
+    deleteIfInactiveScreen(subScreen,        activeScr);
+    deleteIfInactiveScreen(wifiMenuScreen,   activeScr);
+    deleteIfInactiveScreen(wifiToolScreen,   activeScr);
+    deleteIfInactiveScreen(wifiDetailScreen, activeScr);
+    deleteIfInactiveScreen(bleMenuScreen,    activeScr);
+    deleteIfInactiveScreen(bleToolScreen,    activeScr);
+    deleteIfInactiveScreen(bleDetailScreen,  activeScr);
+    deleteIfInactiveScreen(miscMenuScreen,   activeScr);
+    deleteIfInactiveScreen(miscToolScreen,   activeScr);
+    deleteIfInactiveScreen(gpsMenuScreen,    activeScr);
+    deleteIfInactiveScreen(gpsToolScreen,    activeScr);
+
+    // Drop non-home input groups. The main menu group is kept.
+    deleteGroup(&subGroup);
+    deleteGroup(&wifiMenuGroup);
+    deleteGroup(&wifiToolGroup);
+    deleteGroup(&wifiDetailGroup);
+    deleteGroup(&bleMenuGroup);
+    deleteGroup(&bleToolGroup);
+    deleteGroup(&bleDetailGroup);
+    deleteGroup(&miscMenuGroup);
+    deleteGroup(&miscToolGroup);
+    deleteGroup(&gpsMenuGroup);
+    deleteGroup(&gpsToolGroup);
+}
+
+static void updateAutoReturnHome() {
+#if AUTO_RETURN_HOME_TIMEOUT_MS > 0
+    if (powerOffTriggered || !mainScreen) return;
+
+    lv_obj_t *activeScr = lv_screen_active();
+    if (activeScr == mainScreen) return;
+
+    // Do not auto-return in the middle of a long-press power action.
+    if (digitalRead(ENCODER_BTN) == LOW) return;
+
+    if (millis() - lastActivityMs < AUTO_RETURN_HOME_TIMEOUT_MS) return;
+
+    cleanupForAutoReturnHome(activeScr);
+    setGroup(navGroup);
+    setAllLEDs(MENU_COLORS[currentMenu].r, MENU_COLORS[currentMenu].g, MENU_COLORS[currentMenu].b, LED_BRIGHTNESS);
+
+    // Loading home with auto_del=true lets LVGL safely free the active screen
+    // after the animation finishes.
+    lv_screen_load_anim(mainScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, true);
+
+    // Count the auto-return as fresh activity so it does not keep retriggering.
+    resetInactivityTimer();
+#endif
+}
+
 // ════════════════════════════════════════════════════════════════
 //  SETUP
 // ════════════════════════════════════════════════════════════════
-
 void setup() {
     Serial.begin(115200);
     gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -3822,15 +4780,18 @@ void setup() {
     pinMode(POWER_PIN, OUTPUT);
     digitalWrite(POWER_PIN, HIGH);
     pinMode(ENCODER_BTN, INPUT_PULLUP);
+    // Sound uses lazy init. Do not start I2S during boot.
+    // initSound();
 
     tft.begin();
     tft.writecommand(0x11);
     delay(120);
-    tft.setRotation(1);
+    applyDisplayRotation(false);
     // Backlight PWM via LEDC — allows smooth brightness control
     ledcSetup(LCD_BL_CH, LCD_BL_FREQ, LCD_BL_RES);
     ledcAttachPin(LCD_BL_PIN, LCD_BL_CH);
-    ledcWrite(LCD_BL_CH, lcdBrightness);
+    applyBacklightLevel((uint8_t)lcdBrightness);
+    resetInactivityTimer();
     tft.fillScreen(TFT_BLACK);
     showSplashScreen();  // Splash Screen Call
 
@@ -3855,7 +4816,6 @@ void setup() {
 // ════════════════════════════════════════════════════════════════
 //  LOOP
 // ════════════════════════════════════════════════════════════════
-
 void loop() {
     // Feed all available GPS bytes into TinyGPS++ — non-blocking
     while (gpsSerial.available())
@@ -3863,17 +4823,30 @@ void loop() {
 
     lv_timer_handler();
 
+    // Safe inactivity behavior: dim backlight + APA102 brightness only, no ESP32 sleep yet.
+    updateInactivityDimmer();
+
+    // Optional UI auto-return: after inactivity, jump back to the main home menu.
+    updateAutoReturnHome();
+
     // Channel hopping: deauth detector and pwnagotchi watch both need it
     static unsigned long lastHop = 0;
-    if ((deauthActive || pwnActive || flockActive) && (millis() - lastHop >= DEAUTH_HOP_MS)) {
+    if ((deauthActive || pwnActive || flockActive) && (millis() - lastHop >= (unsigned long)deauthHopMs)) {
         lastHop       = millis();
         deauthChannel = (deauthChannel % 13) + 1;
         esp_wifi_set_channel(deauthChannel, WIFI_SECOND_CHAN_NONE);
     }
 
     // Long-press power-off (hold encoder 5 s)
+    // Safety latch: ignore any boot-time LOW reading until the button has been
+    // seen released once. This prevents accidental shutdowns after peripheral init.
     if (!powerOffTriggered) {
-        if (digitalRead(ENCODER_BTN) == LOW) {
+        int encoderBtnState = digitalRead(ENCODER_BTN);
+
+        if (encoderBtnState == HIGH) {
+            powerButtonReleasedAfterBoot = true;
+            btnHoldStart = 0;
+        } else if (powerButtonReleasedAfterBoot) {
             if (btnHoldStart == 0) btnHoldStart = millis();
             if ((millis() - btnHoldStart) > POWER_HOLD_MS) {
                 powerOffTriggered = true;
@@ -3893,10 +4866,14 @@ void loop() {
                 lv_timer_handler();
 
                 setAllLEDs(0, 0, 0, 0);
+                if (soundReady) {
+                    stopSoundDriverAfterChirp();
+                }
                 delay(1500);
                 digitalWrite(POWER_PIN, LOW);
             }
         } else {
+            // Button appears LOW before first release after boot; ignore it.
             btnHoldStart = 0;
         }
     }
