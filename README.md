@@ -9,10 +9,11 @@
 
 | Version | Status | Notes |
 |--------|--------|-------|
+| v1.0.2 | Stable | Adds Packet Monitor with live graph and hop presets, Flock Hybrid, nyanBOX/Axon/Tesla detectors, improved AirTag/Flipper/Skimmer detection, extra themes, and menu cleanup |
 | v1.0.1 | Stable | Adds display/LED dimming controls, scan defaults, rotation toggle, audio feedback, and improved Flock detection |
 | v1.0.0 | Stable | Initial public release of the Rogue Radar Firmware |
 
-> **Latest Release:** `v1.0.1` — Rogue Radar Firmware
+> **Latest Release:** `v1.0.2` — Rogue Radar Firmware
 ---
 
 ## Overview
@@ -44,32 +45,37 @@ It is designed around fast menu navigation, onboard scanning tools, live signal 
 - **Network Scanner** – scans nearby access points and shows SSID, BSSID, RSSI, channel, and security type.
 - **Deauth Detector** – monitors for deauthentication activity using promiscuous mode.
 - **Channel Analyzer** – surveys channel activity and signal strength across WiFi channels.
+- **Packet Monitor** – live WiFi packet monitor with channel selection, packet rate, packet type counts, average RSSI, optional channel hopping, and a live bar graph.
 - **PineAP Hunter** – watches for BSSIDs cycling through many SSIDs across scans.
 - **Pwnagotchi Watch** – looks for Pwnagotchi beacon behavior and parses status data from beacon SSIDs.
 - **Flock Detector** – flags WiFi activity associated with Flock-related SSID keywords, deduplicates hits by source MAC, and can show the source MAC in the results.
+- **Flock Hybrid** – combines BLE and WiFi Flock-style detection into one scanner with merged results and selectable scan presets.
 
 ### BLE Tools
 - **BLE Scanner** – scans nearby Bluetooth Low Energy devices and lists signal details.
-- **AirTag Detector** – identifies AirTag-like BLE activity.
-- **Flipper Detector** – looks for BLE patterns associated with Flipper-style devices.
-- **Skimmer Detector** – checks for HC-03 / HC-05 / HC-06 type modules often used in skimmer-style builds.
+- **AirTag Detector** – identifies AirTag-like BLE activity using manufacturer data, UUID fallback, and passive Apple Find My / AirTag payload pattern detection.
+- **Flipper Detector** – detects Flipper-style BLE devices using name matching, OUI fallback, and UUID detection for Black, White, and Transparent variants; results are selectable with a detail page.
+- **Skimmer Detector** – checks for suspicious BLE serial/module names including HC-03, HC-05, HC-06, HC-08, BT-HC05, JDY-31, AT-09, HM-10, CC41-A, MLT-BT05, SPP-CA, and FFD0.
 - **Meta Detector** – looks for Meta / Ray-Ban smart-glasses related BLE advertisements.
+- **nyanBOX Detector** – detects nyanBOX / Nyan Devices BLE badges and shows name, MAC, RSSI, level, version, age, and Locate Mode.
+- **Axon Detector** – detects Axon-style BLE devices by configurable MAC/OUI prefix with detail view and Locate Mode.
+- **Tesla Detector** – detects Tesla-style BLE name patterns and shows name, MAC, RSSI, age, signal quality, and detail view.
+
+### GPS Tools
+- **GPS Stats** – displays live latitude, longitude, speed, altitude, and satellite data.
+- **Wiggle Wars** – included as a GPS menu item for expansion / custom use.
 
 ### Misc Tools
 - **Device Info** – shows firmware version, chip, flash, heap, CPU, and MAC details.
 - **SD Update** – supports firmware update flow from SD card.
 - **Brightness** – adjusts the TFT backlight with PWM brightness control.
-- **Themes** – switches between the built-in UI color themes.
-- **Scan Defaults** – adjusts BLE scan time, WiFi scan time, WiFi result limit, and deauth hop timing for the current session.
+- **Themes** – switches between built-in UI themes including Dark, Flipper, Matrix, Poseidon, Phantom, Amber, and Tron.
+- **Scan Defaults** – adjusts BLE scan time, WiFi scan time, WiFi result limit, deauth hop timing, Flock Hybrid presets, Packet Monitor hopping ON/OFF, and Packet Monitor hop timing for the current session.
 - **Dimming** – toggles inactivity-based screen and APA102 LED dimming.
 - **LEDs** – toggles the APA102 ring on or off at runtime.
 - **Rotation** – switches between normal and flipped landscape orientations.
 - **Alert Sound** – toggles detection alert chirps.
 - **Menu Sounds** – toggles encoder/menu feedback sounds separately from detection alerts.
-
-### GPS Tools
-- **GPS Stats** – displays live latitude, longitude, speed, altitude, and satellite data.
-- **Wiggle Wars** – included as a GPS menu item for expansion / custom use.
 
 ---
 
