@@ -1,15 +1,16 @@
 // ============================================================
-//  Rogue Radar v1.0.1 Firmware
+//  Rogue Radar v1.0.2 Firmware
 //  Check config.h for adjustable settings
 // ============================================================
 //
 //  Tool Categories:
 //  WiFi Tools: Network Scanner | Deauth Detector | Channel Analyzer
-//              PineAP Hunter | Pwnagotchi Watch | Flock Detector
-//  BLE Tools:  BLE Scanner | AirTag Detector | Flipper Zero Detector
-//              Skimmer Detector | Meta Detector
+//              Packet Monitor | PineAP Hunter | Pwnagotchi Watch | Flock Detector | Flock Hybrid
+//  BLE Tools:  BLE Scanner | AirTag Detector | Flipper Zero Detector | Tesla BLE Detector
+//              nyanBOX Detector | Axon Detector | Skimmer Detector | Meta Detector
 //  GPS Tools:  GPS Stats | Wiggle Wars
-//  Misc Tools: Device Info | SD Update | Brightness ADJ | Themes | Scan Defaults | Dimming | Scan Times | LEDs | Detection Sounds | Menu Sounds | Rotation
+//  Misc Tools: Device Info | SD Update | Brightness ADJ | Themes | Dimming | Scan Times | LEDs | Detection Sounds | Menu Sounds | Rotation
+//              Packet Monitor chan hopping |
 //
 //  Display / UI:
 //  - ST7789 320x170 display
@@ -23,6 +24,7 @@
 //
 //  Arduino IDE Settings:
 //  - Board: ESP32S3 Dev Module
+//  - USB CDC On Boot: Disabled
 //  - Partition Scheme: Huge APP
 //
 //  Required Libraries:
@@ -96,9 +98,13 @@ struct UITheme {
 };
 
 static const UITheme THEMES[] = {
-    { THEME_DARK    },
-    { THEME_FLIPPER },
-    { THEME_MATRIX  },
+    { THEME_DARK     },
+    { THEME_FLIPPER  },
+    { THEME_MATRIX   },
+    { THEME_POSEIDON },
+    { THEME_PHANTOM  },
+    { THEME_AMBER    },
+    { THEME_TRON     },
 };
 static int currentTheme = DEFAULT_THEME;
 
@@ -128,8 +134,8 @@ struct MenuLED { uint8_t r, g, b; };
 const MenuLED MENU_COLORS[4] = {
     LED_COLOR_WIFI,
     LED_COLOR_BLE,
-    LED_COLOR_MISC,
-    LED_COLOR_GPS
+    LED_COLOR_GPS,
+    LED_COLOR_MISC
 };
 
 // ─── LED Spinner (FreeRTOS task on core 0) ───────────────────────
@@ -137,6 +143,7 @@ struct SpinnerColor { uint8_t r, g, b; };
 static volatile bool  spinnerRunning     = false;
 static TaskHandle_t   spinnerTaskHandle  = nullptr;
 static SpinnerColor   spinnerColor       = {0, 200, 0};
+static volatile uint16_t spinnerDelayMs   = 80;
 
 // ─── Global UI State ────────────────────────────────────────────
 static int            currentMenu       = 0;
@@ -181,6 +188,38 @@ static int bleScanSeconds  = BLE_SCAN_SECS;
 static int wifiScanSeconds = WIFI_SCAN_SECS;
 static int wifiMaxResults  = MAX_WIFI_RESULTS;
 static int deauthHopMs     = DEAUTH_HOP_MS;
+
+// Flock Hybrid runtime scan defaults. These reset after reboot.
+static int flockHybridPresetIdx = FLOCK_HYBRID_PRESET_DEFAULT;
+static int flockHybridBleSecs   = FLOCK_HYBRID_BLE_SECS;
+static int flockHybridWifiSecs  = FLOCK_HYBRID_WIFI_SECS;
+static int flockHybridHopMs     = FLOCK_HYBRID_WIFI_HOP_MS;
+
+// Packet Monitor runtime state. Display-only first pass: no PCAP writes.
+static bool          packetMonitorActive  = false;
+static bool          packetMonitorHopEnabled = (PACKET_MONITOR_HOP_ENABLED_DEFAULT != 0);
+static int           packetMonitorHopMs = PACKET_MONITOR_HOP_MS;
+static uint8_t       packetMonitorChannel = PACKET_MONITOR_DEFAULT_CH;
+static uint32_t      packetMonitorLastHopMs = 0;
+static lv_timer_t   *packetMonitorTimer   = nullptr;
+static lv_obj_t     *packetMonStatusLbl   = nullptr;
+static lv_obj_t     *packetMonStatsLbl    = nullptr;
+static lv_obj_t     *packetMonGraphArea   = nullptr;
+static lv_obj_t     *packetMonStartBtn    = nullptr;
+static lv_obj_t     *packetMonStartLbl    = nullptr;
+
+static volatile uint32_t packetMonTotalPackets = 0;
+static volatile uint32_t packetMonMgmtPackets  = 0;
+static volatile uint32_t packetMonDataPackets  = 0;
+static volatile uint32_t packetMonCtrlPackets  = 0;
+static volatile int32_t  packetMonRssiSum      = 0;
+
+static uint32_t packetMonLastTotal   = 0;
+static uint32_t packetMonLastRssiCnt = 0;
+static int32_t  packetMonLastRssiSum = 0;
+static uint32_t packetMonLastUpdate  = 0;
+static uint16_t packetMonRateSamples[PACKET_MONITOR_GRAPH_BARS] = {0};
+static uint8_t  packetMonSampleHead = 0;
 
 // ─── Screen Pointers ────────────────────────────────────────────
 static lv_obj_t *mainScreen       = nullptr;
@@ -320,6 +359,32 @@ static volatile uint8_t flockPendingType = 0;
 static volatile int8_t  flockPendingRSSI = 0;
 static volatile bool    flockPendingReady = false;
 
+// ── Flock Hybrid Scanner ───────────────────────────────────────
+//  Combined BLE + WiFi Flock scan. This intentionally alternates phases
+//  instead of running BLE and WiFi promiscuous mode at the same time.
+struct FlockHybridHit {
+    char     source[6];   // "BLE" or "WiFi"
+    char     name[33];    // BLE name or WiFi SSID
+    char     mac[18];
+    char     reason[24];
+    int8_t   rssi;
+    uint32_t lastSeen;
+};
+
+static FlockHybridHit hybridHits[MAX_FLOCK_HYBRID_HITS];
+static int            hybridHitCount = 0;
+static volatile bool  hybridWifiActive = false;
+static lv_obj_t      *hybridStatusLbl = nullptr;
+static lv_obj_t      *hybridList      = nullptr;
+static lv_timer_t    *hybridStartTimer = nullptr;
+
+// ISR pending slot for the WiFi half of the hybrid scanner
+static char             hybridPendingName[33];
+static char             hybridPendingMac[18];
+static char             hybridPendingReason[24];
+static volatile int8_t  hybridPendingRSSI = 0;
+static volatile bool    hybridPendingReady = false;
+
 // ════════════════════════════════════════════════════════════════
 //  BLE DATA STRUCTURES
 // ════════════════════════════════════════════════════════════════
@@ -330,7 +395,10 @@ enum BLEDeviceType {
     BLE_FLIPPER  = 2,
     BLE_APPLE    = 3,    // Apple but not an AirTag
     BLE_SKIMMER  = 4,    // HC-03/HC-05/HC-06 skimmer module
-    BLE_META     = 5     // Meta/RayBan smart glasses
+    BLE_META     = 5,    // Meta/RayBan smart glasses
+    BLE_NYANBOX  = 6,    // nyanBOX / Nyan Devices badge
+    BLE_AXON     = 7,    // Axon-style BLE device by MAC/OUI prefix
+    BLE_TESLA    = 8     // Tesla BLE name-pattern detector
 };
 
 struct BLEEntry {
@@ -339,11 +407,47 @@ struct BLEEntry {
     int8_t        rssi;
     BLEDeviceType type;
     char          mfgHint[14]; // short manufacturer hint for list row
+    char          flipperColor[13]; // Black / White / Transparent / Unknown
 };
 
 static BLEEntry bleEntries[MAX_BLE_RESULTS];
 static int      bleEntryCount  = 0;
 static bool     bleInitialized = false;  // BLEDevice::init() once only
+
+// nyanBOX detector entries. Fixed array keeps memory predictable on ESP32-S3.
+struct NyanBoxEntry {
+    char     name[33];
+    char     mac[18];
+    int8_t   rssi;
+    uint16_t level;
+    char     version[16];
+    uint32_t lastSeen;
+};
+
+static NyanBoxEntry nyanEntries[MAX_NYANBOX_RESULTS];
+static int          nyanEntryCount = 0;
+
+// Axon detector entries. Fixed array keeps memory predictable on ESP32-S3.
+struct AxonEntry {
+    char     name[33];
+    char     mac[18];
+    int8_t   rssi;
+    uint32_t lastSeen;
+};
+
+static AxonEntry axonEntries[MAX_AXON_RESULTS];
+static int       axonEntryCount = 0;
+
+// Tesla detector entries. Fixed array keeps memory predictable on ESP32-S3.
+struct TeslaEntry {
+    char     name[33];
+    char     mac[18];
+    int8_t   rssi;
+    uint32_t lastSeen;
+};
+
+static TeslaEntry teslaEntries[MAX_TESLA_RESULTS];
+static int        teslaEntryCount = 0;
 
 
 // ════════════════════════════════════════════════════════════════
@@ -355,10 +459,12 @@ void createNetworkScanner();
 void createNetworkDetail(int idx);
 void createDeauthDetector();
 void createChannelAnalyzer();
+void createPacketMonitor();
 void createPineAPHunter();
 void createPineAPDetail(int idx);
 void createPwnagotchiDetector();
 void createFlockDetector();
+void createFlockHybridScanner();
 void createSubScreen(int idx);
 void createMiscMenu();
 void createDeviceInfo();
@@ -378,6 +484,14 @@ void createBLEScanner();
 void createBLEDetail(int idx);
 void createAirTagScanner();
 void createFlipperScanner();
+void createNyanBoxDetector();
+void createNyanBoxDetail(int idx);
+void createNyanBoxLocate(int idx);
+void createAxonDetector();
+void createAxonDetail(int idx);
+void createAxonLocate(int idx);
+void createTeslaDetector();
+void createTeslaDetail(int idx);
 void createSkimmerScanner();
 void createMetaDetector();
 static void cb_bleToolBack(lv_event_t *e);
@@ -805,7 +919,7 @@ static void ledSpinnerTask(void *param) {
 
         ledStrip.write(frame, NUM_LEDS, activeLedBrightness(LED_BRIGHTNESS));
         pos = (pos + 1) % NUM_LEDS;
-        vTaskDelay(pdMS_TO_TICKS(80));   // ~12 FPS chase speed
+        vTaskDelay(pdMS_TO_TICKS(spinnerDelayMs));
     }
 
     spinnerTaskHandle = nullptr;
@@ -813,9 +927,10 @@ static void ledSpinnerTask(void *param) {
 }
 
 // Start the spinner with a given accent colour (call before blocking scan)
-void startLEDSpinner(uint8_t r, uint8_t g, uint8_t b) {
+void startLEDSpinner(uint8_t r, uint8_t g, uint8_t b, uint16_t delayMs = 80) {
     if (spinnerRunning || spinnerTaskHandle != nullptr) return;
     spinnerColor   = {r, g, b};
+    spinnerDelayMs = delayMs;
     spinnerRunning = true;
     xTaskCreatePinnedToCore(
         ledSpinnerTask,    // task function
@@ -923,8 +1038,8 @@ struct MenuItem { const char *icon; const char *label; const char *subTitle; };
 static const MenuItem MENU_ITEMS[4] = {
     { LV_SYMBOL_WIFI,      "WiFi Tools",  LV_SYMBOL_WIFI      "  WiFi Tools" },
     { LV_SYMBOL_BLUETOOTH, "BLE Tools",   LV_SYMBOL_BLUETOOTH "  BLE Tools"  },
-    { LV_SYMBOL_SETTINGS,  "Misc Tools",  LV_SYMBOL_SETTINGS  "  Misc Tools" },
     { LV_SYMBOL_GPS,       "GPS Tools",   LV_SYMBOL_GPS       "  GPS Tools"  },
+    { LV_SYMBOL_SETTINGS,  "Misc Tools",  LV_SYMBOL_SETTINGS  "  Misc Tools" },
 };
 
 static void cb_menuFocused(lv_event_t *e) {
@@ -937,8 +1052,8 @@ static void cb_menuClicked(lv_event_t *e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if      (idx == 0) createWiFiMenu();
     else if (idx == 1) createBLEMenu();
-    else if (idx == 2) createMiscMenu();
-    else if (idx == 3) createGPSMenu();
+    else if (idx == 2) createGPSMenu();
+    else if (idx == 3) createMiscMenu();
     else               createSubScreen(idx);
 }
 
@@ -1403,7 +1518,7 @@ void createSDUpdate() {
 
     otaStatusLbl = lv_label_create(miscToolScreen);
     lv_label_set_text(otaStatusLbl,
-        "Place firmware.bin in SD root\n"
+        "Place update.bin in SD root\n"
         "then press Flash.");
     lv_obj_set_style_text_color(otaStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(otaStatusLbl, 8, 30);
@@ -1455,12 +1570,49 @@ void createSDUpdate() {
 static lv_obj_t *scanDefaultsBleBtn    = nullptr;
 static lv_obj_t *scanDefaultsWifiBtn   = nullptr;
 static lv_obj_t *scanDefaultsResultBtn = nullptr;
-static lv_obj_t *scanDefaultsHopBtn    = nullptr;
+static lv_obj_t *scanDefaultsHopBtn       = nullptr;
+static lv_obj_t *scanDefaultsHybridBtn    = nullptr;
+static lv_obj_t *scanDefaultsPacketHopBtn = nullptr;
+static lv_obj_t *scanDefaultsPacketMsBtn  = nullptr;
+
+struct FlockHybridPreset {
+    const char *name;
+    int bleSecs;
+    int wifiSecs;
+    int hopMs;
+};
+
+static const FlockHybridPreset FLOCK_HYBRID_PRESETS[] = {
+    { FLOCK_HYBRID_PRESET_0_NAME, FLOCK_HYBRID_PRESET_0_BLE, FLOCK_HYBRID_PRESET_0_WIFI, FLOCK_HYBRID_PRESET_0_HOP },
+    { FLOCK_HYBRID_PRESET_1_NAME, FLOCK_HYBRID_PRESET_1_BLE, FLOCK_HYBRID_PRESET_1_WIFI, FLOCK_HYBRID_PRESET_1_HOP },
+    { FLOCK_HYBRID_PRESET_2_NAME, FLOCK_HYBRID_PRESET_2_BLE, FLOCK_HYBRID_PRESET_2_WIFI, FLOCK_HYBRID_PRESET_2_HOP },
+    { FLOCK_HYBRID_PRESET_3_NAME, FLOCK_HYBRID_PRESET_3_BLE, FLOCK_HYBRID_PRESET_3_WIFI, FLOCK_HYBRID_PRESET_3_HOP },
+    { FLOCK_HYBRID_PRESET_4_NAME, FLOCK_HYBRID_PRESET_4_BLE, FLOCK_HYBRID_PRESET_4_WIFI, FLOCK_HYBRID_PRESET_4_HOP }
+};
+
+static const int FLOCK_HYBRID_PRESET_COUNT = sizeof(FLOCK_HYBRID_PRESETS) / sizeof(FLOCK_HYBRID_PRESETS[0]);
+
+static void applyFlockHybridPreset() {
+    if (flockHybridPresetIdx < 0 || flockHybridPresetIdx >= FLOCK_HYBRID_PRESET_COUNT) {
+        flockHybridPresetIdx = 0;
+    }
+
+    flockHybridBleSecs  = FLOCK_HYBRID_PRESETS[flockHybridPresetIdx].bleSecs;
+    flockHybridWifiSecs = FLOCK_HYBRID_PRESETS[flockHybridPresetIdx].wifiSecs;
+    flockHybridHopMs    = FLOCK_HYBRID_PRESETS[flockHybridPresetIdx].hopMs;
+}
 
 static const int BLE_TIME_OPTIONS[]    = {5, 8, 10, 15, 20};
 static const int WIFI_TIME_OPTIONS[]   = {5, 10, 15, 20};
 static const int WIFI_RESULT_OPTIONS[] = {10, 20, 30};
 static const int DEAUTH_HOP_OPTIONS[]  = {100, 200, 500, 1000};
+static const int PACKET_HOP_OPTIONS[]  = {
+    PACKET_MONITOR_HOP_PRESET_0_MS,
+    PACKET_MONITOR_HOP_PRESET_1_MS,
+    PACKET_MONITOR_HOP_PRESET_2_MS,
+    PACKET_MONITOR_HOP_PRESET_3_MS,
+    PACKET_MONITOR_HOP_PRESET_4_MS
+};
 
 static int nextOptionValue(const int *options, int count, int currentValue) {
     for (int i = 0; i < count; i++) {
@@ -1485,6 +1637,12 @@ static void updateScanDefaultsLabels() {
     setBtnText(scanDefaultsResultBtn, buf);
     snprintf(buf, sizeof(buf), LV_SYMBOL_REFRESH "  Deauth Hop: %d ms", deauthHopMs);
     setBtnText(scanDefaultsHopBtn, buf);
+    snprintf(buf, sizeof(buf), LV_SYMBOL_WARNING "  Hybrid: %s", FLOCK_HYBRID_PRESETS[flockHybridPresetIdx].name);
+    setBtnText(scanDefaultsHybridBtn, buf);
+    snprintf(buf, sizeof(buf), LV_SYMBOL_WIFI "  Packet Hop: %s", packetMonitorHopEnabled ? "ON" : "OFF");
+    setBtnText(scanDefaultsPacketHopBtn, buf);
+    snprintf(buf, sizeof(buf), LV_SYMBOL_REFRESH "  Packet Hop: %d ms", packetMonitorHopMs);
+    setBtnText(scanDefaultsPacketMsBtn, buf);
 }
 
 static void cb_scanDefaultsBle(lv_event_t *e) {
@@ -1508,6 +1666,27 @@ static void cb_scanDefaultsWifiResults(lv_event_t *e) {
 
 static void cb_scanDefaultsDeauthHop(lv_event_t *e) {
     deauthHopMs = nextOptionValue(DEAUTH_HOP_OPTIONS, sizeof(DEAUTH_HOP_OPTIONS) / sizeof(DEAUTH_HOP_OPTIONS[0]), deauthHopMs);
+    resetInactivityTimer();
+    updateScanDefaultsLabels();
+}
+
+static void cb_scanDefaultsFlockHybrid(lv_event_t *e) {
+    flockHybridPresetIdx = (flockHybridPresetIdx + 1) % FLOCK_HYBRID_PRESET_COUNT;
+    applyFlockHybridPreset();
+    resetInactivityTimer();
+    updateScanDefaultsLabels();
+}
+
+static void cb_scanDefaultsPacketHopToggle(lv_event_t *e) {
+    packetMonitorHopEnabled = !packetMonitorHopEnabled;
+    packetMonitorLastHopMs = millis();
+    resetInactivityTimer();
+    updateScanDefaultsLabels();
+}
+
+static void cb_scanDefaultsPacketHopMs(lv_event_t *e) {
+    packetMonitorHopMs = nextOptionValue(PACKET_HOP_OPTIONS, sizeof(PACKET_HOP_OPTIONS) / sizeof(PACKET_HOP_OPTIONS[0]), packetMonitorHopMs);
+    packetMonitorLastHopMs = millis();
     resetInactivityTimer();
     updateScanDefaultsLabels();
 }
@@ -1550,6 +1729,21 @@ void createScanDefaults() {
     lv_obj_set_height(scanDefaultsHopBtn, 30);
     lv_obj_add_event_cb(scanDefaultsHopBtn, cb_scanDefaultsDeauthHop, LV_EVENT_CLICKED, nullptr);
 
+    scanDefaultsHybridBtn = lv_list_add_btn(list, nullptr, "");
+    styleListBtn(scanDefaultsHybridBtn);
+    lv_obj_set_height(scanDefaultsHybridBtn, 30);
+    lv_obj_add_event_cb(scanDefaultsHybridBtn, cb_scanDefaultsFlockHybrid, LV_EVENT_CLICKED, nullptr);
+
+    scanDefaultsPacketHopBtn = lv_list_add_btn(list, nullptr, "");
+    styleListBtn(scanDefaultsPacketHopBtn);
+    lv_obj_set_height(scanDefaultsPacketHopBtn, 30);
+    lv_obj_add_event_cb(scanDefaultsPacketHopBtn, cb_scanDefaultsPacketHopToggle, LV_EVENT_CLICKED, nullptr);
+
+    scanDefaultsPacketMsBtn = lv_list_add_btn(list, nullptr, "");
+    styleListBtn(scanDefaultsPacketMsBtn);
+    lv_obj_set_height(scanDefaultsPacketMsBtn, 30);
+    lv_obj_add_event_cb(scanDefaultsPacketMsBtn, cb_scanDefaultsPacketHopMs, LV_EVENT_CLICKED, nullptr);
+
     updateScanDefaultsLabels();
 
     lv_obj_t *backBtn = createBackBtn(miscToolScreen, cb_miscToolBack);
@@ -1560,6 +1754,9 @@ void createScanDefaults() {
     lv_group_add_obj(miscToolGroup, scanDefaultsWifiBtn);
     lv_group_add_obj(miscToolGroup, scanDefaultsResultBtn);
     lv_group_add_obj(miscToolGroup, scanDefaultsHopBtn);
+    lv_group_add_obj(miscToolGroup, scanDefaultsHybridBtn);
+    lv_group_add_obj(miscToolGroup, scanDefaultsPacketHopBtn);
+    lv_group_add_obj(miscToolGroup, scanDefaultsPacketMsBtn);
     lv_group_add_obj(miscToolGroup, backBtn);
     setGroup(miscToolGroup);
 
@@ -2266,13 +2463,15 @@ void createWiggleWars() {
 // ════════════════════════════════════════════════════════════════
 //  WIFI MENU
 // ════════════════════════════════════════════════════════════════
-static const char *WIFI_TOOL_LABELS[6] = {
+static const char *WIFI_TOOL_LABELS[8] = {
     LV_SYMBOL_WIFI     "  Network Scanner",
     LV_SYMBOL_WARNING  "  Deauth Detector",
     LV_SYMBOL_LOOP     "  Channel Analyzer",
+    LV_SYMBOL_EYE_OPEN "  Packet Monitor",
     LV_SYMBOL_EYE_OPEN "  PineAP Hunter",
     LV_SYMBOL_EYE_OPEN "  Pwnagotchi Watch",
-    LV_SYMBOL_WARNING  "  Flock Detector"
+    LV_SYMBOL_WARNING  "  Flock Detector",
+    LV_SYMBOL_BLUETOOTH "  Flock Hybrid"
 };
 
 static void cb_wifiMenuBack(lv_event_t *e) {
@@ -2288,9 +2487,11 @@ static void cb_wifiToolSelected(lv_event_t *e) {
         case 0: createNetworkScanner();      break;
         case 1: createDeauthDetector();      break;
         case 2: createChannelAnalyzer();     break;
-        case 3: createPineAPHunter();        break;
-        case 4: createPwnagotchiDetector(); break;
-        case 5: createFlockDetector();      break;
+        case 3: createPacketMonitor();      break;
+        case 4: createPineAPHunter();       break;
+        case 5: createPwnagotchiDetector(); break;
+        case 6: createFlockDetector();      break;
+        case 7: createFlockHybridScanner(); break;
     }
 }
 
@@ -2315,7 +2516,7 @@ void createWiFiMenu() {
     deleteGroup(&wifiMenuGroup);
     wifiMenuGroup = lv_group_create();
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 8; i++) {
         lv_obj_t *btn = lv_list_add_btn(list, nullptr, WIFI_TOOL_LABELS[i]);
         styleListBtn(btn);
         lv_obj_set_height(btn, 30);
@@ -2445,9 +2646,24 @@ static void cb_wifiToolBack(lv_event_t *e) {
         esp_wifi_set_promiscuous(false);
         esp_wifi_set_promiscuous_rx_cb(nullptr);
     }
+    if (hybridWifiActive) {
+        hybridWifiActive = false;
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(nullptr);
+    }
+    if (packetMonitorActive) {
+        packetMonitorActive = false;
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(nullptr);
+    }
+    if (spinnerRunning) {
+        stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+    }
     if (deauthTimer) { lv_timer_delete(deauthTimer); deauthTimer = nullptr; }
     if (pwnTimer)    { lv_timer_delete(pwnTimer);    pwnTimer    = nullptr; }
     if (flockTimer)  { lv_timer_delete(flockTimer);  flockTimer  = nullptr; }
+    if (hybridStartTimer) { lv_timer_delete(hybridStartTimer); hybridStartTimer = nullptr; }
+    if (packetMonitorTimer) { lv_timer_delete(packetMonitorTimer); packetMonitorTimer = nullptr; }
     // Do NOT lv_obj_delete the outgoing screen — auto_del=true lets LVGL free it
     // after the animation completes.  Deleting before load_anim = use-after-free crash.
     wifiToolScreen = nullptr;
@@ -2913,8 +3129,320 @@ void createChannelAnalyzer() {
 }
 
 
+
 // ════════════════════════════════════════════════════════════════
-//  TOOL 4 – PINEAP HUNTER
+//  TOOL 4 – PACKET MONITOR
+//
+//  Display-only first pass inspired by PacketMonitor32. Uses WiFi
+//  promiscuous mode to count packet activity on the selected channel.
+//  No PCAP / SD writes yet, so it stays lighter and safer.
+// ════════════════════════════════════════════════════════════════
+
+static void IRAM_ATTR packet_monitor_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!packetMonitorActive) return;
+
+    const wifi_promiscuous_pkt_t *pkt = reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
+    packetMonTotalPackets++;
+    packetMonRssiSum += pkt->rx_ctrl.rssi;
+
+    if      (type == WIFI_PKT_MGMT) packetMonMgmtPackets++;
+    else if (type == WIFI_PKT_DATA) packetMonDataPackets++;
+    else if (type == WIFI_PKT_CTRL) packetMonCtrlPackets++;
+}
+
+static const char *packetSignalLabel(int avgRssi) {
+    if (avgRssi >= -55) return "Strong";
+    if (avgRssi >= -70) return "Good";
+    if (avgRssi >= -82) return "Weak";
+    return "Far";
+}
+
+static void packetMonResetCounters() {
+    packetMonTotalPackets = 0;
+    packetMonMgmtPackets  = 0;
+    packetMonDataPackets  = 0;
+    packetMonCtrlPackets  = 0;
+    packetMonRssiSum      = 0;
+    packetMonLastTotal    = 0;
+    packetMonLastRssiCnt  = 0;
+    packetMonLastRssiSum  = 0;
+    packetMonLastUpdate   = millis();
+    packetMonSampleHead   = 0;
+    memset(packetMonRateSamples, 0, sizeof(packetMonRateSamples));
+}
+
+static void packetMonDrawGraph() {
+    if (!packetMonGraphArea) return;
+    lv_obj_clean(packetMonGraphArea);
+
+    const int areaW   = SCREEN_W - 12 - 8;
+    const int areaH   = 58;
+    const int barGap  = 1;
+    const int barW    = max(2, (areaW / PACKET_MONITOR_GRAPH_BARS) - barGap);
+    const int maxBarH = areaH - 10;
+
+    uint16_t maxRate = 1;
+    for (int i = 0; i < PACKET_MONITOR_GRAPH_BARS; i++) {
+        if (packetMonRateSamples[i] > maxRate) maxRate = packetMonRateSamples[i];
+    }
+#if PACKET_MONITOR_GRAPH_MAX_RATE > 0
+    if (maxRate < PACKET_MONITOR_GRAPH_MAX_RATE) maxRate = PACKET_MONITOR_GRAPH_MAX_RATE;
+#endif
+
+    for (int i = 0; i < PACKET_MONITOR_GRAPH_BARS; i++) {
+        int srcIdx = (packetMonSampleHead + i) % PACKET_MONITOR_GRAPH_BARS;
+        uint16_t rate = packetMonRateSamples[srcIdx];
+        int barH = rate == 0 ? 2 : max(2, (int)((float)rate / maxRate * maxBarH));
+        int x = i * (barW + barGap);
+        int y = maxBarH - barH;
+
+        lv_color_t col = lv_color_hex(TH.accent);
+        if (rate == 0) col = lv_color_hex(TH.barBg);
+        else if (rate > (maxRate * 75 / 100)) col = lv_color_hex(TH.alert);
+        else if (rate > (maxRate * 45 / 100)) col = lv_color_hex(TH.warn);
+        else col = lv_color_hex(TH.success);
+
+        lv_obj_t *bar = lv_obj_create(packetMonGraphArea);
+        lv_obj_set_size(bar, barW, barH);
+        lv_obj_set_pos(bar, x, y);
+        lv_obj_set_style_bg_color(bar, col, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    lv_obj_t *base = lv_obj_create(packetMonGraphArea);
+    lv_obj_set_size(base, areaW, 1);
+    lv_obj_set_pos(base, 0, maxBarH + 2);
+    lv_obj_set_style_bg_color(base, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(base, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(base, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(base, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+static void packetMonUpdateUI() {
+    if (!packetMonStatsLbl || !packetMonStatusLbl) return;
+
+    uint32_t now = millis();
+
+    if (packetMonitorActive && packetMonitorHopEnabled &&
+        (now - packetMonitorLastHopMs >= (uint32_t)packetMonitorHopMs)) {
+        packetMonitorChannel++;
+        if (packetMonitorChannel > 13) packetMonitorChannel = 1;
+        esp_wifi_set_channel(packetMonitorChannel, WIFI_SECOND_CHAN_NONE);
+        packetMonitorLastHopMs = now;
+    }
+
+    uint32_t total = packetMonTotalPackets;
+    uint32_t mgmt  = packetMonMgmtPackets;
+    uint32_t data  = packetMonDataPackets;
+    uint32_t ctrl  = packetMonCtrlPackets;
+    int32_t  rssiS = packetMonRssiSum;
+
+    uint32_t elapsed = now - packetMonLastUpdate;
+    if (elapsed == 0) elapsed = 1;
+    uint32_t deltaPackets = total - packetMonLastTotal;
+
+    // Keep both sides of the math as uint32_t to avoid Arduino/C++ min()
+    // template type conflicts on ESP32 core 2.0.10.
+    uint32_t rawRate = (uint32_t)((deltaPackets * 1000UL) / elapsed);
+    if (rawRate > 65535UL) rawRate = 65535UL;
+    uint16_t rate = (uint16_t)rawRate;
+
+    int avgRssi = -99;
+    uint32_t deltaRssiCount = total - packetMonLastRssiCnt;
+    if (deltaRssiCount > 0) {
+        avgRssi = (int)((rssiS - (int32_t)packetMonLastRssiSum) / (int32_t)deltaRssiCount);
+    }
+
+    packetMonRateSamples[packetMonSampleHead] = rate;
+    packetMonSampleHead = (packetMonSampleHead + 1) % PACKET_MONITOR_GRAPH_BARS;
+    packetMonLastTotal   = total;
+    packetMonLastRssiCnt = total;
+    packetMonLastRssiSum = rssiS;
+    packetMonLastUpdate  = now;
+
+    char status[72];
+    snprintf(status, sizeof(status), "%s CH:%u %s  Rate:%u/s  RSSI:%ddBm %s",
+             packetMonitorActive ? LV_SYMBOL_PLAY : LV_SYMBOL_STOP,
+             packetMonitorChannel,
+             packetMonitorHopEnabled ? "HOP" : "MAN",
+             rate,
+             avgRssi,
+             deltaRssiCount ? packetSignalLabel(avgRssi) : "--");
+    lv_label_set_text(packetMonStatusLbl, status);
+    lv_obj_set_style_text_color(packetMonStatusLbl,
+        packetMonitorActive ? lv_color_hex(TH.accent) : lv_color_hex(TH.textDim),
+        LV_PART_MAIN);
+
+    char stats[96];
+    snprintf(stats, sizeof(stats), "Packets:%lu   Mgmt:%lu   Data:%lu   Ctrl:%lu",
+             (unsigned long)total,
+             (unsigned long)mgmt,
+             (unsigned long)data,
+             (unsigned long)ctrl);
+    lv_label_set_text(packetMonStatsLbl, stats);
+
+    packetMonDrawGraph();
+}
+
+static void packetMonTimerCb(lv_timer_t *t) {
+    packetMonUpdateUI();
+}
+
+static void packetMonStop() {
+    if (!packetMonitorActive) return;
+    packetMonitorActive = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+    if (packetMonStartLbl) lv_label_set_text(packetMonStartLbl, LV_SYMBOL_PLAY "  Start");
+    packetMonUpdateUI();
+}
+
+static void packetMonStart() {
+    packetMonResetCounters();
+
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(50);
+
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    esp_wifi_set_channel(packetMonitorChannel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous_rx_cb(packet_monitor_cb);
+    esp_wifi_set_promiscuous(true);
+    packetMonitorActive = true;
+    packetMonitorLastHopMs = millis();
+
+    startLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 120);
+    if (packetMonStartLbl) lv_label_set_text(packetMonStartLbl, LV_SYMBOL_STOP "  Stop");
+    packetMonUpdateUI();
+}
+
+static void cb_packetMonStartStop(lv_event_t *e) {
+    if (packetMonitorActive) packetMonStop();
+    else packetMonStart();
+}
+
+static void packetMonSetChannel(uint8_t ch) {
+    if (ch < 1) ch = 13;
+    if (ch > 13) ch = 1;
+    packetMonitorChannel = ch;
+    packetMonitorLastHopMs = millis();
+    if (packetMonitorActive) {
+        esp_wifi_set_channel(packetMonitorChannel, WIFI_SECOND_CHAN_NONE);
+        packetMonResetCounters();
+    }
+    packetMonUpdateUI();
+}
+
+static void cb_packetMonChMinus(lv_event_t *e) {
+    packetMonSetChannel(packetMonitorChannel == 1 ? 13 : packetMonitorChannel - 1);
+}
+
+static void cb_packetMonChPlus(lv_event_t *e) {
+    packetMonSetChannel(packetMonitorChannel == 13 ? 1 : packetMonitorChannel + 1);
+}
+
+static lv_obj_t *createSmallPacketBtn(lv_obj_t *parent, const char *text, int x, lv_event_cb_t cb) {
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 50, 26);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, x, -4);
+    lv_obj_set_style_bg_color(btn, TC(actionBg),  LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn, TC(actionFoc), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(btn, TC(success),   LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(btn, TC(actionBdr), LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 5, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_color(lbl, TC(text), LV_PART_MAIN);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+void createPacketMonitor() {
+    packetMonitorActive = false;
+    packetMonStatusLbl = nullptr;
+    packetMonStatsLbl  = nullptr;
+    packetMonGraphArea = nullptr;
+    packetMonStartBtn  = nullptr;
+    packetMonStartLbl  = nullptr;
+    packetMonResetCounters();
+
+    if (wifiToolScreen) { lv_obj_delete(wifiToolScreen); wifiToolScreen = nullptr; }
+    wifiToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiToolScreen);
+    createHeader(wifiToolScreen, LV_SYMBOL_EYE_OPEN "  Packet Monitor");
+
+    packetMonStatusLbl = lv_label_create(wifiToolScreen);
+    lv_label_set_text(packetMonStatusLbl, packetMonitorHopEnabled ?
+        "Ready. Packet Hop ON. Press Start." :
+        "Ready. Choose channel and press Start.");
+    lv_obj_set_style_text_color(packetMonStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(packetMonStatusLbl, 8, 30);
+
+    packetMonStatsLbl = lv_label_create(wifiToolScreen);
+    lv_label_set_text(packetMonStatsLbl, "Packets:0   Mgmt:0   Data:0   Ctrl:0");
+    lv_obj_set_style_text_color(packetMonStatsLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_set_pos(packetMonStatsLbl, 8, 46);
+
+    packetMonGraphArea = lv_obj_create(wifiToolScreen);
+    lv_obj_set_size(packetMonGraphArea, SCREEN_W - 12, 66);
+    lv_obj_set_pos(packetMonGraphArea, 6, 66);
+    lv_obj_set_style_bg_color(packetMonGraphArea, lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(packetMonGraphArea, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(packetMonGraphArea, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(packetMonGraphArea, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(packetMonGraphArea, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(packetMonGraphArea, 4, LV_PART_MAIN);
+    lv_obj_clear_flag(packetMonGraphArea, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hint = lv_label_create(packetMonGraphArea);
+    lv_label_set_text(hint, "Live packets / second graph");
+    lv_obj_set_style_text_color(hint, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
+    lv_obj_t *chMinus = createSmallPacketBtn(wifiToolScreen, "CH-", 112, cb_packetMonChMinus);
+    lv_obj_t *chPlus  = createSmallPacketBtn(wifiToolScreen, "CH+", 166, cb_packetMonChPlus);
+
+    packetMonStartBtn = lv_btn_create(wifiToolScreen);
+    lv_obj_set_size(packetMonStartBtn, 96, 26);
+    lv_obj_align(packetMonStartBtn, LV_ALIGN_BOTTOM_RIGHT, -6, -4);
+    lv_obj_set_style_bg_color(packetMonStartBtn, TC(actionBg),  LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(packetMonStartBtn, TC(actionFoc), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(packetMonStartBtn, TC(success),   LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(packetMonStartBtn, TC(actionBdr), LV_PART_MAIN);
+    lv_obj_set_style_border_width(packetMonStartBtn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(packetMonStartBtn, 5, LV_PART_MAIN);
+    lv_obj_add_event_cb(packetMonStartBtn, cb_packetMonStartStop, LV_EVENT_CLICKED, nullptr);
+    packetMonStartLbl = lv_label_create(packetMonStartBtn);
+    lv_label_set_text(packetMonStartLbl, LV_SYMBOL_PLAY "  Start");
+    lv_obj_set_style_text_color(packetMonStartLbl, TC(text), LV_PART_MAIN);
+    lv_obj_center(packetMonStartLbl);
+
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    lv_group_add_obj(wifiToolGroup, backBtn);
+    lv_group_add_obj(wifiToolGroup, chMinus);
+    lv_group_add_obj(wifiToolGroup, chPlus);
+    lv_group_add_obj(wifiToolGroup, packetMonStartBtn);
+    setGroup(wifiToolGroup);
+
+    if (packetMonitorTimer) { lv_timer_delete(packetMonitorTimer); packetMonitorTimer = nullptr; }
+    packetMonitorTimer = lv_timer_create(packetMonTimerCb, PACKET_MONITOR_UPDATE_MS, nullptr);
+
+    packetMonUpdateUI();
+    setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, LED_BRIGHTNESS);
+    lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  TOOL 5 – PINEAP HUNTER
 //
 //  Detects rogue WiFi Pineapple / KARMA attacks by tracking how many
 //  unique SSIDs each BSSID advertises across repeated scans.
@@ -3348,7 +3876,58 @@ static bool detectMeta(BLEAdvertisedDevice &dev) {
 //  UUID fallback — AirTags advertise service UUID 0xFD44 (Apple's
 //    proprietary continuity service) in both modes.
 //
+// GhostESP-style raw BLE payload pattern check for Apple Find My / AirTag.
+// This catches full advertising payloads like:
+//   1E FF 4C 00 ...       (manufacturer AD structure with Apple company ID)
+//   4C 00 12 19 ...       (Find My manufacturer payload)
+// and the shorter Apple Nearby packet:
+//   4C 00 07 ...          (nearby interaction)
+static bool detectAirTagPayloadPattern(const uint8_t *payload, size_t len) {
+#if AIRTAG_PAYLOAD_DETECT_ENABLED
+    if (!payload || len < 4) return false;
+
+    for (size_t i = 0; i <= len - 4; i++) {
+        // Full AD structure form: len, type=0xFF, Apple company ID 0x004C.
+        if (payload[i] == 0x1E && payload[i + 1] == 0xFF &&
+            payload[i + 2] == AIRTAG_APPLE_COMPANY_LE_0 &&
+            payload[i + 3] == AIRTAG_APPLE_COMPANY_LE_1) {
+            return true;
+        }
+
+        // Manufacturer data form: Apple company ID + Find My type/subtype.
+        if (payload[i] == AIRTAG_APPLE_COMPANY_LE_0 &&
+            payload[i + 1] == AIRTAG_APPLE_COMPANY_LE_1 &&
+            payload[i + 2] == AIRTAG_FINDMY_TYPE &&
+            payload[i + 3] == AIRTAG_FINDMY_SUBTYPE) {
+            return true;
+        }
+
+        // Manufacturer data form: Apple company ID + nearby interaction type.
+        if (payload[i] == AIRTAG_APPLE_COMPANY_LE_0 &&
+            payload[i + 1] == AIRTAG_APPLE_COMPANY_LE_1 &&
+            payload[i + 2] == AIRTAG_NEARBY_TYPE) {
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
 static bool detectAirTag(BLEAdvertisedDevice &dev) {
+    // ── Check 0: GhostESP-style raw advertisement payload pattern ─
+    // Arduino-ESP32 exposes the raw payload here; use it when available
+    // because it can contain the complete AD structure, not only the
+    // manufacturer-data slice.
+#if AIRTAG_PAYLOAD_DETECT_ENABLED
+    {
+        uint8_t *rawPayload = dev.getPayload();
+        size_t rawLen = dev.getPayloadLength();
+        if (rawPayload && rawLen > 0 && detectAirTagPayloadPattern(rawPayload, rawLen)) {
+            return true;
+        }
+    }
+#endif
+
     // ── Check 1: manufacturer data patterns ─────────────────────
     if (dev.haveManufacturerData()) {
         std::string m = dev.getManufacturerData();
@@ -3407,15 +3986,213 @@ static bool detectApple(BLEAdvertisedDevice &dev) {
     return ((uint8_t)m[0] == 0x4C && (uint8_t)m[1] == 0x00);
 }
 
-// Flipper Zero detection — three independent signals, any match wins:
+
+// GhostESP-style Flipper UUID helpers.
+// These scan the raw BLE advertising payload for 16-bit, 32-bit, and 128-bit
+// UUID AD fields that contain the known Flipper values.
+static uint16_t rrReadU16LE(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t rrReadU32LE(const uint8_t *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static bool isFlipperUuidValue(uint16_t uuid) {
+    return uuid == FLIPPER_UUID_BLACK ||
+           uuid == FLIPPER_UUID_WHITE ||
+           uuid == FLIPPER_UUID_TRANSPARENT;
+}
+
+static bool scanFlipperUuidList(const uint8_t *data, size_t len, size_t step) {
+    if (!data || len < step) return false;
+
+    for (size_t i = 0; i + step <= len; i += step) {
+        uint16_t uuid = 0;
+
+        if (step == 2) {
+            uuid = rrReadU16LE(data + i);
+        } else if (step == 4) {
+            uuid = (uint16_t)(rrReadU32LE(data + i) & 0xFFFF);
+        } else {
+            continue;
+        }
+
+        if (isFlipperUuidValue(uuid)) return true;
+    }
+
+    return false;
+}
+
+static bool scan128BitForFlipperUuid(const uint8_t *data, size_t len) {
+    if (!data || len < 16) return false;
+
+    // GhostESP scans inside each 128-bit UUID because the Flipper value may
+    // be embedded in the base UUID instead of presented as a simple 16-bit UUID.
+    for (size_t i = 0; i + 2 <= len; i++) {
+        if (isFlipperUuidValue(rrReadU16LE(data + i))) return true;
+    }
+
+    return false;
+}
+
+static bool detectFlipperUuidFromAdvPayload(const uint8_t *data, size_t len) {
+    if (!data || len < 2) return false;
+
+    const uint8_t *p = data;
+    size_t remaining = len;
+
+    while (remaining > 1) {
+        uint8_t fieldLen = p[0];
+        if (fieldLen == 0 || (size_t)(fieldLen + 1) > remaining) break;
+
+        uint8_t fieldType = p[1];
+        const uint8_t *payload = p + 2;
+        uint8_t payloadLen = (fieldLen >= 1) ? (uint8_t)(fieldLen - 1) : 0;
+
+        // 0x02 / 0x03 = partial / complete 16-bit UUID list
+        if ((fieldType == 0x02 || fieldType == 0x03) && payloadLen >= 2) {
+            if (scanFlipperUuidList(payload, payloadLen, 2)) return true;
+        }
+        // 0x04 / 0x05 = partial / complete 32-bit UUID list
+        else if ((fieldType == 0x04 || fieldType == 0x05) && payloadLen >= 4) {
+            if (scanFlipperUuidList(payload, payloadLen, 4)) return true;
+        }
+        // 0x06 / 0x07 = partial / complete 128-bit UUID list
+        else if ((fieldType == 0x06 || fieldType == 0x07) && payloadLen >= 16) {
+            for (size_t i = 0; i + 16 <= payloadLen; i += 16) {
+                if (scan128BitForFlipperUuid(payload + i, 16)) return true;
+            }
+        }
+
+        remaining -= (size_t)(fieldLen + 1);
+        p += (size_t)(fieldLen + 1);
+    }
+
+    return false;
+}
+static uint16_t firstFlipperUuidFromList(const uint8_t *data, size_t len, size_t step) {
+    if (!data || len < step) return 0;
+
+    for (size_t i = 0; i + step <= len; i += step) {
+        uint16_t uuid = 0;
+        if (step == 2) {
+            uuid = rrReadU16LE(data + i);
+        } else if (step == 4) {
+            uuid = (uint16_t)(rrReadU32LE(data + i) & 0xFFFF);
+        }
+
+        if (isFlipperUuidValue(uuid)) return uuid;
+    }
+
+    return 0;
+}
+
+static uint16_t firstFlipperUuidFrom128(const uint8_t *data, size_t len) {
+    if (!data || len < 16) return 0;
+
+    for (size_t i = 0; i + 2 <= len; i++) {
+        uint16_t uuid = rrReadU16LE(data + i);
+        if (isFlipperUuidValue(uuid)) return uuid;
+    }
+
+    return 0;
+}
+
+static uint16_t getFlipperUuidFromAdvPayload(const uint8_t *data, size_t len) {
+    if (!data || len < 2) return 0;
+
+    const uint8_t *p = data;
+    size_t remaining = len;
+
+    while (remaining > 1) {
+        uint8_t fieldLen = p[0];
+        if (fieldLen == 0 || (size_t)(fieldLen + 1) > remaining) break;
+
+        uint8_t fieldType = p[1];
+        const uint8_t *payload = p + 2;
+        uint8_t payloadLen = (fieldLen >= 1) ? (uint8_t)(fieldLen - 1) : 0;
+        uint16_t uuid = 0;
+
+        if ((fieldType == 0x02 || fieldType == 0x03) && payloadLen >= 2) {
+            uuid = firstFlipperUuidFromList(payload, payloadLen, 2);
+        } else if ((fieldType == 0x04 || fieldType == 0x05) && payloadLen >= 4) {
+            uuid = firstFlipperUuidFromList(payload, payloadLen, 4);
+        } else if ((fieldType == 0x06 || fieldType == 0x07) && payloadLen >= 16) {
+            for (size_t i = 0; i + 16 <= payloadLen; i += 16) {
+                uuid = firstFlipperUuidFrom128(payload + i, 16);
+                if (uuid) break;
+            }
+        }
+
+        if (uuid) return uuid;
+
+        remaining -= (size_t)(fieldLen + 1);
+        p += (size_t)(fieldLen + 1);
+    }
+
+    return 0;
+}
+
+static uint16_t getFlipperUuidFromServiceUUIDs(BLEAdvertisedDevice &dev) {
+    if (!dev.haveServiceUUID()) return 0;
+
+    int uuidCount = dev.getServiceUUIDCount();
+    for (int i = 0; i < uuidCount; i++) {
+        BLEUUID uuid = dev.getServiceUUID(i);
+
+        if (uuid.bitSize() == 16) {
+            uint16_t u16 = uuid.getNative()->uuid.uuid16;
+            if (isFlipperUuidValue(u16)) return u16;
+        }
+
+        String uuidStr = String(uuid.toString().c_str());
+        uuidStr.toLowerCase();
+        if (uuidStr.indexOf("3081") >= 0) return FLIPPER_UUID_BLACK;
+        if (uuidStr.indexOf("3082") >= 0) return FLIPPER_UUID_WHITE;
+        if (uuidStr.indexOf("3083") >= 0) return FLIPPER_UUID_TRANSPARENT;
+    }
+
+    return 0;
+}
+
+static const char *flipperColorFromUuid(uint16_t uuid) {
+    if (uuid == FLIPPER_UUID_BLACK)       return "Black";
+    if (uuid == FLIPPER_UUID_WHITE)       return "White";
+    if (uuid == FLIPPER_UUID_TRANSPARENT) return "Transparent";
+    return "Unknown";
+}
+
+static const char *detectFlipperColor(BLEAdvertisedDevice &dev) {
+    if (FLIPPER_UUID_DETECT_ENABLED) {
+        uint8_t *payload = dev.getPayload();
+        size_t payloadLen = dev.getPayloadLength();
+        uint16_t uuid = getFlipperUuidFromAdvPayload(payload, payloadLen);
+        if (uuid) return flipperColorFromUuid(uuid);
+    }
+
+    uint16_t svcUuid = getFlipperUuidFromServiceUUIDs(dev);
+    if (svcUuid) return flipperColorFromUuid(svcUuid);
+
+    return "Unknown";
+}
+
+
+// Flipper Zero detection — multiple independent signals, any match wins:
 //
 //  1. Advertised name contains one of the configured Flipper strings
 //     from config.h (case-insensitive).
 //
-//  2. Advertised service UUID matches one of the common Flipper BLE
+//  2. Raw advertisement UUID fields match GhostESP-style Flipper UUID
+//     detection: 0x3081, 0x3082, or 0x3083.
+//
+//  3. Advertised service UUID matches one of the common Flipper BLE
 //     UUIDs: 0x3081, 0x3082, or 0x3083.
 //
-//  3. OUI prefix 0C:FA:22 — only valid for non-random/static addresses.
+//  4. OUI prefix 0C:FA:22 — only valid for non-random/static addresses.
 //     Kept as a weak fallback because Flipper often uses private BLE
 //     addresses, so this may not always fire.
 //
@@ -3433,7 +4210,19 @@ static bool detectFlipper(BLEAdvertisedDevice &dev) {
         }
     }
 
-    // ── Method 2: Common Flipper service UUIDs ───────────────────
+    // ── Method 2: GhostESP-style raw advertisement UUID fields ───
+    // This catches UUIDs in partial/complete 16-bit, 32-bit, and 128-bit
+    // AD fields, even when the Arduino BLE wrapper does not expose them
+    // through haveServiceUUID()/getServiceUUID().
+    if (FLIPPER_UUID_DETECT_ENABLED) {
+        uint8_t *payload = dev.getPayload();
+        size_t payloadLen = dev.getPayloadLength();
+        if (payload && payloadLen > 0 && detectFlipperUuidFromAdvPayload(payload, payloadLen)) {
+            return true;
+        }
+    }
+
+    // ── Method 3: Common Flipper service UUIDs ───────────────────
     if (dev.haveServiceUUID()) {
         int uuidCount = dev.getServiceUUIDCount();
         for (int i = 0; i < uuidCount; i++) {
@@ -3457,7 +4246,7 @@ static bool detectFlipper(BLEAdvertisedDevice &dev) {
         }
     }
 
-    // ── Method 3: OUI check (bonus – rarely fires with random addr) ─
+    // ── Method 4: OUI check (bonus – rarely fires with random addr) ─
     std::string mac = dev.getAddress().toString();
     if (mac.length() >= 8) {
         std::string oui = mac.substr(0, 8);
@@ -3468,6 +4257,250 @@ static bool detectFlipper(BLEAdvertisedDevice &dev) {
     return false;
 }
 
+
+// nyanBOX / Nyan Devices badge detection.
+// Reference logic adapted from nyanBOX detector: service UUID + optional
+// manufacturer data where FF FF is followed by level and packed version.
+static bool detectNyanBox(BLEAdvertisedDevice &dev) {
+    if (!dev.haveServiceUUID()) return false;
+
+    String target = String(NYANBOX_SERVICE_UUID);
+    target.toLowerCase();
+
+    int uuidCount = dev.getServiceUUIDCount();
+    for (int i = 0; i < uuidCount; i++) {
+        String uuidStr = String(dev.getServiceUUID(i).toString().c_str());
+        uuidStr.toLowerCase();
+        if (uuidStr == target) return true;
+        if (uuidStr.indexOf("6e79616e") >= 0 && uuidStr.indexOf("636521") >= 0) return true;
+    }
+    return false;
+}
+
+// Axon-style BLE detection. Reference logic checks for devices whose
+// advertised BLE address starts with the configured OUI/MAC prefix.
+static bool detectAxon(BLEAdvertisedDevice &dev) {
+    String mac = dev.getAddress().toString().c_str();
+    mac.toLowerCase();
+
+    String prefix = String(AXON_MAC_PREFIX);
+    prefix.toLowerCase();
+
+    return mac.startsWith(prefix);
+}
+
+// Tesla BLE name-pattern detector. Inspired by TeslaScanner, but guarded so
+// index 17 is only read when the advertised name is long enough.
+static bool detectTeslaName(BLEAdvertisedDevice &dev) {
+    if (!dev.haveName()) return false;
+
+    String nm = dev.getName().c_str();
+    nm.trim();
+
+    if (nm.length() <= TESLA_NAME_END_INDEX) return false;
+
+    return (nm.charAt(0) == TESLA_NAME_START_CHAR &&
+            nm.charAt(TESLA_NAME_END_INDEX) == TESLA_NAME_END_CHAR);
+}
+
+static void parseNyanBoxManufacturer(BLEAdvertisedDevice &dev, uint16_t &level, char *version, size_t versionLen) {
+    level = 0;
+    if (version && versionLen) {
+        strncpy(version, "Unknown", versionLen - 1);
+        version[versionLen - 1] = '\0';
+    }
+
+    if (!dev.haveManufacturerData()) return;
+    std::string m = dev.getManufacturerData();
+    if (m.length() < 8) return;
+
+    const uint8_t *b = (const uint8_t *)m.data();
+    if (b[0] != 0xFF || b[1] != 0xFF) return;
+
+    level = ((uint16_t)b[2] << 8) | b[3];
+    uint32_t versionNum = ((uint32_t)b[4] << 24) |
+                          ((uint32_t)b[5] << 16) |
+                          ((uint32_t)b[6] << 8)  |
+                           (uint32_t)b[7];
+
+    int major = versionNum / 10000;
+    int minor = (versionNum / 100) % 100;
+    int patch = versionNum % 100;
+
+    if (!version || !versionLen) return;
+    if (minor == 0 && patch == 0) {
+        snprintf(version, versionLen, "v%d", major);
+    } else if (patch == 0) {
+        snprintf(version, versionLen, "v%d.%d", major, minor);
+    } else {
+        snprintf(version, versionLen, "v%d.%d.%d", major, minor, patch);
+    }
+}
+
+static int findNyanBoxByMac(const char *mac) {
+    for (int i = 0; i < nyanEntryCount; i++) {
+        if (strcmp(nyanEntries[i].mac, mac) == 0) return i;
+    }
+    return -1;
+}
+
+static void sortNyanBoxByRSSI() {
+    for (int i = 0; i < nyanEntryCount - 1; i++) {
+        for (int j = 0; j < nyanEntryCount - 1 - i; j++) {
+            if (nyanEntries[j].rssi < nyanEntries[j + 1].rssi) {
+                NyanBoxEntry tmp = nyanEntries[j];
+                nyanEntries[j] = nyanEntries[j + 1];
+                nyanEntries[j + 1] = tmp;
+            }
+        }
+    }
+}
+
+static void upsertNyanBoxDevice(BLEAdvertisedDevice &dev) {
+    String macStr = dev.getAddress().toString().c_str();
+    int idx = findNyanBoxByMac(macStr.c_str());
+    if (idx < 0) {
+        if (nyanEntryCount >= MAX_NYANBOX_RESULTS) return;
+        idx = nyanEntryCount++;
+        memset(&nyanEntries[idx], 0, sizeof(NyanBoxEntry));
+        strncpy(nyanEntries[idx].mac, macStr.c_str(), sizeof(nyanEntries[idx].mac) - 1);
+        strncpy(nyanEntries[idx].name, "Unknown", sizeof(nyanEntries[idx].name) - 1);
+        strncpy(nyanEntries[idx].version, "Unknown", sizeof(nyanEntries[idx].version) - 1);
+    }
+
+    String nm = dev.haveName() ? dev.getName().c_str() : "Unknown";
+    strncpy(nyanEntries[idx].name, nm.c_str(), sizeof(nyanEntries[idx].name) - 1);
+    nyanEntries[idx].name[sizeof(nyanEntries[idx].name) - 1] = '\0';
+
+    nyanEntries[idx].rssi = (int8_t)dev.getRSSI();
+    nyanEntries[idx].lastSeen = millis();
+    parseNyanBoxManufacturer(dev, nyanEntries[idx].level,
+                             nyanEntries[idx].version,
+                             sizeof(nyanEntries[idx].version));
+}
+
+static int doNyanBoxScan(int durationSec, const char *targetMac = nullptr) {
+    ensureBLEInit();
+    WiFi.disconnect();
+    delay(50);
+
+    BLEScan *pScan = BLEDevice::getScan();
+    pScan->setActiveScan(true);
+    pScan->setInterval(150);
+    pScan->setWindow(140);
+
+    BLEScanResults results = pScan->start(durationSec, false);
+    int total = results.getCount();
+
+    for (int i = 0; i < total; i++) {
+        BLEAdvertisedDevice dev = results.getDevice(i);
+        String macStr = dev.getAddress().toString().c_str();
+
+        if (targetMac && targetMac[0]) {
+            if (macStr.equalsIgnoreCase(String(targetMac))) {
+                upsertNyanBoxDevice(dev);
+            }
+            continue;
+        }
+
+        if (detectNyanBox(dev)) {
+            upsertNyanBoxDevice(dev);
+        }
+    }
+
+    pScan->clearResults();
+    sortNyanBoxByRSSI();
+    return nyanEntryCount;
+}
+
+static const char *nyanSignalQuality(int8_t rssi) {
+    if (rssi >= -50) return "EXCELLENT";
+    if (rssi >= -60) return "VERY GOOD";
+    if (rssi >= -70) return "GOOD";
+    if (rssi >= -80) return "FAIR";
+    return "WEAK";
+}
+
+static const char *axonSignalQuality(int8_t rssi) {
+    if (rssi >= -50) return "EXCELLENT";
+    if (rssi >= -60) return "VERY GOOD";
+    if (rssi >= -70) return "GOOD";
+    if (rssi >= -80) return "FAIR";
+    return "WEAK";
+}
+
+static int findAxonByMac(const char *mac) {
+    for (int i = 0; i < axonEntryCount; i++) {
+        if (strcmp(axonEntries[i].mac, mac) == 0) return i;
+    }
+    return -1;
+}
+
+static void sortAxonByRSSI() {
+    for (int i = 0; i < axonEntryCount - 1; i++) {
+        for (int j = 0; j < axonEntryCount - 1 - i; j++) {
+            if (axonEntries[j].rssi < axonEntries[j + 1].rssi) {
+                AxonEntry tmp = axonEntries[j];
+                axonEntries[j] = axonEntries[j + 1];
+                axonEntries[j + 1] = tmp;
+            }
+        }
+    }
+}
+
+static void upsertAxonDevice(BLEAdvertisedDevice &dev) {
+    String macStr = dev.getAddress().toString().c_str();
+    int idx = findAxonByMac(macStr.c_str());
+    if (idx < 0) {
+        if (axonEntryCount >= MAX_AXON_RESULTS) return;
+        idx = axonEntryCount++;
+        memset(&axonEntries[idx], 0, sizeof(AxonEntry));
+        strncpy(axonEntries[idx].mac, macStr.c_str(), sizeof(axonEntries[idx].mac) - 1);
+        strncpy(axonEntries[idx].name, "Axon Device", sizeof(axonEntries[idx].name) - 1);
+    }
+
+    String nm = dev.haveName() ? dev.getName().c_str() : "Axon Device";
+    strncpy(axonEntries[idx].name, nm.c_str(), sizeof(axonEntries[idx].name) - 1);
+    axonEntries[idx].name[sizeof(axonEntries[idx].name) - 1] = '\0';
+
+    axonEntries[idx].rssi = (int8_t)dev.getRSSI();
+    axonEntries[idx].lastSeen = millis();
+}
+
+static int doAxonScan(int durationSec, const char *targetMac = nullptr) {
+    ensureBLEInit();
+    WiFi.disconnect();
+    delay(50);
+
+    BLEScan *pScan = BLEDevice::getScan();
+    pScan->setActiveScan(true);
+    pScan->setInterval(150);
+    pScan->setWindow(140);
+
+    BLEScanResults results = pScan->start(durationSec, false);
+    int total = results.getCount();
+
+    for (int i = 0; i < total; i++) {
+        BLEAdvertisedDevice dev = results.getDevice(i);
+        String macStr = dev.getAddress().toString().c_str();
+
+        if (targetMac && targetMac[0]) {
+            if (macStr.equalsIgnoreCase(String(targetMac))) {
+                upsertAxonDevice(dev);
+            }
+            continue;
+        }
+
+        if (detectAxon(dev)) {
+            upsertAxonDevice(dev);
+        }
+    }
+
+    pScan->clearResults();
+    sortAxonByRSSI();
+    return axonEntryCount;
+}
+
 // Short manufacturer hint string for list row display
 static const char *mfgHintStr(BLEDeviceType t) {
     switch (t) {
@@ -3475,6 +4508,9 @@ static const char *mfgHintStr(BLEDeviceType t) {
         case BLE_FLIPPER: return "[Flipper]";
         case BLE_SKIMMER: return "[Skimmer?]";
         case BLE_META:    return "[Meta]";
+        case BLE_NYANBOX: return "[nyanBOX]";
+        case BLE_AXON:    return "[Axon]";
+        case BLE_TESLA:   return "[Tesla]";
         case BLE_APPLE:   return "[Apple]";
         default:          return "";
     }
@@ -3510,14 +4546,23 @@ static int doBLEScan(int durationSec, BLEDeviceType filterType) {
         // Classify device
         BLEDeviceType dtype = BLE_GENERIC;
         if      (detectFlipper(dev)) dtype = BLE_FLIPPER;
+        else if (detectNyanBox(dev)) dtype = BLE_NYANBOX;
+        else if (detectAxon(dev))    dtype = BLE_AXON;
+        else if (detectTeslaName(dev)) dtype = BLE_TESLA;
         else if (detectAirTag(dev))  dtype = BLE_AIRTAG;
         else if (detectApple(dev))   dtype = BLE_APPLE;
         else if (detectMeta(dev))    dtype = BLE_META;
         else if (dev.haveName()) {
-            // Skimmer check — HC-03, HC-05, HC-06 Bluetooth modules
+            // Skimmer check — suspicious serial/BLE module names from config.h.
             String nm = dev.getName().c_str();
-            if (nm == "HC-03" || nm == "HC-05" || nm == "HC-06")
-                dtype = BLE_SKIMMER;
+            nm.trim();
+
+            for (int s = 0; s < SKIMMER_NAME_MATCH_COUNT; s++) {
+                if (nm.equalsIgnoreCase(SKIMMER_NAME_MATCHES[s])) {
+                    dtype = BLE_SKIMMER;
+                    break;
+                }
+            }
         }
 
         // If a filter is requested, skip non-matching
@@ -3537,6 +4582,11 @@ static int doBLEScan(int durationSec, BLEDeviceType filterType) {
         strncpy(bleEntries[bleEntryCount].mfgHint,
                 mfgHintStr(dtype), 13);
         bleEntries[bleEntryCount].mfgHint[13] = '\0';
+
+        strncpy(bleEntries[bleEntryCount].flipperColor,
+                dtype == BLE_FLIPPER ? detectFlipperColor(dev) : "",
+                sizeof(bleEntries[bleEntryCount].flipperColor) - 1);
+        bleEntries[bleEntryCount].flipperColor[sizeof(bleEntries[bleEntryCount].flipperColor) - 1] = '\0';
 
         bleEntryCount++;
     }
@@ -3759,7 +4809,7 @@ void createPwnagotchiDetector() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  TOOL 6 – FLOCK SAFETY DETECTOR
+//  TOOL 7 – FLOCK SAFETY DETECTOR
 //
 //  Flock/Penguin-style devices can beacon / probe with SSIDs containing
 //  Flock-related keywords. We sniff beacon frames (mgmt subtype 8),
@@ -4001,6 +5051,336 @@ void createFlockDetector() {
     lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
+
+
+// ════════════════════════════════════════════════════════════════
+//  FLOCK HYBRID SCANNER — BLE phase + WiFi phase, merged list
+// ════════════════════════════════════════════════════════════════
+static const char *hybridSignalQuality(int8_t rssi) {
+    if (rssi >= -50) return "VERY GOOD";
+    if (rssi >= -65) return "GOOD";
+    if (rssi >= -80) return "FAIR";
+    return "WEAK";
+}
+
+static void hybridUpsertHit(const char *source, const char *name, const char *mac,
+                            int8_t rssi, const char *reason) {
+    if (!source || !name || !mac || !reason) return;
+
+    for (int i = 0; i < hybridHitCount; i++) {
+        if (strcmp(hybridHits[i].source, source) == 0 &&
+            strcmp(hybridHits[i].mac, mac) == 0) {
+            strncpy(hybridHits[i].name, name, sizeof(hybridHits[i].name) - 1);
+            hybridHits[i].name[sizeof(hybridHits[i].name) - 1] = '\0';
+            strncpy(hybridHits[i].reason, reason, sizeof(hybridHits[i].reason) - 1);
+            hybridHits[i].reason[sizeof(hybridHits[i].reason) - 1] = '\0';
+            hybridHits[i].rssi = rssi;
+            hybridHits[i].lastSeen = millis();
+            return;
+        }
+    }
+
+    if (hybridHitCount >= MAX_FLOCK_HYBRID_HITS) return;
+    FlockHybridHit &h = hybridHits[hybridHitCount++];
+    memset(&h, 0, sizeof(h));
+    strncpy(h.source, source, sizeof(h.source) - 1);
+    strncpy(h.name, name, sizeof(h.name) - 1);
+    strncpy(h.mac, mac, sizeof(h.mac) - 1);
+    strncpy(h.reason, reason, sizeof(h.reason) - 1);
+    h.rssi = rssi;
+    h.lastSeen = millis();
+    playFlockChirp();
+}
+
+static void hybridSortByRSSI() {
+    for (int i = 0; i < hybridHitCount - 1; i++) {
+        for (int j = 0; j < hybridHitCount - 1 - i; j++) {
+            if (hybridHits[j].rssi < hybridHits[j + 1].rssi) {
+                FlockHybridHit tmp = hybridHits[j];
+                hybridHits[j] = hybridHits[j + 1];
+                hybridHits[j + 1] = tmp;
+            }
+        }
+    }
+}
+
+static void hybridProcessPendingWifi() {
+    if (!hybridPendingReady) return;
+    char name[33], mac[18], reason[24];
+    int8_t rssi = hybridPendingRSSI;
+    memcpy(name, hybridPendingName, sizeof(name));
+    memcpy(mac, hybridPendingMac, sizeof(mac));
+    memcpy(reason, hybridPendingReason, sizeof(reason));
+    hybridPendingReady = false;
+    hybridUpsertHit("WiFi", name, mac, rssi, reason);
+}
+
+static void hybridRebuildList() {
+    if (!hybridList) return;
+    hybridSortByRSSI();
+    lv_obj_clean(hybridList);
+
+    if (hybridHitCount == 0) {
+        lv_obj_t *e = lv_list_add_text(hybridList,
+            "No combined Flock hits yet. Press Start Scan.");
+        if (e) lv_obj_set_style_text_color(e, lv_color_hex(TH.textDim), LV_PART_MAIN);
+        return;
+    }
+
+    for (int i = 0; i < hybridHitCount; i++) {
+        uint32_t age = (millis() - hybridHits[i].lastSeen) / 1000UL;
+        char row[132];
+#if FLOCK_HYBRID_SHOW_MAC
+        snprintf(row, sizeof(row), "%s  %s  %ddBm\n%s  %s  %lus",
+                 hybridHits[i].source,
+                 hybridHits[i].name,
+                 hybridHits[i].rssi,
+                 hybridHits[i].mac,
+                 hybridHits[i].reason,
+                 (unsigned long)age);
+#else
+        snprintf(row, sizeof(row), "%s  %s  %ddBm  %s",
+                 hybridHits[i].source,
+                 hybridHits[i].name,
+                 hybridHits[i].rssi,
+                 hybridHits[i].reason);
+#endif
+        lv_obj_t *entry = lv_list_add_text(hybridList, row);
+        if (entry) {
+            lv_obj_set_style_text_color(entry,
+                strcmp(hybridHits[i].source, "BLE") == 0 ? lv_color_hex(TH.accent) : lv_color_hex(TH.alert),
+                LV_PART_MAIN);
+        }
+    }
+}
+
+static const char *hybridKeywordReason(const char *name) {
+    if (flockContainsKeyword(name, FLOCK_KEYWORD_1)) return FLOCK_KEYWORD_1;
+    if (flockContainsKeyword(name, FLOCK_KEYWORD_2)) return FLOCK_KEYWORD_2;
+    if (flockContainsKeyword(name, FLOCK_KEYWORD_3)) return FLOCK_KEYWORD_3;
+    if (flockContainsKeyword(name, FLOCK_KEYWORD_4)) return "fs battery";
+    return "keyword";
+}
+
+static bool hybridNameIsTenDigits(const char *name) {
+    if (!name) return false;
+    int len = 0;
+    for (; name[len]; len++) {
+        if (name[len] < '0' || name[len] > '9') return false;
+    }
+    return len == 10;
+}
+
+static bool detectFlockBLE(BLEAdvertisedDevice &dev, char *reason, size_t reasonLen) {
+    if (reason && reasonLen) reason[0] = '\0';
+
+    if (dev.haveName()) {
+        String nm = String(dev.getName().c_str());
+        char nbuf[33];
+        strncpy(nbuf, nm.c_str(), sizeof(nbuf) - 1);
+        nbuf[sizeof(nbuf) - 1] = '\0';
+
+        if (containsFlockKeyword(nbuf)) {
+            snprintf(reason, reasonLen, "Name:%s", hybridKeywordReason(nbuf));
+            return true;
+        }
+        if (hybridNameIsTenDigits(nbuf)) {
+            snprintf(reason, reasonLen, "10-digit name");
+            return true;
+        }
+    }
+
+    if (dev.haveManufacturerData()) {
+        std::string md = dev.getManufacturerData();
+        if (md.length() >= 2) {
+            uint8_t b0 = (uint8_t)md[0];
+            uint8_t b1 = (uint8_t)md[1];
+            // XUNTONG 0x09C8 may appear little-endian in manufacturer data.
+            if ((b0 == 0xC8 && b1 == 0x09) || (b0 == 0x09 && b1 == 0xC8)) {
+                snprintf(reason, reasonLen, "MFG 09C8");
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static void hybrid_wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!hybridWifiActive || type != WIFI_PKT_MGMT || hybridPendingReady) return;
+
+    const wifi_promiscuous_pkt_t *pkt = reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
+    const uint8_t *d = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    if (len < 24) return;
+
+    uint8_t fc0 = d[0];
+    uint8_t ftype = (fc0 >> 2) & 0x03;
+    uint8_t stype = (fc0 >> 4) & 0x0F;
+    if (ftype != 0) return;
+    if (stype != 8 && stype != 5 && stype != 4) return;
+
+    int ieOffset = (stype == 4) ? 24 : 36;
+    if (ieOffset >= len) return;
+
+    const uint8_t *ie = d + ieOffset;
+    int rem = len - ieOffset;
+    while (rem >= 2) {
+        uint8_t id = ie[0];
+        uint8_t elen = ie[1];
+        if (elen + 2 > rem) break;
+
+        if (id == 0 && elen > 0) {
+            int n = elen > 32 ? 32 : elen;
+            char ssid[33];
+            memcpy(ssid, ie + 2, n);
+            ssid[n] = '\0';
+
+            if (containsFlockKeyword(ssid)) {
+                memcpy(hybridPendingName, ssid, n + 1);
+                snprintf(hybridPendingMac, sizeof(hybridPendingMac),
+                         "%02X:%02X:%02X:%02X:%02X:%02X",
+                         d[10], d[11], d[12], d[13], d[14], d[15]);
+                snprintf(hybridPendingReason, sizeof(hybridPendingReason),
+                         "%s", (stype == 4) ? "Probe" : "Beacon");
+                hybridPendingRSSI = pkt->rx_ctrl.rssi;
+                hybridPendingReady = true;
+                return;
+            }
+        }
+        ie += elen + 2;
+        rem -= elen + 2;
+    }
+}
+
+static void runFlockHybridCycle() {
+    if (!hybridStatusLbl || !hybridList) return;
+
+    startLEDSpinner(FLOCK_HYBRID_LED_R, FLOCK_HYBRID_LED_G, FLOCK_HYBRID_LED_B, FLOCK_HYBRID_LED_SPIN_MS);
+
+    lv_label_set_text(hybridStatusLbl, LV_SYMBOL_BLUETOOTH "  BLE phase running...");
+    lv_obj_set_style_text_color(hybridStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+    lv_timer_handler();
+
+    ensureBLEInit();
+    WiFi.disconnect();
+    delay(50);
+    BLEScan *pScan = BLEDevice::getScan();
+    pScan->setActiveScan(true);
+    pScan->setInterval(150);
+    pScan->setWindow(140);
+    BLEScanResults results = pScan->start(flockHybridBleSecs, false);
+    int total = results.getCount();
+    for (int i = 0; i < total; i++) {
+        BLEAdvertisedDevice dev = results.getDevice(i);
+        char reason[24];
+        if (detectFlockBLE(dev, reason, sizeof(reason))) {
+            String nm = dev.haveName() ? dev.getName().c_str() : "<unknown>";
+            String mac = dev.getAddress().toString().c_str();
+            hybridUpsertHit("BLE", nm.c_str(), mac.c_str(), (int8_t)dev.getRSSI(), reason);
+        }
+    }
+    pScan->clearResults();
+    hybridRebuildList();
+
+    lv_label_set_text(hybridStatusLbl, LV_SYMBOL_WIFI "  WiFi phase running...");
+    lv_obj_set_style_text_color(hybridStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
+    lv_timer_handler();
+
+    hybridPendingReady = false;
+    hybridWifiActive = true;
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(hybrid_wifi_sniffer_cb);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    uint8_t ch = 1;
+    unsigned long startMs = millis();
+    unsigned long lastHopMs = 0;
+    unsigned long wifiMs = (unsigned long)flockHybridWifiSecs * 1000UL;
+
+    while ((millis() - startMs) < wifiMs && hybridWifiActive) {
+        if (hybridPendingReady) {
+            hybridProcessPendingWifi();
+            hybridRebuildList();
+        }
+        if (millis() - lastHopMs >= (unsigned long)flockHybridHopMs) {
+            lastHopMs = millis();
+            ch = (ch % 13) + 1;
+            esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        }
+        lv_timer_handler();
+        delay(15);
+    }
+
+    hybridWifiActive = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    hybridProcessPendingWifi();
+    hybridRebuildList();
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_WARNING "  Hybrid complete — %d hit%s",
+             hybridHitCount, hybridHitCount == 1 ? "" : "s");
+    stopLEDSpinner(FLOCK_HYBRID_LED_R, FLOCK_HYBRID_LED_G, FLOCK_HYBRID_LED_B);
+
+    lv_label_set_text(hybridStatusLbl, buf);
+    lv_obj_set_style_text_color(hybridStatusLbl,
+        hybridHitCount ? lv_color_hex(TH.alert) : lv_color_hex(TH.textDim), LV_PART_MAIN);
+}
+
+static void cb_runFlockHybrid(lv_event_t *e) {
+    runFlockHybridCycle();
+}
+
+static void cb_startFlockHybridTimer(lv_timer_t *t) {
+    if (hybridStartTimer) { lv_timer_delete(hybridStartTimer); hybridStartTimer = nullptr; }
+    runFlockHybridCycle();
+}
+
+void createFlockHybridScanner() {
+    hybridHitCount = 0;
+    hybridPendingReady = false;
+    hybridWifiActive = false;
+    hybridStatusLbl = nullptr;
+    hybridList = nullptr;
+    memset(hybridHits, 0, sizeof(hybridHits));
+
+    if (wifiToolScreen) { lv_obj_delete(wifiToolScreen); wifiToolScreen = nullptr; }
+    wifiToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiToolScreen);
+    createHeader(wifiToolScreen, LV_SYMBOL_WARNING "  Flock Hybrid");
+
+    hybridStatusLbl = lv_label_create(wifiToolScreen);
+    lv_label_set_text(hybridStatusLbl,
+        "Ready. Press Start Scan to run BLE + WiFi.\n"
+        "Merged hits show source, RSSI, reason.");
+    lv_obj_set_style_text_color(hybridStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(hybridStatusLbl, 8, 30);
+
+    hybridList = lv_list_create(wifiToolScreen);
+    lv_obj_set_size(hybridList, SCREEN_W, SCREEN_H - 82);
+    lv_obj_set_pos(hybridList, 0, 50);
+    lv_obj_set_style_bg_color(hybridList,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(hybridList,       LV_OPA_COVER,        LV_PART_MAIN);
+    lv_obj_set_style_border_width(hybridList, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(hybridList,      2, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(hybridList,      1, LV_PART_MAIN);
+    hybridRebuildList();
+
+    lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
+    lv_obj_t *scanBtn = createActionBtn(wifiToolScreen, LV_SYMBOL_REFRESH "  Start Scan", cb_runFlockHybrid);
+
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    lv_group_add_obj(wifiToolGroup, backBtn);
+    lv_group_add_obj(wifiToolGroup, scanBtn);
+    setGroup(wifiToolGroup);
+
+    setAllLEDs(FLOCK_HYBRID_LED_R, FLOCK_HYBRID_LED_G, FLOCK_HYBRID_LED_B, LED_BRIGHTNESS);
+    lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
 // ════════════════════════════════════════════════════════════════
 //  BLE SHARED BACK CALLBACKS
 // ════════════════════════════════════════════════════════════════
@@ -4022,13 +5402,17 @@ static void cb_bleDetailBack(lv_event_t *e) {
 // ════════════════════════════════════════════════════════════════
 //  BLE MENU
 // ════════════════════════════════════════════════════════════════
-static const char *BLE_TOOL_LABELS[5] = {
+static const char *BLE_TOOL_LABELS[] = {
     LV_SYMBOL_BLUETOOTH "  BLE Scanner",
     "\xEF\x80\xA6"      "  AirTag Detector",   // apple-ish symbol fallback
     LV_SYMBOL_WARNING   "  Flipper Detector",
+    LV_SYMBOL_BLUETOOTH "  nyanBOX Detector",
+    LV_SYMBOL_BLUETOOTH "  Axon Detector",
+    LV_SYMBOL_BLUETOOTH "  Tesla Detector",
     LV_SYMBOL_WARNING   "  Skimmer Detector",
     LV_SYMBOL_EYE_OPEN  "  Meta Detector"
 };
+static const int BLE_TOOL_COUNT = sizeof(BLE_TOOL_LABELS) / sizeof(BLE_TOOL_LABELS[0]);
 
 static void cb_bleMenuBack(lv_event_t *e) {
     lv_screen_load_anim(mainScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
@@ -4043,8 +5427,11 @@ static void cb_bleToolSelected(lv_event_t *e) {
         case 0: createBLEScanner();      break;
         case 1: createAirTagScanner();   break;
         case 2: createFlipperScanner();  break;
-        case 3: createSkimmerScanner();  break;
-        case 4: createMetaDetector();    break;
+        case 3: createNyanBoxDetector(); break;
+        case 4: createAxonDetector();    break;
+        case 5: createTeslaDetector();   break;
+        case 6: createSkimmerScanner();  break;
+        case 7: createMetaDetector();    break;
     }
 }
 
@@ -4069,7 +5456,7 @@ void createBLEMenu() {
     deleteGroup(&bleMenuGroup);
     bleMenuGroup = lv_group_create();
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < BLE_TOOL_COUNT; i++) {
         lv_obj_t *btn = lv_list_add_btn(list, nullptr, BLE_TOOL_LABELS[i]);
         styleListBtn(btn);
         lv_obj_set_height(btn, 30);
@@ -4125,6 +5512,7 @@ static void rebuildBLEScanList() {
             case BLE_AIRTAG:  col = lv_color_hex(0xf0f0f0); break; // white-ish
             case BLE_FLIPPER: col = lv_color_hex(0xff9900); break; // orange
             case BLE_APPLE:   col = lv_color_hex(TH.accent); break; // blue accent
+            case BLE_TESLA:   col = lv_color_hex(0x58a6ff); break; // blue Tesla detector accent
             default:          col = bleRssiColor(bleEntries[i].rssi); break;
         }
         lv_obj_set_style_text_color(btn, col, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -4236,6 +5624,10 @@ void createBLEDetail(int idx) {
             badge    = "  Meta / RayBan Device";
             badgeCol = lv_color_hex(TH.accent);
             break;
+        case BLE_TESLA:
+            badge    = "  Tesla BLE Pattern";
+            badgeCol = lv_color_hex(0x58a6ff);
+            break;
         case BLE_APPLE:
             badge    = "  Apple Device";
             badgeCol = lv_color_hex(TH.accent);
@@ -4271,14 +5663,26 @@ void createBLEDetail(int idx) {
         rssi >= -65 ? "Good"      :
         rssi >= -75 ? "Fair"      : "Weak";
 
-    char info[200];
-    snprintf(info, sizeof(info),
-             "Name  : %s\n"
-             "MAC   : %s\n"
-             "RSSI  : %d dBm  (%s)",
-             bleEntries[idx].name,
-             bleEntries[idx].mac,
-             rssi, quality);
+    char info[240];
+    if (bleEntries[idx].type == BLE_FLIPPER) {
+        snprintf(info, sizeof(info),
+                 "Name  : %s\n"
+                 "Color : %s\n"
+                 "MAC   : %s\n"
+                 "RSSI  : %d dBm  (%s)",
+                 bleEntries[idx].name,
+                 bleEntries[idx].flipperColor[0] ? bleEntries[idx].flipperColor : "Unknown",
+                 bleEntries[idx].mac,
+                 rssi, quality);
+    } else {
+        snprintf(info, sizeof(info),
+                 "Name  : %s\n"
+                 "MAC   : %s\n"
+                 "RSSI  : %d dBm  (%s)",
+                 bleEntries[idx].name,
+                 bleEntries[idx].mac,
+                 rssi, quality);
+    }
 
     lv_obj_t *infoLbl = lv_label_create(card);
     lv_label_set_text(infoLbl, info);
@@ -4362,9 +5766,7 @@ void createAirTagScanner() {
 
     airtagStatusLbl = lv_label_create(bleToolScreen);
     lv_label_set_text(airtagStatusLbl,
-        "Scans for Apple AirTag Find My\n"
-        "advertisements  (Company ID 0x004C\n"
-        "type 0x12 subtype 0x19)");
+        "Detects Apple AirTags\n");
     lv_obj_set_style_text_color(airtagStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(airtagStatusLbl, 8, 30);
 
@@ -4396,10 +5798,21 @@ void createAirTagScanner() {
 // ════════════════════════════════════════════════════════════════
 static lv_obj_t *flipperStatusLbl = nullptr;
 static lv_obj_t *flipperList      = nullptr;
+static lv_obj_t *flipperBackBtn   = nullptr;
+static lv_obj_t *flipperScanBtn   = nullptr;
+
+static void resetFlipperToolGroup() {
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    if (flipperBackBtn) lv_group_add_obj(bleToolGroup, flipperBackBtn);
+    if (flipperScanBtn) lv_group_add_obj(bleToolGroup, flipperScanBtn);
+    setGroup(bleToolGroup);
+}
 
 static void cb_doFlipperScan(lv_event_t *e) {
     lv_label_set_text(flipperStatusLbl, LV_SYMBOL_REFRESH "  Scanning 8s...");
     lv_obj_set_style_text_color(flipperStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
+    resetFlipperToolGroup();
     lv_obj_clean(flipperList);
     lv_timer_handler();
 
@@ -4429,20 +5842,24 @@ static void cb_doFlipperScan(lv_event_t *e) {
     lv_label_set_text(flipperStatusLbl, buf);
     lv_obj_set_style_text_color(flipperStatusLbl, lv_color_hex(0xff9900), LV_PART_MAIN);
 
-    for (int i = 0; i < found; i++) {
-        char row[52];
-        snprintf(row, sizeof(row), "%-20s  %ddBm",
-                 bleEntries[i].name, bleEntries[i].rssi);
-        lv_obj_t *entry = lv_list_add_text(flipperList, row);
-        if (entry)
-            lv_obj_set_style_text_color(entry, lv_color_hex(0xff9900), LV_PART_MAIN);
+    resetFlipperToolGroup();
 
-        // Second line with MAC
-        char macRow[28];
-        snprintf(macRow, sizeof(macRow), "  %s", bleEntries[i].mac);
-        lv_obj_t *macEntry = lv_list_add_text(flipperList, macRow);
-        if (macEntry)
-            lv_obj_set_style_text_color(macEntry, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    for (int i = 0; i < found; i++) {
+        char row[64];
+        snprintf(row, sizeof(row), "%-14s %-11s %ddBm",
+                 bleEntries[i].name,
+                 bleEntries[i].flipperColor[0] ? bleEntries[i].flipperColor : "Unknown",
+                 bleEntries[i].rssi);
+
+        lv_obj_t *btn = lv_list_add_btn(flipperList, nullptr, row);
+        if (btn) {
+            styleListBtn(btn);
+            lv_obj_set_style_text_color(btn, lv_color_hex(0xff9900), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+                createBLEDetail((int)(intptr_t)lv_event_get_user_data(ev));
+            }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            lv_group_add_obj(bleToolGroup, btn);
+        }
     }
 }
 
@@ -4454,9 +5871,7 @@ void createFlipperScanner() {
 
     flipperStatusLbl = lv_label_create(bleToolScreen);
     lv_label_set_text(flipperStatusLbl,
-        "Names: config.h list\n"
-        "UUIDs: 3081 / 3082 / 3083\n"
-        "OUI: 0C:FA:22 (fallback)");
+        "Detects Fipper Zeros");
     lv_obj_set_style_text_color(flipperStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(flipperStatusLbl, 8, 30);
 
@@ -4469,26 +5884,918 @@ void createFlipperScanner() {
     lv_obj_set_style_pad_all(flipperList,      2, LV_PART_MAIN);
     lv_obj_set_style_pad_row(flipperList,      2, LV_PART_MAIN);
 
-    lv_obj_t *backBtn = createBackBtn(bleToolScreen, cb_bleToolBack);
-    lv_obj_t *scanBtn = createActionBtn(bleToolScreen,
-                                        LV_SYMBOL_REFRESH "  Scan",
-                                        cb_doFlipperScan);
+    flipperBackBtn = createBackBtn(bleToolScreen, cb_bleToolBack);
+    flipperScanBtn = createActionBtn(bleToolScreen,
+                                     LV_SYMBOL_REFRESH "  Scan",
+                                     cb_doFlipperScan);
 
-    deleteGroup(&bleToolGroup);
-    bleToolGroup = lv_group_create();
-    lv_group_add_obj(bleToolGroup, backBtn);
-    lv_group_add_obj(bleToolGroup, scanBtn);
-    setGroup(bleToolGroup);
+    resetFlipperToolGroup();
 
     lv_screen_load_anim(bleToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
+
 // ════════════════════════════════════════════════════════════════
-//  BLE TOOL 4 – SKIMMER DETECTOR
+//  BLE TOOL 4 – NYANBOX DETECTOR
 //
-//  Scans for Bluetooth devices with names matching known skimmer
-//  modules: HC-03, HC-05, HC-06. These cheap hobbyist boards are
-//  commonly found inside gas pump card skimmers.
+//  BLE-only detector for nyanBOX / Nyan Devices badges. It checks
+//  for the configured 128-bit service UUID and parses optional
+//  manufacturer data for level and firmware version. Locate Mode
+//  refreshes RSSI for the selected MAC on demand.
+// ════════════════════════════════════════════════════════════════
+static lv_obj_t *nyanStatusLbl = nullptr;
+static lv_obj_t *nyanList      = nullptr;
+static lv_obj_t *nyanBackBtn   = nullptr;
+static lv_obj_t *nyanScanBtn   = nullptr;
+static lv_obj_t *nyanLocateLbl = nullptr;
+static int       nyanLocateIdx = -1;
+static int       nyanDetailIdxForLocate = -1;
+
+static void rebuildNyanBoxList() {
+    if (!nyanList) return;
+
+    // Rebuild focus group after lv_obj_clean() because list children are destroyed.
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    if (nyanBackBtn) lv_group_add_obj(bleToolGroup, nyanBackBtn);
+    if (nyanScanBtn) lv_group_add_obj(bleToolGroup, nyanScanBtn);
+
+    lv_obj_clean(nyanList);
+
+    if (nyanEntryCount == 0) {
+        lv_obj_t *empty = lv_list_add_text(nyanList, "No nyanBOX devices found yet");
+        if (empty) lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
+        setGroup(bleToolGroup);
+        return;
+    }
+
+    for (int i = 0; i < nyanEntryCount; i++) {
+        char nameTrunc[12];
+        strncpy(nameTrunc, nyanEntries[i].name[0] ? nyanEntries[i].name : "Unknown", 11);
+        nameTrunc[11] = '\0';
+
+        char row[64];
+        if (nyanEntries[i].level > 0) {
+            snprintf(row, sizeof(row), "%s  L%u  %ddBm",
+                     nameTrunc, nyanEntries[i].level, nyanEntries[i].rssi);
+        } else {
+            snprintf(row, sizeof(row), "%s  L?  %ddBm",
+                     nameTrunc, nyanEntries[i].rssi);
+        }
+
+        lv_obj_t *btn = lv_list_add_btn(nyanList, nullptr, row);
+        styleListBtn(btn);
+        lv_obj_set_style_text_color(btn, bleRssiColor(nyanEntries[i].rssi), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            createNyanBoxDetail((int)(intptr_t)lv_event_get_user_data(ev));
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_group_add_obj(bleToolGroup, btn);
+    }
+
+    setGroup(bleToolGroup);
+}
+
+static void cb_doNyanBoxScan(lv_event_t *e) {
+    char msg[48];
+    snprintf(msg, sizeof(msg), LV_SYMBOL_REFRESH "  Scanning %ds...", NYANBOX_SCAN_SECS);
+    lv_label_set_text(nyanStatusLbl, msg);
+    lv_obj_set_style_text_color(nyanStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
+    lv_obj_clean(nyanList);
+    lv_timer_handler();
+
+    startLEDSpinner(120, 0, 220);
+    nyanEntryCount = 0;
+    memset(nyanEntries, 0, sizeof(nyanEntries));
+    int found = doNyanBoxScan(NYANBOX_SCAN_SECS);
+    stopLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
+
+    if (found == 0) {
+        lv_label_set_text(nyanStatusLbl, LV_SYMBOL_BLUETOOTH "  No nyanBOX devices detected");
+        lv_obj_set_style_text_color(nyanStatusLbl, lv_color_hex(TH.success), LV_PART_MAIN);
+    } else {
+        snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  %d nyanBOX device%s found!",
+                 found, found == 1 ? "" : "s");
+        lv_label_set_text(nyanStatusLbl, msg);
+        lv_obj_set_style_text_color(nyanStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+    }
+
+    rebuildNyanBoxList();
+}
+
+void createNyanBoxDetector() {
+    nyanStatusLbl = nullptr;
+    nyanList      = nullptr;
+    nyanBackBtn   = nullptr;
+    nyanScanBtn   = nullptr;
+    nyanLocateLbl = nullptr;
+    nyanLocateIdx = -1;
+    nyanDetailIdxForLocate = -1;
+
+    if (bleToolScreen) { lv_obj_delete(bleToolScreen); bleToolScreen = nullptr; }
+    bleToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleToolScreen);
+    createHeader(bleToolScreen, LV_SYMBOL_BLUETOOTH "  nyanBOX Detector");
+
+    nyanStatusLbl = lv_label_create(bleToolScreen);
+    char readyMsg[64];
+    snprintf(readyMsg, sizeof(readyMsg),
+             "Detects NyanBOX Devices", NYANBOX_SCAN_SECS);
+    lv_label_set_text(nyanStatusLbl, readyMsg);
+    lv_obj_set_style_text_color(nyanStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(nyanStatusLbl, 8, 30);
+
+    nyanList = lv_list_create(bleToolScreen);
+    lv_obj_set_size(nyanList, SCREEN_W, SCREEN_H - 80);
+    lv_obj_set_pos(nyanList, 0, 48);
+    lv_obj_set_style_bg_color(nyanList,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(nyanList,       LV_OPA_COVER,        LV_PART_MAIN);
+    lv_obj_set_style_border_width(nyanList, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(nyanList,      2, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(nyanList,      2, LV_PART_MAIN);
+
+    lv_obj_t *empty = lv_list_add_text(nyanList, "Ready to scan for nyanBOX badges");
+    if (empty) lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
+
+    nyanBackBtn = createBackBtn(bleToolScreen, cb_bleToolBack);
+    nyanScanBtn = createActionBtn(bleToolScreen,
+                                  LV_SYMBOL_REFRESH "  Scan",
+                                  cb_doNyanBoxScan);
+
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    lv_group_add_obj(bleToolGroup, nyanBackBtn);
+    lv_group_add_obj(bleToolGroup, nyanScanBtn);
+    setGroup(bleToolGroup);
+
+    if (nyanEntryCount > 0) {
+        char msg[56];
+        snprintf(msg, sizeof(msg), LV_SYMBOL_BLUETOOTH "  %d saved nyanBOX result%s",
+                 nyanEntryCount, nyanEntryCount == 1 ? "" : "s");
+        lv_label_set_text(nyanStatusLbl, msg);
+        lv_obj_set_style_text_color(nyanStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+        rebuildNyanBoxList();
+    }
+
+    setAllLEDs(120, 0, 220, LED_BRIGHTNESS);
+    lv_screen_load_anim(bleToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+static void cb_nyanDetailBack(lv_event_t *e) {
+    cb_bleDetailBack(e);
+}
+
+static void cb_nyanLocate(lv_event_t *e) {
+    if (nyanDetailIdxForLocate >= 0) createNyanBoxLocate(nyanDetailIdxForLocate);
+}
+
+void createNyanBoxDetail(int idx) {
+    if (idx < 0 || idx >= nyanEntryCount) return;
+    nyanDetailIdxForLocate = idx;
+
+    if (bleDetailScreen) { lv_obj_delete(bleDetailScreen); bleDetailScreen = nullptr; }
+    bleDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleDetailScreen);
+
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), LV_SYMBOL_BLUETOOTH "  %.24s", nyanEntries[idx].name);
+    createHeader(bleDetailScreen, hdr);
+
+    lv_obj_t *card = lv_obj_create(bleDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card,      lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,        LV_OPA_COVER,          LV_PART_MAIN);
+    lv_obj_set_style_border_color(card,  lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card,  1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,        6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,       6, LV_PART_MAIN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    uint32_t ageSec = (millis() - nyanEntries[idx].lastSeen) / 1000;
+    char info[220];
+    snprintf(info, sizeof(info),
+             "nyanBOX / Nyan Device\n"
+             "Name : %s\n"
+             "MAC  : %s\n"
+             "RSSI : %d dBm (%s)\n"
+             "Level: %s%u\n"
+             "FW   : %s\n"
+             "Age  : %lus",
+             nyanEntries[idx].name,
+             nyanEntries[idx].mac,
+             nyanEntries[idx].rssi,
+             nyanSignalQuality(nyanEntries[idx].rssi),
+             nyanEntries[idx].level > 0 ? "" : "?",
+             nyanEntries[idx].level,
+             nyanEntries[idx].version,
+             (unsigned long)ageSec);
+
+    lv_obj_t *infoLbl = lv_label_create(card);
+    lv_label_set_text(infoLbl, info);
+    lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(infoLbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(infoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(infoLbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *backBtn = createBackBtn(bleDetailScreen, cb_nyanDetailBack);
+    lv_obj_t *locateBtn = createActionBtn(bleDetailScreen,
+                                          LV_SYMBOL_EYE_OPEN "  Locate",
+                                          cb_nyanLocate);
+
+    deleteGroup(&bleDetailGroup);
+    bleDetailGroup = lv_group_create();
+    lv_group_add_obj(bleDetailGroup, backBtn);
+    lv_group_add_obj(bleDetailGroup, locateBtn);
+    setGroup(bleDetailGroup);
+
+    lv_screen_load_anim(bleDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+static void updateNyanLocateLabel() {
+    if (!nyanLocateLbl || nyanLocateIdx < 0 || nyanLocateIdx >= nyanEntryCount) return;
+
+    int8_t rssi = nyanEntries[nyanLocateIdx].rssi;
+    int signalLevel = map(constrain(rssi, -100, -40), -100, -40, 0, 5);
+    char bars[8] = "";
+    for (int i = 0; i < 5; i++) strcat(bars, i < signalLevel ? "|" : ".");
+
+    char buf[220];
+    snprintf(buf, sizeof(buf),
+             "Locate nyanBOX\n"
+             "%s\n"
+             "%s\n\n"
+             "RSSI  : %d dBm\n"
+             "Signal: %s\n"
+             "Bars  : %s\n\n"
+             "Press Refresh to update",
+             nyanEntries[nyanLocateIdx].name,
+             nyanEntries[nyanLocateIdx].mac,
+             rssi,
+             nyanSignalQuality(rssi),
+             bars);
+    lv_label_set_text(nyanLocateLbl, buf);
+}
+
+static void cb_nyanLocateRefresh(lv_event_t *e) {
+    if (nyanLocateIdx < 0 || nyanLocateIdx >= nyanEntryCount) return;
+
+    lv_label_set_text(nyanLocateLbl, LV_SYMBOL_REFRESH "  Refreshing RSSI...");
+    lv_timer_handler();
+
+    char mac[18];
+    strncpy(mac, nyanEntries[nyanLocateIdx].mac, sizeof(mac) - 1);
+    mac[sizeof(mac) - 1] = '\0';
+
+    startLEDSpinner(120, 0, 220);
+    doNyanBoxScan(NYANBOX_LOCATE_SCAN_SECS, mac);
+    stopLEDSpinner(120, 0, 220);
+
+    // MAC-based upsert may have shifted sort order. Re-find target.
+    int newIdx = findNyanBoxByMac(mac);
+    if (newIdx >= 0) nyanLocateIdx = newIdx;
+    updateNyanLocateLabel();
+}
+
+static void cb_nyanLocateBack(lv_event_t *e) {
+    int idx = nyanLocateIdx;
+    if (bleDetailScreen) { lv_obj_delete(bleDetailScreen); bleDetailScreen = nullptr; }
+    if (idx >= 0 && idx < nyanEntryCount) createNyanBoxDetail(idx);
+    else createNyanBoxDetector();
+}
+
+void createNyanBoxLocate(int idx) {
+    if (idx < 0 || idx >= nyanEntryCount) return;
+    nyanLocateIdx = idx;
+
+    if (bleDetailScreen) { lv_obj_delete(bleDetailScreen); bleDetailScreen = nullptr; }
+    bleDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleDetailScreen);
+    createHeader(bleDetailScreen, LV_SYMBOL_EYE_OPEN "  Locate nyanBOX");
+
+    lv_obj_t *card = lv_obj_create(bleDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card,      lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,        LV_OPA_COVER,          LV_PART_MAIN);
+    lv_obj_set_style_border_color(card,  lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card,  1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,        6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,       6, LV_PART_MAIN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    nyanLocateLbl = lv_label_create(card);
+    lv_label_set_long_mode(nyanLocateLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(nyanLocateLbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(nyanLocateLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(nyanLocateLbl, LV_ALIGN_TOP_LEFT, 0, 0);
+    updateNyanLocateLabel();
+
+    lv_obj_t *backBtn = createBackBtn(bleDetailScreen, cb_nyanLocateBack);
+    lv_obj_t *refreshBtn = createActionBtn(bleDetailScreen,
+                                           LV_SYMBOL_REFRESH "  Refresh",
+                                           cb_nyanLocateRefresh);
+
+    deleteGroup(&bleDetailGroup);
+    bleDetailGroup = lv_group_create();
+    lv_group_add_obj(bleDetailGroup, backBtn);
+    lv_group_add_obj(bleDetailGroup, refreshBtn);
+    setGroup(bleDetailGroup);
+
+    lv_screen_load_anim(bleDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  BLE TOOL 5 – AXON DETECTOR
+//
+//  BLE-only detector for Axon-style devices. It checks the configured
+//  MAC/OUI prefix and stores matches in a fixed-size array. Locate Mode
+//  refreshes RSSI for the selected MAC on demand.
+// ════════════════════════════════════════════════════════════════
+static lv_obj_t *axonStatusLbl = nullptr;
+static lv_obj_t *axonList      = nullptr;
+static lv_obj_t *axonBackBtn   = nullptr;
+static lv_obj_t *axonScanBtn   = nullptr;
+static lv_obj_t *axonLocateLbl = nullptr;
+static int       axonLocateIdx = -1;
+static int       axonDetailIdxForLocate = -1;
+
+static void rebuildAxonList() {
+    if (!axonList) return;
+
+    // Rebuild focus group after lv_obj_clean() because list children are destroyed.
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    if (axonBackBtn) lv_group_add_obj(bleToolGroup, axonBackBtn);
+    if (axonScanBtn) lv_group_add_obj(bleToolGroup, axonScanBtn);
+
+    lv_obj_clean(axonList);
+
+    if (axonEntryCount == 0) {
+        lv_obj_t *empty = lv_list_add_text(axonList, "No Axon devices found yet");
+        if (empty) lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
+        setGroup(bleToolGroup);
+        return;
+    }
+
+    for (int i = 0; i < axonEntryCount; i++) {
+        char nameTrunc[12];
+        strncpy(nameTrunc, axonEntries[i].name[0] ? axonEntries[i].name : "Axon", 11);
+        nameTrunc[11] = '\0';
+
+        char row[64];
+#if AXON_SHOW_FULL_MAC
+        snprintf(row, sizeof(row), "%s  %ddBm", nameTrunc, axonEntries[i].rssi);
+#else
+        snprintf(row, sizeof(row), "%s  %ddBm", nameTrunc, axonEntries[i].rssi);
+#endif
+
+        lv_obj_t *btn = lv_list_add_btn(axonList, nullptr, row);
+        styleListBtn(btn);
+        lv_obj_set_style_text_color(btn, bleRssiColor(axonEntries[i].rssi), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            createAxonDetail((int)(intptr_t)lv_event_get_user_data(ev));
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_group_add_obj(bleToolGroup, btn);
+
+#if AXON_SHOW_FULL_MAC
+        lv_obj_t *macTxt = lv_list_add_text(axonList, axonEntries[i].mac);
+        if (macTxt) lv_obj_set_style_text_color(macTxt, lv_color_hex(TH.textDim), LV_PART_MAIN);
+#endif
+    }
+
+    setGroup(bleToolGroup);
+}
+
+static void cb_doAxonScan(lv_event_t *e) {
+    char msg[48];
+    snprintf(msg, sizeof(msg), LV_SYMBOL_REFRESH "  Scanning %ds...", AXON_SCAN_SECS);
+    lv_label_set_text(axonStatusLbl, msg);
+    lv_obj_set_style_text_color(axonStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
+    lv_obj_clean(axonList);
+    lv_timer_handler();
+
+    startLEDSpinner(0, 120, 220);
+    axonEntryCount = 0;
+    memset(axonEntries, 0, sizeof(axonEntries));
+    int found = doAxonScan(AXON_SCAN_SECS);
+    stopLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
+
+    if (found == 0) {
+        lv_label_set_text(axonStatusLbl, LV_SYMBOL_BLUETOOTH "  No Axon devices detected");
+        lv_obj_set_style_text_color(axonStatusLbl, lv_color_hex(TH.success), LV_PART_MAIN);
+    } else {
+        snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  %d Axon device%s found!",
+                 found, found == 1 ? "" : "s");
+        lv_label_set_text(axonStatusLbl, msg);
+        lv_obj_set_style_text_color(axonStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+    }
+
+    rebuildAxonList();
+}
+
+void createAxonDetector() {
+    axonStatusLbl = nullptr;
+    axonList      = nullptr;
+    axonBackBtn   = nullptr;
+    axonScanBtn   = nullptr;
+    axonLocateLbl = nullptr;
+    axonLocateIdx = -1;
+    axonDetailIdxForLocate = -1;
+
+    if (bleToolScreen) { lv_obj_delete(bleToolScreen); bleToolScreen = nullptr; }
+    bleToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleToolScreen);
+    createHeader(bleToolScreen, LV_SYMBOL_BLUETOOTH "  Axon Detector");
+
+    axonStatusLbl = lv_label_create(bleToolScreen);
+    char readyMsg[80];
+    snprintf(readyMsg, sizeof(readyMsg),
+             "Detects Axon Cameras", AXON_MAC_PREFIX, AXON_SCAN_SECS);
+    lv_label_set_text(axonStatusLbl, readyMsg);
+    lv_obj_set_style_text_color(axonStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(axonStatusLbl, 8, 30);
+
+    axonList = lv_list_create(bleToolScreen);
+    lv_obj_set_size(axonList, SCREEN_W, SCREEN_H - 80);
+    lv_obj_set_pos(axonList, 0, 48);
+    lv_obj_set_style_bg_color(axonList,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(axonList,       LV_OPA_COVER,        LV_PART_MAIN);
+    lv_obj_set_style_border_width(axonList, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(axonList,      2, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(axonList,      2, LV_PART_MAIN);
+
+    lv_obj_t *empty = lv_list_add_text(axonList, "Ready to scan for Axon devices");
+    if (empty) lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
+
+    axonBackBtn = createBackBtn(bleToolScreen, cb_bleToolBack);
+    axonScanBtn = createActionBtn(bleToolScreen,
+                                  LV_SYMBOL_REFRESH "  Scan",
+                                  cb_doAxonScan);
+
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    lv_group_add_obj(bleToolGroup, axonBackBtn);
+    lv_group_add_obj(bleToolGroup, axonScanBtn);
+    setGroup(bleToolGroup);
+
+    if (axonEntryCount > 0) {
+        char msg[56];
+        snprintf(msg, sizeof(msg), LV_SYMBOL_BLUETOOTH "  %d saved Axon result%s",
+                 axonEntryCount, axonEntryCount == 1 ? "" : "s");
+        lv_label_set_text(axonStatusLbl, msg);
+        lv_obj_set_style_text_color(axonStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+        rebuildAxonList();
+    }
+
+    setAllLEDs(0, 120, 220, LED_BRIGHTNESS);
+    lv_screen_load_anim(bleToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+static void cb_axonDetailBack(lv_event_t *e) {
+    cb_bleDetailBack(e);
+}
+
+static void cb_axonLocate(lv_event_t *e) {
+    if (axonDetailIdxForLocate >= 0) createAxonLocate(axonDetailIdxForLocate);
+}
+
+void createAxonDetail(int idx) {
+    if (idx < 0 || idx >= axonEntryCount) return;
+    axonDetailIdxForLocate = idx;
+
+    if (bleDetailScreen) { lv_obj_delete(bleDetailScreen); bleDetailScreen = nullptr; }
+    bleDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleDetailScreen);
+
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), LV_SYMBOL_BLUETOOTH "  %.24s", axonEntries[idx].name);
+    createHeader(bleDetailScreen, hdr);
+
+    lv_obj_t *card = lv_obj_create(bleDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card,      lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,        LV_OPA_COVER,          LV_PART_MAIN);
+    lv_obj_set_style_border_color(card,  lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card,  1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,        6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,       6, LV_PART_MAIN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    uint32_t ageSec = (millis() - axonEntries[idx].lastSeen) / 1000;
+    char info[200];
+    snprintf(info, sizeof(info),
+             "Axon-style BLE Device\n"
+             "Name : %s\n"
+             "MAC  : %s\n"
+             "RSSI : %d dBm (%s)\n"
+             "Age  : %lus\n"
+             "Prefix: %s",
+             axonEntries[idx].name,
+             axonEntries[idx].mac,
+             axonEntries[idx].rssi,
+             axonSignalQuality(axonEntries[idx].rssi),
+             (unsigned long)ageSec,
+             AXON_MAC_PREFIX);
+
+    lv_obj_t *infoLbl = lv_label_create(card);
+    lv_label_set_text(infoLbl, info);
+    lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(infoLbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(infoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(infoLbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *backBtn = createBackBtn(bleDetailScreen, cb_axonDetailBack);
+    lv_obj_t *locateBtn = createActionBtn(bleDetailScreen,
+                                          LV_SYMBOL_EYE_OPEN "  Locate",
+                                          cb_axonLocate);
+
+    deleteGroup(&bleDetailGroup);
+    bleDetailGroup = lv_group_create();
+    lv_group_add_obj(bleDetailGroup, backBtn);
+    lv_group_add_obj(bleDetailGroup, locateBtn);
+    setGroup(bleDetailGroup);
+
+    lv_screen_load_anim(bleDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+static void updateAxonLocateLabel() {
+    if (!axonLocateLbl || axonLocateIdx < 0 || axonLocateIdx >= axonEntryCount) return;
+
+    int8_t rssi = axonEntries[axonLocateIdx].rssi;
+    int signalLevel = map(constrain(rssi, -100, -40), -100, -40, 0, 5);
+    char bars[8] = "";
+    for (int i = 0; i < 5; i++) strcat(bars, i < signalLevel ? "|" : ".");
+
+    char buf[220];
+    snprintf(buf, sizeof(buf),
+             "Locate Axon\n"
+             "%s\n"
+             "%s\n\n"
+             "RSSI  : %d dBm\n"
+             "Signal: %s\n"
+             "Bars  : %s\n\n"
+             "Press Refresh to update",
+             axonEntries[axonLocateIdx].name,
+             axonEntries[axonLocateIdx].mac,
+             rssi,
+             axonSignalQuality(rssi),
+             bars);
+    lv_label_set_text(axonLocateLbl, buf);
+}
+
+static void cb_axonLocateRefresh(lv_event_t *e) {
+    if (axonLocateIdx < 0 || axonLocateIdx >= axonEntryCount) return;
+
+    lv_label_set_text(axonLocateLbl, LV_SYMBOL_REFRESH "  Refreshing RSSI...");
+    lv_timer_handler();
+
+    char mac[18];
+    strncpy(mac, axonEntries[axonLocateIdx].mac, sizeof(mac) - 1);
+    mac[sizeof(mac) - 1] = '\0';
+
+    startLEDSpinner(0, 120, 220);
+    doAxonScan(AXON_LOCATE_SCAN_SECS, mac);
+    stopLEDSpinner(0, 120, 220);
+
+    // MAC-based upsert may have shifted sort order. Re-find target.
+    int newIdx = findAxonByMac(mac);
+    if (newIdx >= 0) axonLocateIdx = newIdx;
+    updateAxonLocateLabel();
+}
+
+static void cb_axonLocateBack(lv_event_t *e) {
+    int idx = axonLocateIdx;
+    if (bleDetailScreen) { lv_obj_delete(bleDetailScreen); bleDetailScreen = nullptr; }
+    if (idx >= 0 && idx < axonEntryCount) createAxonDetail(idx);
+    else createAxonDetector();
+}
+
+void createAxonLocate(int idx) {
+    if (idx < 0 || idx >= axonEntryCount) return;
+    axonLocateIdx = idx;
+
+    if (bleDetailScreen) { lv_obj_delete(bleDetailScreen); bleDetailScreen = nullptr; }
+    bleDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleDetailScreen);
+    createHeader(bleDetailScreen, LV_SYMBOL_EYE_OPEN "  Locate Axon");
+
+    lv_obj_t *card = lv_obj_create(bleDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card,      lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,        LV_OPA_COVER,          LV_PART_MAIN);
+    lv_obj_set_style_border_color(card,  lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card,  1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,        6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,       6, LV_PART_MAIN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    axonLocateLbl = lv_label_create(card);
+    lv_label_set_long_mode(axonLocateLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(axonLocateLbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(axonLocateLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(axonLocateLbl, LV_ALIGN_TOP_LEFT, 0, 0);
+    updateAxonLocateLabel();
+
+    lv_obj_t *backBtn = createBackBtn(bleDetailScreen, cb_axonLocateBack);
+    lv_obj_t *refreshBtn = createActionBtn(bleDetailScreen,
+                                           LV_SYMBOL_REFRESH "  Refresh",
+                                           cb_axonLocateRefresh);
+
+    deleteGroup(&bleDetailGroup);
+    bleDetailGroup = lv_group_create();
+    lv_group_add_obj(bleDetailGroup, backBtn);
+    lv_group_add_obj(bleDetailGroup, refreshBtn);
+    setGroup(bleDetailGroup);
+
+    lv_screen_load_anim(bleDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+
+// ════════════════════════════════════════════════════════════════
+//  BLE TOOL 6 – TESLA DETECTOR
+//
+//  Passive BLE name-pattern detector inspired by TeslaScanner.
+//  It checks names only when the advertised name is long enough:
+//     name[0] == TESLA_NAME_START_CHAR
+//     name[TESLA_NAME_END_INDEX] == TESLA_NAME_END_CHAR
+// ════════════════════════════════════════════════════════════════
+static lv_obj_t *teslaStatusLbl = nullptr;
+static lv_obj_t *teslaList      = nullptr;
+static lv_obj_t *teslaBackBtn   = nullptr;
+static lv_obj_t *teslaScanBtn   = nullptr;
+
+static const char *teslaSignalQuality(int8_t rssi) {
+    if (rssi >= -50) return "EXCELLENT";
+    if (rssi >= -60) return "VERY GOOD";
+    if (rssi >= -70) return "GOOD";
+    if (rssi >= -80) return "FAIR";
+    return "WEAK";
+}
+
+static int findTeslaByMac(const char *mac) {
+    for (int i = 0; i < teslaEntryCount; i++) {
+        if (strcmp(teslaEntries[i].mac, mac) == 0) return i;
+    }
+    return -1;
+}
+
+static void sortTeslaByRSSI() {
+    for (int i = 0; i < teslaEntryCount - 1; i++) {
+        for (int j = 0; j < teslaEntryCount - 1 - i; j++) {
+            if (teslaEntries[j].rssi < teslaEntries[j + 1].rssi) {
+                TeslaEntry tmp = teslaEntries[j];
+                teslaEntries[j] = teslaEntries[j + 1];
+                teslaEntries[j + 1] = tmp;
+            }
+        }
+    }
+}
+
+static void upsertTeslaDevice(BLEAdvertisedDevice &dev) {
+    String macStr = dev.getAddress().toString().c_str();
+    int idx = findTeslaByMac(macStr.c_str());
+    if (idx < 0) {
+        if (teslaEntryCount >= MAX_TESLA_RESULTS) return;
+        idx = teslaEntryCount++;
+        memset(&teslaEntries[idx], 0, sizeof(TeslaEntry));
+        strncpy(teslaEntries[idx].mac, macStr.c_str(), sizeof(teslaEntries[idx].mac) - 1);
+        strncpy(teslaEntries[idx].name, "Tesla BLE", sizeof(teslaEntries[idx].name) - 1);
+    }
+
+    String nm = dev.haveName() ? dev.getName().c_str() : "Tesla BLE";
+    strncpy(teslaEntries[idx].name, nm.c_str(), sizeof(teslaEntries[idx].name) - 1);
+    teslaEntries[idx].name[sizeof(teslaEntries[idx].name) - 1] = '\0';
+    teslaEntries[idx].rssi = (int8_t)dev.getRSSI();
+    teslaEntries[idx].lastSeen = millis();
+}
+
+static int doTeslaScan(int durationSec) {
+    ensureBLEInit();
+    WiFi.disconnect();
+    delay(50);
+
+    BLEScan *pScan = BLEDevice::getScan();
+    pScan->setActiveScan(true);
+    pScan->setInterval(150);
+    pScan->setWindow(140);
+
+    BLEScanResults results = pScan->start(durationSec, false);
+    int total = results.getCount();
+
+    teslaEntryCount = 0;
+    memset(teslaEntries, 0, sizeof(teslaEntries));
+
+    for (int i = 0; i < total && teslaEntryCount < MAX_TESLA_RESULTS; i++) {
+        BLEAdvertisedDevice dev = results.getDevice(i);
+        if (detectTeslaName(dev)) {
+            upsertTeslaDevice(dev);
+        }
+    }
+
+    pScan->clearResults();
+    sortTeslaByRSSI();
+    return teslaEntryCount;
+}
+
+static void rebuildTeslaList() {
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    if (teslaBackBtn) lv_group_add_obj(bleToolGroup, teslaBackBtn);
+    if (teslaScanBtn) lv_group_add_obj(bleToolGroup, teslaScanBtn);
+    setGroup(bleToolGroup);
+
+    lv_obj_clean(teslaList);
+    if (teslaEntryCount == 0) {
+        lv_obj_t *empty = lv_list_add_text(teslaList, "No Tesla BLE patterns found yet");
+        if (empty) lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
+        return;
+    }
+
+    for (int i = 0; i < teslaEntryCount; i++) {
+        char nameTrunc[19];
+        strncpy(nameTrunc, teslaEntries[i].name, 18);
+        nameTrunc[18] = '\0';
+
+        char row[64];
+        snprintf(row, sizeof(row), "%-18s %ddBm", nameTrunc, teslaEntries[i].rssi);
+
+        lv_obj_t *btn = lv_list_add_btn(teslaList, nullptr, row);
+        styleListBtn(btn);
+        lv_obj_set_style_text_color(btn, bleRssiColor(teslaEntries[i].rssi), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            createTeslaDetail((int)(intptr_t)lv_event_get_user_data(ev));
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_group_add_obj(bleToolGroup, btn);
+
+#if TESLA_SHOW_FULL_MAC
+        lv_obj_t *macTxt = lv_list_add_text(teslaList, teslaEntries[i].mac);
+        if (macTxt) lv_obj_set_style_text_color(macTxt, lv_color_hex(TH.textDim), LV_PART_MAIN);
+#endif
+    }
+
+    setGroup(bleToolGroup);
+}
+
+static void cb_doTeslaScan(lv_event_t *e) {
+    char msg[48];
+    snprintf(msg, sizeof(msg), LV_SYMBOL_REFRESH "  Scanning %ds...", TESLA_SCAN_SECS);
+    lv_label_set_text(teslaStatusLbl, msg);
+    lv_obj_set_style_text_color(teslaStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
+    lv_obj_clean(teslaList);
+    lv_timer_handler();
+
+    startLEDSpinner(0, 90, 220);
+    int found = doTeslaScan(TESLA_SCAN_SECS);
+    stopLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
+
+    if (found == 0) {
+        lv_label_set_text(teslaStatusLbl, LV_SYMBOL_BLUETOOTH "  No Tesla BLE patterns detected");
+        lv_obj_set_style_text_color(teslaStatusLbl, lv_color_hex(TH.success), LV_PART_MAIN);
+    } else {
+        snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  %d Tesla-like BLE device%s found!",
+                 found, found == 1 ? "" : "s");
+        lv_label_set_text(teslaStatusLbl, msg);
+        lv_obj_set_style_text_color(teslaStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+    }
+
+    rebuildTeslaList();
+}
+
+void createTeslaDetector() {
+    teslaStatusLbl = nullptr;
+    teslaList      = nullptr;
+    teslaBackBtn   = nullptr;
+    teslaScanBtn   = nullptr;
+
+    if (bleToolScreen) { lv_obj_delete(bleToolScreen); bleToolScreen = nullptr; }
+    bleToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleToolScreen);
+    createHeader(bleToolScreen, LV_SYMBOL_BLUETOOTH "  Tesla Detector");
+
+    teslaStatusLbl = lv_label_create(bleToolScreen);
+    char readyMsg[96];
+    snprintf(readyMsg, sizeof(readyMsg),
+             "Detects Tesla-style BLE names\nPattern: %c...%c at index %d  (%ds)",
+             TESLA_NAME_START_CHAR, TESLA_NAME_END_CHAR, TESLA_NAME_END_INDEX, TESLA_SCAN_SECS);
+    lv_label_set_text(teslaStatusLbl, readyMsg);
+    lv_obj_set_style_text_color(teslaStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(teslaStatusLbl, 8, 30);
+
+    teslaList = lv_list_create(bleToolScreen);
+    lv_obj_set_size(teslaList, SCREEN_W, SCREEN_H - 80);
+    lv_obj_set_pos(teslaList, 0, 48);
+    lv_obj_set_style_bg_color(teslaList,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(teslaList,       LV_OPA_COVER,        LV_PART_MAIN);
+    lv_obj_set_style_border_width(teslaList, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(teslaList,      2, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(teslaList,      2, LV_PART_MAIN);
+
+    lv_obj_t *empty = lv_list_add_text(teslaList, "Ready to scan for Tesla BLE names");
+    if (empty) lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
+
+    teslaBackBtn = createBackBtn(bleToolScreen, cb_bleToolBack);
+    teslaScanBtn = createActionBtn(bleToolScreen,
+                                   LV_SYMBOL_REFRESH "  Scan",
+                                   cb_doTeslaScan);
+
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    lv_group_add_obj(bleToolGroup, teslaBackBtn);
+    lv_group_add_obj(bleToolGroup, teslaScanBtn);
+    setGroup(bleToolGroup);
+
+    if (teslaEntryCount > 0) {
+        char msg[56];
+        snprintf(msg, sizeof(msg), LV_SYMBOL_BLUETOOTH "  %d saved Tesla result%s",
+                 teslaEntryCount, teslaEntryCount == 1 ? "" : "s");
+        lv_label_set_text(teslaStatusLbl, msg);
+        lv_obj_set_style_text_color(teslaStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+        rebuildTeslaList();
+    }
+
+    setAllLEDs(0, 90, 220, LED_BRIGHTNESS);
+    lv_screen_load_anim(bleToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+static void cb_teslaDetailBack(lv_event_t *e) {
+    cb_bleDetailBack(e);
+}
+
+void createTeslaDetail(int idx) {
+    if (idx < 0 || idx >= teslaEntryCount) return;
+
+    if (bleDetailScreen) { lv_obj_delete(bleDetailScreen); bleDetailScreen = nullptr; }
+    bleDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleDetailScreen);
+
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), LV_SYMBOL_BLUETOOTH "  %.24s", teslaEntries[idx].name);
+    createHeader(bleDetailScreen, hdr);
+
+    lv_obj_t *card = lv_obj_create(bleDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card,      lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,        LV_OPA_COVER,          LV_PART_MAIN);
+    lv_obj_set_style_border_color(card,  lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card,  1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,        6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,       6, LV_PART_MAIN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    uint32_t ageSec = (millis() - teslaEntries[idx].lastSeen) / 1000;
+    char info[220];
+    snprintf(info, sizeof(info),
+             "Tesla-style BLE Pattern\n"
+             "Name : %s\n"
+             "MAC  : %s\n"
+             "RSSI : %d dBm (%s)\n"
+             "Age  : %lus\n"
+             "Rule : name[0]=%c, name[%d]=%c",
+             teslaEntries[idx].name,
+             teslaEntries[idx].mac,
+             teslaEntries[idx].rssi,
+             teslaSignalQuality(teslaEntries[idx].rssi),
+             (unsigned long)ageSec,
+             TESLA_NAME_START_CHAR,
+             TESLA_NAME_END_INDEX,
+             TESLA_NAME_END_CHAR);
+
+    lv_obj_t *infoLbl = lv_label_create(card);
+    lv_label_set_text(infoLbl, info);
+    lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(infoLbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(infoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(infoLbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *bar = lv_bar_create(bleDetailScreen);
+    lv_obj_set_size(bar, SCREEN_W - 12, 5);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
+    lv_bar_set_range(bar, -100, -30);
+    lv_bar_set_value(bar, teslaEntries[idx].rssi, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, bleRssiColor(teslaEntries[idx].rssi), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
+
+    lv_obj_t *backBtn = createBackBtn(bleDetailScreen, cb_teslaDetailBack);
+
+    deleteGroup(&bleDetailGroup);
+    bleDetailGroup = lv_group_create();
+    lv_group_add_obj(bleDetailGroup, backBtn);
+    setGroup(bleDetailGroup);
+
+    lv_screen_load_anim(bleDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  BLE TOOL 7 – SKIMMER DETECTOR
+//
+//  Scans for Bluetooth devices with names matching suspicious serial/BLE
+//  module names from config.h. These cheap hobbyist boards are sometimes
+//  found inside gas pump card skimmers or similar suspicious builds.
 //  Reference: github.com/sparkfunX/Skimmer_Scanner
 //             github.com/justcallmekoko/ESP32Marauder
 // ════════════════════════════════════════════════════════════════
@@ -4512,7 +6819,7 @@ static void cb_doSkimmerScan(lv_event_t *e) {
         lv_obj_set_style_text_color(skimmerStatusLbl,
             lv_color_hex(TH.success), LV_PART_MAIN);
         lv_obj_t *empty = lv_list_add_text(skimmerList,
-            "No HC-03 / HC-05 / HC-06 in range");
+            "No configured skimmer names in range");
         if (empty)
             lv_obj_set_style_text_color(empty,
                 lv_color_hex(TH.textDim), LV_PART_MAIN);
@@ -4553,8 +6860,8 @@ void createSkimmerScanner() {
 
     skimmerStatusLbl = lv_label_create(bleToolScreen);
     lv_label_set_text(skimmerStatusLbl,
-        "Scans for HC-03 / HC-05 / HC-06\n"
-        "Bluetooth modules used in skimmers");
+        "Scans for configured suspicious BLE\n"
+        "serial modules used in skimmers");
     lv_obj_set_style_text_color(skimmerStatusLbl,
         lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(skimmerStatusLbl, 8, 30);
@@ -4583,7 +6890,7 @@ void createSkimmerScanner() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  BLE TOOL 5 – META / RAYBAN DETECTOR
+//  BLE TOOL 8 – META / RAYBAN DETECTOR
 //
 //  Detects Meta smart glasses (Ray-Ban Meta, Quest, etc.) by
 //  checking BLE advertisements for Meta/Luxottica manufacturer IDs,
@@ -4652,8 +6959,7 @@ void createMetaDetector() {
 
     metaStatusLbl = lv_label_create(bleToolScreen);
     lv_label_set_text(metaStatusLbl,
-        "Detects Ray-Ban Meta / Quest via\n"
-        "BLE manufacturer & service UUIDs");
+        "Detects Ray-Ban Meta / Quest");
     lv_obj_set_style_text_color(metaStatusLbl,
         lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(metaStatusLbl, 8, 30);
@@ -4696,17 +7002,25 @@ static void deleteIfInactiveScreen(lv_obj_t *&scr, lv_obj_t *activeScr) {
 
 static void cleanupForAutoReturnHome(lv_obj_t *activeScr) {
     // Stop any WiFi promiscuous tools cleanly before jumping home.
-    if (deauthActive || pwnActive || flockActive) {
+    if (deauthActive || pwnActive || flockActive || hybridWifiActive || packetMonitorActive) {
         deauthActive = false;
         pwnActive    = false;
         flockActive  = false;
+        hybridWifiActive = false;
+        packetMonitorActive = false;
         esp_wifi_set_promiscuous(false);
         esp_wifi_set_promiscuous_rx_cb(nullptr);
+    }
+
+    if (spinnerRunning) {
+        stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
     }
 
     if (deauthTimer) { lv_timer_delete(deauthTimer); deauthTimer = nullptr; }
     if (pwnTimer)    { lv_timer_delete(pwnTimer);    pwnTimer    = nullptr; }
     if (flockTimer)  { lv_timer_delete(flockTimer);  flockTimer  = nullptr; }
+    if (hybridStartTimer) { lv_timer_delete(hybridStartTimer); hybridStartTimer = nullptr; }
+    if (packetMonitorTimer) { lv_timer_delete(packetMonitorTimer); packetMonitorTimer = nullptr; }
 
     // Stop GPS/Wiggle Wars timers safely if one of those tools is open.
     if (gpsTimer) { lv_timer_delete(gpsTimer); gpsTimer = nullptr; }
@@ -4792,6 +7106,7 @@ void setup() {
     ledcAttachPin(LCD_BL_PIN, LCD_BL_CH);
     applyBacklightLevel((uint8_t)lcdBrightness);
     resetInactivityTimer();
+    applyFlockHybridPreset();
     tft.fillScreen(TFT_BLACK);
     showSplashScreen();  // Splash Screen Call
 
@@ -4831,7 +7146,7 @@ void loop() {
 
     // Channel hopping: deauth detector and pwnagotchi watch both need it
     static unsigned long lastHop = 0;
-    if ((deauthActive || pwnActive || flockActive) && (millis() - lastHop >= (unsigned long)deauthHopMs)) {
+    if ((deauthActive || pwnActive || flockActive || hybridWifiActive) && (millis() - lastHop >= (unsigned long)deauthHopMs)) {
         lastHop       = millis();
         deauthChannel = (deauthChannel % 13) + 1;
         esp_wifi_set_channel(deauthChannel, WIFI_SECOND_CHAN_NONE);

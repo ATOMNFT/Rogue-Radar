@@ -1,5 +1,5 @@
 // ============================================================
-//  config.h — Rogue Radar T-Embed v1.0.1
+//  config.h — Rogue Radar T-Embed v1.0.2
 //  Edit this file to customise pins, limits, themes, and behaviour.
 //  Do not edit rogue-radar.ino unless you know what you're doing.
 // ============================================================
@@ -7,7 +7,7 @@
 
 // ─── Device Name / Firmware Version ─────────────────────────────
 #define DEVICE_NAME       "Rogue Radar"
-#define FIRMWARE_VERSION  "RR v1.0.1"
+#define FIRMWARE_VERSION  "RR v1.0.2"
 
 // ─── Pin Definitions ────────────────────────────────────────────
 #define POWER_PIN       46
@@ -83,7 +83,6 @@
 #define DISPLAY_ROTATION_FLIPPED  1
 #define DISPLAY_ROTATION_DEFAULT  DISPLAY_ROTATION_NORMAL
 
-
 // ─── GPS ────────────────────────────────────────────────────────
 #define GPS_RX_PIN  44
 #define GPS_TX_PIN  43
@@ -119,6 +118,23 @@
 #define WIFI_SCAN_SECS    10
 #define MAX_WIFI_RESULTS  30
 
+// ─── Packet Monitor ─────────────────────────────────────────────
+// Display-only packet monitor inspired by https://github.com/spacehuhn/PacketMonitor32.
+#define PACKET_MONITOR_DEFAULT_CH        6
+#define PACKET_MONITOR_UPDATE_MS       500
+#define PACKET_MONITOR_GRAPH_BARS       48
+#define PACKET_MONITOR_GRAPH_MAX_RATE  200  // baseline packets/sec for graph scaling; set 0 for autoscale only
+
+// Channel hopping for WiFi Tools > Packet Monitor.
+// Runtime controls: Misc Tools > Scan Defaults > Packet Hop / Packet Hop ms.
+#define PACKET_MONITOR_HOP_ENABLED_DEFAULT  0
+#define PACKET_MONITOR_HOP_MS             750
+#define PACKET_MONITOR_HOP_PRESET_0_MS    250
+#define PACKET_MONITOR_HOP_PRESET_1_MS    500
+#define PACKET_MONITOR_HOP_PRESET_2_MS    750
+#define PACKET_MONITOR_HOP_PRESET_3_MS   1000
+#define PACKET_MONITOR_HOP_PRESET_4_MS   1500
+
 // ─── Deauth Detector ────────────────────────────────────────────
 #define MAX_DEAUTH        12
 // Channel hop delay is session-adjustable from Misc > Scan Defaults.
@@ -150,13 +166,123 @@
 // 1 = show source MAC under each Flock hit row, 0 = compact one-line rows.
 #define FLOCK_SHOW_SOURCE_MAC  1
 
+// ─── Flock Hybrid Scanner ──────────────────────────────────────
+// Combined BLE + WiFi scanner. It runs BLE first, then WiFi sniffing,
+// and merges both hit types into one list. Values reset after reboot.
+#define MAX_FLOCK_HYBRID_HITS      30
+#define FLOCK_HYBRID_BLE_SECS       8
+#define FLOCK_HYBRID_WIFI_SECS     10
+#define FLOCK_HYBRID_WIFI_HOP_MS  200
+#define FLOCK_HYBRID_PRESET_DEFAULT  1   // 0=Quick, 1=Balanced, 2=Wide, 3=Deep, 4=Patient
+
+// Presets used by Misc > Scan Defaults > Flock Hybrid.
+// Each click cycles to the next set. These reset after reboot.
+#define FLOCK_HYBRID_PRESET_0_NAME  "Quick"
+#define FLOCK_HYBRID_PRESET_0_BLE    5
+#define FLOCK_HYBRID_PRESET_0_WIFI   6
+#define FLOCK_HYBRID_PRESET_0_HOP  150
+
+#define FLOCK_HYBRID_PRESET_1_NAME  "Balanced"
+#define FLOCK_HYBRID_PRESET_1_BLE    FLOCK_HYBRID_BLE_SECS
+#define FLOCK_HYBRID_PRESET_1_WIFI   FLOCK_HYBRID_WIFI_SECS
+#define FLOCK_HYBRID_PRESET_1_HOP    FLOCK_HYBRID_WIFI_HOP_MS
+
+#define FLOCK_HYBRID_PRESET_2_NAME  "Wide"
+#define FLOCK_HYBRID_PRESET_2_BLE    8
+#define FLOCK_HYBRID_PRESET_2_WIFI  15
+#define FLOCK_HYBRID_PRESET_2_HOP  250
+
+#define FLOCK_HYBRID_PRESET_3_NAME  "Deep"
+#define FLOCK_HYBRID_PRESET_3_BLE   12
+#define FLOCK_HYBRID_PRESET_3_WIFI  20
+#define FLOCK_HYBRID_PRESET_3_HOP  300
+
+#define FLOCK_HYBRID_PRESET_4_NAME  "Patient"
+#define FLOCK_HYBRID_PRESET_4_BLE   15
+#define FLOCK_HYBRID_PRESET_4_WIFI  25
+#define FLOCK_HYBRID_PRESET_4_HOP  500
+#define FLOCK_HYBRID_SHOW_MAC       1
+// Teal slow APA102 spinner shown while the hybrid scan cycle is running.
+#define FLOCK_HYBRID_LED_R          0
+#define FLOCK_HYBRID_LED_G        180
+#define FLOCK_HYBRID_LED_B        170
+#define FLOCK_HYBRID_LED_SPIN_MS  160
+
 // ─── BLE Scanner ────────────────────────────────────────────────
 #define MAX_BLE_RESULTS   30
 // BLE scan time is session-adjustable from Misc > Scan Defaults.
 // It resets to this value after reboot.
 #define BLE_SCAN_SECS      8
 
+
+// ─── Tesla Detector ─────────────────────────────────────────────
+// Passive BLE name-pattern detector inspired by Esp32vsEvil/TeslaScanner.
+// It only checks TESLA_NAME_END_INDEX when the BLE name length is long enough.
+#define MAX_TESLA_RESULTS        20
+#define TESLA_SCAN_SECS           8
+#define TESLA_NAME_START_CHAR   'S'
+#define TESLA_NAME_END_INDEX     17
+#define TESLA_NAME_END_CHAR     'C'
+#define TESLA_SHOW_FULL_MAC       1
+
+// ─── AirTag Detector ────────────────────────────────────────────
+// Adds GhostESP-style passive BLE payload pattern detection for
+// Apple Find My / AirTag advertisements. This stays passive and
+// does not connect to BLE devices.
+#define AIRTAG_PAYLOAD_DETECT_ENABLED   1
+#define AIRTAG_FINDMY_TYPE             0x12
+#define AIRTAG_FINDMY_SUBTYPE          0x19
+#define AIRTAG_NEARBY_TYPE             0x07
+#define AIRTAG_APPLE_COMPANY_LE_0      0x4C
+#define AIRTAG_APPLE_COMPANY_LE_1      0x00
+
+// ─── Skimmer Detector ───────────────────────────────────────────
+// Expanded passive BLE name matching based on GhostESP device detect logic.
+// 1 = include the extended suspicious serial/BLE module names below.
+#define SKIMMER_EXTENDED_NAMES_ENABLED  1
+#define SKIMMER_NAME_MATCH_COUNT       12
+
+static const char* SKIMMER_NAME_MATCHES[SKIMMER_NAME_MATCH_COUNT] = {
+    "HC-03",
+    "HC-05",
+    "HC-06",
+    "HC-08",
+    "BT-HC05",
+    "JDY-31",
+    "AT-09",
+    "HM-10",
+    "CC41-A",
+    "MLT-BT05",
+    "SPP-CA",
+    "FFD0"
+};
+
+
+// ─── nyanBOX Detector ─────────────────────────────────────────── (Credit to https://github.com/jbohack/nyanBOX)
+// BLE-only detector for nyanBOX / Nyan Devices badges.
+// Scan values reset after reboot and do not use Preferences.
+#define MAX_NYANBOX_RESULTS       30
+#define NYANBOX_SCAN_SECS          8
+#define NYANBOX_LOCATE_SCAN_SECS   2
+#define NYANBOX_SERVICE_UUID      "6e79616e-424f-582d-7365-727669636521"
+
+// ─── Axon Detector ────────────────────────────────────────────── (Credit to https://github.com/jbohack/nyanBOX)
+// BLE-only detector for Axon-style BLE devices using the configured MAC/OUI prefix.
+// Scan values reset after reboot and do not use Preferences.
+#define MAX_AXON_RESULTS          30
+#define AXON_SCAN_SECS             8
+#define AXON_LOCATE_SCAN_SECS      2
+#define AXON_MAC_PREFIX           "00:25:df"
+#define AXON_SHOW_FULL_MAC         1
+
 // ─── Flipper Detector ───────────────────────────────────────────
+// Name matching stays enabled, and UUID detection adds the GhostESP-style
+// passive BLE advertisement check for known Flipper BLE UUIDs.
+#define FLIPPER_UUID_DETECT_ENABLED  1
+#define FLIPPER_UUID_BLACK        0x3081
+#define FLIPPER_UUID_WHITE        0x3082
+#define FLIPPER_UUID_TRANSPARENT  0x3083
+
 // Number of Flipper name strings checked below. If you add or remove
 // entries in FLIPPER_NAME_MATCHES, update this count to match.
 #define FLIPPER_NAME_MATCH_COUNT  4
@@ -216,3 +342,40 @@ static const char* FLIPPER_NAME_MATCHES[FLIPPER_NAME_MATCH_COUNT] = {
     0x0d1f0d, 0x1a5a1a, 0x00ff41, \
     0x001a00, 0x003300, 0x00ff41, \
     0x004000, 0x5a0000
+
+#define THEME_POSEIDON \
+    "Poseidon", \
+    0x000000, 0x211429, 0x080808, 0x212421, 0x101010, \
+    0xffffff, 0x7b7d7b, 0x00ffff, \
+    0x00ff00, 0xffff00, 0xff0000, \
+    0x101010, 0x310039, 0xff00ff, \
+    0x211429, 0x310039, 0xff00ff, \
+    0x00ff00, 0xff0000
+
+#define THEME_PHANTOM \
+    "Phantom", \
+    0x000000, 0x390042, 0x100021, 0x4a0084, 0x180021, \
+    0xdedbde, 0x636163, 0xc600ff, \
+    0x84ff84, 0xff7d00, 0xff0000, \
+    0x180021, 0x290042, 0xc600ff, \
+    0x390042, 0x290042, 0xc600ff, \
+    0x84ff84, 0xff0000
+
+#define THEME_AMBER \
+    "Amber", \
+    0x000000, 0x422000, 0x100800, 0x422000, 0x211000, \
+    0xff9600, 0x633000, 0xff9600, \
+    0xff9600, 0xff9600, 0xa56100, \
+    0x211000, 0x211000, 0xff9600, \
+    0x422000, 0x211000, 0xff9600, \
+    0xff9600, 0xa56100
+
+#define THEME_TRON \
+    "Tron", \
+    0x000000, 0x00205a, 0x000029, 0x009aff, 0x00204a, \
+    0xbdffff, 0x292c39, 0x00ffff, \
+    0x00ffff, 0xffff00, 0xff0000, \
+    0x00204a, 0x00209c, 0x00ffff, \
+    0x00205a, 0x00209c, 0x00ffff, \
+    0x00ffff, 0xff0000
+
