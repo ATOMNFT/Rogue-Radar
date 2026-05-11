@@ -58,7 +58,7 @@ It is designed around fast menu navigation, onboard scanning tools, live signal 
 - **Skimmer Detector** – checks for suspicious BLE serial/module names including HC-03, HC-05, HC-06, HC-08, BT-HC05, JDY-31, AT-09, HM-10, CC41-A, MLT-BT05, SPP-CA, and FFD0.
 - **Meta Detector** – looks for Meta / Ray-Ban smart-glasses related BLE advertisements.
 - **nyanBOX Detector** – detects nyanBOX / Nyan Devices BLE badges and shows name, MAC, RSSI, level, version, age, and Locate Mode.
-- **Axon Detector** – detects Axon-style BLE devices by configurable MAC/OUI prefix with detail view and Locate Mode.
+- **Axon Detector** – detects Axon-style BLE devices by configurable MAC/OUI prefix with detail view and Locate Mode. 
 - **Tesla Detector** – detects Tesla-style BLE name patterns and shows name, MAC, RSSI, age, signal quality, and detail view.
 
 ### GPS Tools
@@ -274,4 +274,24 @@ This project is intended for educational, research, and defensive awareness purp
 
 ## Credits
 
+Rogue Radar would not be possible without the work and inspiration from these projects and creators:
 
+- **JustCallMeKoKo / ESP32Marauder**  
+  Huge credit to JustCallMeKoKo for the continued work on ESP32Marauder and for helping push ESP32-based WiFi/BLE research tools forward.  
+  https://github.com/justcallmekoko/ESP32Marauder
+
+- **jbohack / nyanBOX**  
+  Big credit to jbohack for the nyanBOX hardware and firmware work, which helped inspire several BLE-focused ideas and detector improvements in Rogue Radar.  
+  https://github.com/jbohack/nyanBOX
+
+- **spacehuhn / PacketMonitor32**  
+  Credit to spacehuhn for PacketMonitor32, which inspired the live Packet Monitor feature and WiFi packet activity graph in Rogue Radar.  
+  https://github.com/spacehuhn/PacketMonitor32
+
+- **GhostESP Revival**  
+  Credit to the GhostESP Revival project for BLE detection ideas that helped improve AirTag-like, Flipper, and skimmer-style detection logic.  
+  https://github.com/GhostESP-Revival/GhostESP
+
+- **Esp32vsEvil / TeslaScanner**  
+  Credit to Esp32vsEvil for the TeslaScanner idea that inspired the Tesla BLE detector added to Rogue Radar.  
+  https://github.com/Esp32vsEvil/TeslaScanner
