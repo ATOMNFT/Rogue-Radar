@@ -1,0 +1,15 @@
+{
+  "name": "rogue-radar-v1.0.3",
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "improv": false,
+      "parts": [
+        {
+          "path": "rogue-radar-v1.0.3.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}
