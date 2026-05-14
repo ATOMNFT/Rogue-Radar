@@ -1,5 +1,5 @@
 // ============================================================
-//  Rogue Radar v1.0.2 Firmware
+//  Rogue Radar v1.0.3 Firmware
 //  Check config.h for adjustable settings
 // ============================================================
 //
@@ -10,7 +10,7 @@
 //              nyanBOX Detector | Axon Detector | Skimmer Detector | Meta Detector
 //  GPS Tools:  GPS Stats | Wiggle Wars
 //  Misc Tools: Device Info | SD Update | Brightness ADJ | Themes | Dimming | Scan Times | LEDs | Detection Sounds | Menu Sounds | Rotation
-//              Packet Monitor chan hopping |
+//              Packet Monitor chan hopping | Battery Gauge | Volume Adjustments |
 //
 //  Display / UI:
 //  - ST7789 320x170 display
@@ -105,6 +105,8 @@ static const UITheme THEMES[] = {
     { THEME_PHANTOM  },
     { THEME_AMBER    },
     { THEME_TRON     },
+    { THEME_TYPER    },
+    { THEME_JOKER    },
 };
 static int currentTheme = DEFAULT_THEME;
 
@@ -164,12 +166,22 @@ static lv_obj_t      *miscDimmingBtn    = nullptr;
 static lv_obj_t      *miscLedsBtn       = nullptr;
 static lv_obj_t      *miscSoundBtn      = nullptr;
 static lv_obj_t      *miscMenuSoundBtn  = nullptr;
+static lv_obj_t      *miscAlertVolumeBtn = nullptr;
 static lv_obj_t      *miscRotationBtn   = nullptr;
+
+// Menu volume auto-set state. Declared here so the common Misc Back handler
+// can safely delete the timer from any Misc tool page.
+static lv_timer_t    *menuVolAutoTimer = nullptr;
+static bool           menuVolPendingAutoSet = false;
+static lv_timer_t    *alertVolAutoTimer = nullptr;
+static bool           alertVolPendingAutoSet = false;
 
 // ─── I2S Speaker / Alert Chirp State ───────────────────────────
 static bool           soundEnabled      = (SOUND_ENABLED_DEFAULT != 0);
 static bool           soundReady        = false;
 static bool           menuFeedbackEnabled = (MENU_FEEDBACK_ENABLED_DEFAULT != 0);
+static int            menuFeedbackVolumePercent = MENU_FEEDBACK_VOLUME_PERCENT;
+static int            alertSoundVolumePercent = SOUND_VOLUME_PERCENT;
 static unsigned long  lastDeauthSoundMs = 0;
 static unsigned long  lastFlockSoundMs  = 0;
 static unsigned long  lastPwnSoundMs    = 0;
@@ -270,6 +282,7 @@ struct DeauthEvent {
     char     dst[18];
     uint8_t  channel;
     uint16_t reason;
+    int8_t   rssi;
     uint32_t ms;
 };
 
@@ -279,6 +292,15 @@ static volatile int  deauthTotal   = 0;
 static int           deauthSoundedTotal = 0;
 static volatile bool deauthActive  = false;
 static uint8_t       deauthChannel = 1;
+
+// Deauth stats are lightweight and mirror the existing detector logic.
+// They are shown in the detector list and in the Deauth Stats page.
+static volatile int32_t deauthRssiSum      = 0;
+static volatile int     deauthRssiCount    = 0;
+static volatile int8_t  deauthStrongestRSSI = -127;
+static int              deauthCurrentRate  = 0;
+static uint32_t         deauthLastRateMs   = 0;
+static int              deauthLastRateTotal = 0;
 
 // ── Channel Analyzer ────────────────────────────────────────────
 static int    chanNetCount[14];
@@ -314,11 +336,15 @@ static int         pineapFlagged    = 0;   // BSSIDs above threshold
 //  then extract name + pwnd_tot from the SSID JSON.
 //
 struct PwnEntry {
-    char     name[33];   // parsed from JSON "name" field
-    char     bssid[18];  // BSSID from beacon frame
-    int      pwnd_tot;   // parsed from JSON "pwnd_tot"
+    char     name[33];       // parsed from JSON "name" field
+    char     bssid[18];      // BSSID from beacon frame
+    char     rawJson[97];    // shortened SSID JSON preview
+    int      pwnd_tot;       // parsed from JSON "pwnd_tot"
+    bool     pal;            // parsed from JSON "pal"
+    bool     minigotchi;     // parsed from JSON "minigotchi"
+    uint8_t  channel;        // channel seen on
     int8_t   rssi;
-    uint32_t lastSeen;   // millis()
+    uint32_t lastSeen;       // millis()
 };
 
 static PwnEntry        pwnEntries[MAX_PWNS];
@@ -330,6 +356,7 @@ static lv_timer_t     *pwnTimer       = nullptr;
 static char            pwnPendingSSID[PWN_BUF_LEN];
 static char            pwnPendingBSSID[18];
 static volatile int8_t pwnPendingRSSI  = 0;
+static volatile uint8_t pwnPendingChannel = 1;
 static volatile bool   pwnPendingReady = false;
 
 // ── Flock Safety Detector ────────────────────────────────────────
@@ -458,11 +485,13 @@ void createWiFiMenu();
 void createNetworkScanner();
 void createNetworkDetail(int idx);
 void createDeauthDetector();
+void createDeauthStats();
 void createChannelAnalyzer();
 void createPacketMonitor();
 void createPineAPHunter();
 void createPineAPDetail(int idx);
 void createPwnagotchiDetector();
+void createPwnagotchiDetail(int idx);
 void createFlockDetector();
 void createFlockHybridScanner();
 void createSubScreen(int idx);
@@ -470,6 +499,8 @@ void createMiscMenu();
 void createDeviceInfo();
 void createSDUpdate();
 void createBrightnessControl();
+void createMenuFeedbackVolumeControl();
+void createAlertSoundVolumeControl();
 void createThemePicker();
 void createScanDefaults();
 void createGPSMenu();
@@ -610,7 +641,7 @@ static void initSound() {
 
     i2s_zero_dma_buffer(I2S_NUM_0);
     soundReady = true;
-    Serial.println("[Sound] I2S alert chirps ready");
+    //Serial.println("[Sound] I2S alert chirps ready");  // Added for testing.------------------------------------------------------------------------------------
 }
 
 static bool ensureSoundReady(bool requireAlertSoundEnabled = true) {
@@ -622,10 +653,11 @@ static bool ensureSoundReady(bool requireAlertSoundEnabled = true) {
     return soundReady;
 }
 
-static void soundTone(uint16_t freqHz, uint16_t durationMs, uint8_t volumePct = SOUND_VOLUME_PERCENT, bool requireAlertSoundEnabled = true) {
+static void soundTone(uint16_t freqHz, uint16_t durationMs, uint8_t volumePct = 255, bool requireAlertSoundEnabled = true) {
     if (freqHz == 0 || durationMs == 0) return;
     if (!ensureSoundReady(requireAlertSoundEnabled)) return;
 
+    if (volumePct == 255) volumePct = (uint8_t)alertSoundVolumePercent;
     if (volumePct > 100) volumePct = 100;
     int16_t amp = (int16_t)((12000L * volumePct) / 100L);
     if (amp < 300) amp = 300;
@@ -686,45 +718,45 @@ static void stopSoundDriverAfterChirp() {
 
 static void playDeauthChirp() {
     if (!soundCooldownReady(lastDeauthSoundMs)) return;
-    soundTone(2100, 65, SOUND_VOLUME_PERCENT);
+    soundTone(2100, 65, (uint8_t)alertSoundVolumePercent);
     soundSilence(45);
-    soundTone(2100, 65, SOUND_VOLUME_PERCENT);
+    soundTone(2100, 65, (uint8_t)alertSoundVolumePercent);
     stopSoundDriverAfterChirp();
 }
 
 static void playFlockChirp() {
     if (!soundCooldownReady(lastFlockSoundMs)) return;
-    soundTone(520, 170, SOUND_VOLUME_PERCENT);
+    soundTone(520, 170, (uint8_t)alertSoundVolumePercent);
     soundSilence(50);
-    soundTone(390, 210, SOUND_VOLUME_PERCENT);
+    soundTone(390, 210, (uint8_t)alertSoundVolumePercent);
     stopSoundDriverAfterChirp();
 }
 
 static void playPwnagotchiChirp() {
     if (!soundCooldownReady(lastPwnSoundMs)) return;
-    soundTone(880, 80, SOUND_VOLUME_PERCENT);
+    soundTone(880, 80, (uint8_t)alertSoundVolumePercent);
     soundSilence(35);
-    soundTone(1175, 80, SOUND_VOLUME_PERCENT);
+    soundTone(1175, 80, (uint8_t)alertSoundVolumePercent);
     soundSilence(35);
-    soundTone(1568, 110, SOUND_VOLUME_PERCENT);
+    soundTone(1568, 110, (uint8_t)alertSoundVolumePercent);
     stopSoundDriverAfterChirp();
 }
 
 static void playFlipperChirp() {
     if (!soundCooldownReady(lastFlipSoundMs)) return;
-    soundTone(1200, 55, SOUND_VOLUME_PERCENT);
+    soundTone(1200, 55, (uint8_t)alertSoundVolumePercent);
     soundSilence(30);
-    soundTone(1600, 55, SOUND_VOLUME_PERCENT);
+    soundTone(1600, 55, (uint8_t)alertSoundVolumePercent);
     soundSilence(30);
-    soundTone(1000, 70, SOUND_VOLUME_PERCENT);
+    soundTone(1000, 70, (uint8_t)alertSoundVolumePercent);
     stopSoundDriverAfterChirp();
 }
 
 static void playBLESuspiciousChirp() {
     if (!soundCooldownReady(lastBleSusSoundMs)) return;
-    soundTone(430, 120, SOUND_VOLUME_PERCENT);
+    soundTone(430, 120, (uint8_t)alertSoundVolumePercent);
     soundSilence(80);
-    soundTone(430, 120, SOUND_VOLUME_PERCENT);
+    soundTone(430, 120, (uint8_t)alertSoundVolumePercent);
     stopSoundDriverAfterChirp();
 }
 
@@ -742,7 +774,7 @@ static void playMenuTickFeedback() {
     // Very short, quiet tick for encoder movement.
     // This intentionally does not obey Misc > Sound ON/OFF; use
     // Misc > Menu Sounds ON/OFF or MENU_FEEDBACK_ENABLED_DEFAULT to disable it.
-    soundTone(1450, 8, MENU_FEEDBACK_VOLUME_PERCENT, false);
+    soundTone(1450, 8, (uint8_t)menuFeedbackVolumePercent, false);
     stopSoundDriverAfterChirp();
 }
 
@@ -751,7 +783,7 @@ static void playMenuClickFeedback() {
     if (!menuFeedbackCooldownReady(lastMenuClickMs, 120)) return;
 
     // Short click for button/select actions.
-    soundTone(950, 18, MENU_FEEDBACK_VOLUME_PERCENT, false);
+    soundTone(950, 18, (uint8_t)menuFeedbackVolumePercent, false);
     stopSoundDriverAfterChirp();
 }
 
@@ -784,6 +816,23 @@ static void toggleSoundEnabled() {
     updateSoundMenuLabel();
 }
 
+
+static const char *getAlertVolumeMenuLabel() {
+    static char label[44];
+    snprintf(label, sizeof(label), LV_SYMBOL_AUDIO "  Alert Volume: %d%%",
+             alertSoundVolumePercent);
+    return label;
+}
+
+static void updateAlertVolumeMenuLabel() {
+    if (!miscAlertVolumeBtn) return;
+
+    lv_obj_t *label = lv_obj_get_child(miscAlertVolumeBtn, 0);
+    if (label) {
+        lv_label_set_text(label, getAlertVolumeMenuLabel());
+    }
+}
+
 static const char *getMenuSoundMenuLabel() {
     static char label[44];
     snprintf(label, sizeof(label), LV_SYMBOL_AUDIO "  Menu Sounds: %s",
@@ -812,6 +861,14 @@ static void toggleMenuFeedbackEnabled() {
 
     updateMenuSoundMenuLabel();
 }
+
+static const char *getMenuVolumeMenuLabel() {
+    static char label[44];
+    snprintf(label, sizeof(label), LV_SYMBOL_AUDIO "  Menu Volume: %d%%",
+             menuFeedbackVolumePercent);
+    return label;
+}
+
 
 // ════════════════════════════════════════════════════════════════
 //  LVGL FLUSH + ENCODER CALLBACKS
@@ -960,6 +1017,120 @@ static void applyScreenStyle(lv_obj_t *scr) {
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 }
 
+// ── Battery Meter Helpers ───────────────────────────────────────
+// Reads the T-Embed LiPo battery voltage from the configured ADC pin
+// and displays a compact percentage in the right side of the top bar.
+static lv_obj_t *batteryTopLabel = nullptr;
+
+// Cached battery values prevent rapid menu changes from causing jumpy readings
+// and keep ADC work out of frequent UI redraw paths.
+static int      batteryCachedRaw     = 0;
+static float    batteryCachedVolts   = 0.0f;
+static int      batteryCachedPercent = 0;
+static uint32_t batteryLastReadMs    = 0;
+static bool     batteryCacheValid    = false;
+
+// Shared top-bar battery display value.
+// This prevents Home / WiFi / BLE / Misc headers from showing different
+// percentages just because each screen was created at a different time.
+static int      batteryDisplayPercent      = 0;
+static uint32_t batteryDisplayLastUpdateMs = 0;
+static bool     batteryDisplayValid        = false;
+
+#if BATTERY_METER_ENABLED
+static int batteryVoltageToPercent(float volts) {
+    // Approximate single-cell LiPo curve. This is intentionally conservative
+    // and can be calibrated later after comparing against a charger/multimeter.
+    if (volts >= 4.20f) return 100;
+    if (volts <= 3.30f) return 0;
+
+    struct BatteryPoint { float v; int p; };
+    static const BatteryPoint curve[] = {
+        {4.20f, 100}, {4.10f, 90}, {4.00f, 80}, {3.92f, 70},
+        {3.85f, 60},  {3.79f, 50}, {3.75f, 40}, {3.70f, 30},
+        {3.65f, 20},  {3.55f, 10}, {3.30f, 0}
+    };
+
+    for (size_t i = 0; i < (sizeof(curve) / sizeof(curve[0])) - 1; i++) {
+        if (volts <= curve[i].v && volts >= curve[i + 1].v) {
+            float spanV = curve[i].v - curve[i + 1].v;
+            float spanP = (float)(curve[i].p - curve[i + 1].p);
+            float frac  = (volts - curve[i + 1].v) / spanV;
+            int pct = curve[i + 1].p + (int)(frac * spanP + 0.5f);
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+            return pct;
+        }
+    }
+    return 0;
+}
+
+static void readBatterySnapshot(int *rawOut, float *voltsOut, int *percentOut) {
+    uint32_t now = millis();
+
+    // Only sample the ADC when the cache is stale. This avoids doing analogRead()
+    // repeatedly during fast menu navigation / encoder use.
+    if (!batteryCacheValid || (now - batteryLastReadMs >= (uint32_t)BATTERY_UPDATE_MS)) {
+        uint32_t rawSum = 0;
+        const uint8_t samples = BATTERY_AVG_SAMPLES;
+        for (uint8_t i = 0; i < samples; i++) {
+            rawSum += (uint32_t)analogRead(BATTERY_ADC_PIN);
+            delay(1);
+        }
+
+        batteryCachedRaw = (int)(rawSum / samples);
+        float adcVoltage = ((float)batteryCachedRaw / BATTERY_ADC_RESOLUTION) * BATTERY_ADC_REF_VOLTAGE;
+        batteryCachedVolts = adcVoltage * BATTERY_DIVIDER_RATIO;
+        batteryCachedPercent = batteryVoltageToPercent(batteryCachedVolts);
+        batteryLastReadMs = now;
+        batteryCacheValid = true;
+    }
+
+    if (rawOut)     *rawOut = batteryCachedRaw;
+    if (voltsOut)   *voltsOut = batteryCachedVolts;
+    if (percentOut) *percentOut = batteryCachedPercent;
+}
+
+static void refreshBatteryDisplayPercent(bool force = false) {
+    uint32_t now = millis();
+
+    // Top-bar percent is intentionally stickier than raw ADC reads.
+    // All headers use this one shared value so each menu shows the same
+    // battery percent instead of re-sampling differently per screen.
+    if (force || !batteryDisplayValid ||
+        (now - batteryDisplayLastUpdateMs >= (uint32_t)BATTERY_DISPLAY_UPDATE_MS)) {
+        int raw = 0;
+        float volts = 0.0f;
+        int percent = 0;
+
+        readBatterySnapshot(&raw, &volts, &percent);
+
+        batteryDisplayPercent = percent;
+        batteryDisplayLastUpdateMs = now;
+        batteryDisplayValid = true;
+    }
+}
+
+static void updateBatteryTopLabel() {
+    // Important: this is only called while creating a fresh header. Avoid using
+    // an LVGL timer here because screen changes delete old header objects and a
+    // timer can randomly update a stale label pointer during encoder navigation.
+    if (!batteryTopLabel) return;
+
+    refreshBatteryDisplayPercent(false);
+    int percent = batteryDisplayPercent;
+
+    char text[20];
+    snprintf(text, sizeof(text), "BAT %d%%", percent);
+    lv_label_set_text(batteryTopLabel, text);
+
+    uint32_t col = TH.success;
+    if (percent <= BATTERY_CRITICAL_PERCENT) col = TH.alert;
+    else if (percent <= BATTERY_WARN_PERCENT) col = TH.warn;
+    lv_obj_set_style_text_color(batteryTopLabel, lv_color_hex(col), LV_PART_MAIN);
+}
+#endif
+
 static lv_obj_t *createHeader(lv_obj_t *parent, const char *text) {
     lv_obj_t *bar = lv_obj_create(parent);
     lv_obj_set_size(bar, SCREEN_W, 28);
@@ -973,6 +1144,18 @@ static lv_obj_t *createHeader(lv_obj_t *parent, const char *text) {
     lv_label_set_text(lbl, text);
     lv_obj_set_style_text_color(lbl, TC(accent), LV_PART_MAIN);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 8, 0);
+
+#if BATTERY_METER_ENABLED
+    // Compact battery percentage on the opposite side of the top bar.
+    batteryTopLabel = nullptr;
+    batteryTopLabel = lv_label_create(bar);
+    lv_obj_set_width(batteryTopLabel, 78);
+    lv_label_set_long_mode(batteryTopLabel, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(batteryTopLabel, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+    lv_obj_align(batteryTopLabel, LV_ALIGN_RIGHT_MID, -8, 0);
+    updateBatteryTopLabel();
+#endif
+
     return bar;
 }
 
@@ -1015,15 +1198,37 @@ static lv_obj_t *createActionBtn(lv_obj_t *parent,
 }
 
 static void styleListBtn(lv_obj_t *btn) {
+    // Do NOT use lv_obj_remove_style_all(btn) here.
+    // It breaks the built-in list/button spacing and can stack text/icons.
+
     lv_obj_set_height(btn, 26);
+
+    // Default row style
     lv_obj_set_style_bg_color(btn,   TC(cardAlt),  LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_color(btn, TC(text),     LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    // Focused row style
     lv_obj_set_style_bg_color(btn,   TC(btnFocus), LV_PART_MAIN | LV_STATE_FOCUSED);
     lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER, LV_PART_MAIN | LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(btn, TC(accent), LV_PART_MAIN | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(btn, 1,           LV_PART_MAIN | LV_STATE_FOCUSED);
+
+    // Encoder/key focus state — helps override LVGL's default blue focus bar
+    lv_obj_set_style_bg_color(btn,   TC(btnFocus), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_color(btn, TC(accent), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_width(btn, 1,           LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+
+    // Extra-specific focused + key-focused state
+    lv_obj_set_style_bg_color(btn,   TC(btnFocus), LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER, LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_color(btn, TC(accent), LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_width(btn, 1,           LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+
+    // Pressed/selected style
     lv_obj_set_style_bg_color(btn,   TC(btnPress), LV_PART_MAIN | LV_STATE_PRESSED);
+
     lv_obj_set_style_radius(btn, 4, LV_PART_MAIN);
     lv_obj_set_style_pad_left(btn, 8, LV_PART_MAIN);
 }
@@ -1249,6 +1454,16 @@ static void cb_miscMenuBack(lv_event_t *e) {
 }
 
 static void cb_miscToolBack(lv_event_t *e) {
+    if (menuVolAutoTimer) {
+        lv_timer_delete(menuVolAutoTimer);
+        menuVolAutoTimer = nullptr;
+    }
+    menuVolPendingAutoSet = false;
+    if (alertVolAutoTimer) {
+        lv_timer_delete(alertVolAutoTimer);
+        alertVolAutoTimer = nullptr;
+    }
+    alertVolPendingAutoSet = false;
     miscToolScreen = nullptr;
     deleteGroup(&miscToolGroup);
     setGroup(miscMenuGroup);
@@ -1267,8 +1482,10 @@ static void cb_miscToolSelected(lv_event_t *e) {
         case 5: toggleDimmingEnabled();    break;
         case 6: toggleLedsEnabled();       break;
         case 7: toggleSoundEnabled();      break;
-        case 8: toggleMenuFeedbackEnabled(); break;
-        case 9: toggleDisplayRotation();   break;
+        case 8: createAlertSoundVolumeControl(); break;
+        case 9: toggleMenuFeedbackEnabled(); break;
+        case 10: createMenuFeedbackVolumeControl(); break;
+        case 11: toggleDisplayRotation();  break;
     }
 }
 
@@ -1296,9 +1513,10 @@ void createMiscMenu() {
     miscLedsBtn = nullptr;
     miscSoundBtn = nullptr;
     miscMenuSoundBtn = nullptr;
+    miscAlertVolumeBtn = nullptr;
     miscRotationBtn = nullptr;
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 12; i++) {
         const char *label = nullptr;
         if (i < 5) {
             label = MISC_TOOL_LABELS[i];
@@ -1309,7 +1527,11 @@ void createMiscMenu() {
         } else if (i == 7) {
             label = getSoundMenuLabel();
         } else if (i == 8) {
+            label = getAlertVolumeMenuLabel();
+        } else if (i == 9) {
             label = getMenuSoundMenuLabel();
+        } else if (i == 10) {
+            label = getMenuVolumeMenuLabel();
         } else {
             label = getRotationMenuLabel();
         }
@@ -1327,8 +1549,10 @@ void createMiscMenu() {
         } else if (i == 7) {
             miscSoundBtn = btn;
         } else if (i == 8) {
-            miscMenuSoundBtn = btn;
+            miscAlertVolumeBtn = btn;
         } else if (i == 9) {
+            miscMenuSoundBtn = btn;
+        } else if (i == 11) {
             miscRotationBtn = btn;
         }
     }
@@ -1358,7 +1582,11 @@ void createDeviceInfo() {
     lv_obj_set_style_border_width(card, 1,                      LV_PART_MAIN);
     lv_obj_set_style_radius(card,       6,                      LV_PART_MAIN);
     lv_obj_set_style_pad_all(card,      6,                      LV_PART_MAIN);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Device Info can grow as we add useful diagnostics, so keep this card scrollable.
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
 
     // Gather device info at run time
     uint32_t heap     = ESP.getFreeHeap();
@@ -1368,28 +1596,87 @@ void createDeviceInfo() {
     uint32_t cpuMHz   = ESP.getCpuFreqMHz();
     const char *firmwareVer = FIRMWARE_VERSION;
 
-    // WiFi MAC
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+#if BATTERY_METER_ENABLED
+    int battRaw = 0;
+    float battVolts = 0.0f;
+    int battPct = 0;
+    readBatterySnapshot(&battRaw, &battVolts, &battPct);
+#endif
 
-    char info[320];
+    // Device MAC addresses
+    uint8_t staMac[6];
+    uint8_t apMac[6];
+    uint8_t btMac[6];
+    esp_read_mac(staMac, ESP_MAC_WIFI_STA);
+    esp_read_mac(apMac,  ESP_MAC_WIFI_SOFTAP);
+    esp_read_mac(btMac,  ESP_MAC_BT);
+
+    char staMacStr[18];
+    char apMacStr[18];
+    char btMacStr[18];
+    snprintf(staMacStr, sizeof(staMacStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             staMac[0], staMac[1], staMac[2], staMac[3], staMac[4], staMac[5]);
+    snprintf(apMacStr, sizeof(apMacStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             apMac[0], apMac[1], apMac[2], apMac[3], apMac[4], apMac[5]);
+    snprintf(btMacStr, sizeof(btMacStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             btMac[0], btMac[1], btMac[2], btMac[3], btMac[4], btMac[5]);
+
+    uint64_t efuseMac = ESP.getEfuseMac();
+
+    char info[900];
+#if BATTERY_METER_ENABLED
     snprintf(info, sizeof(info),
-             "FW   : %s\n"
-             "Chip : ESP32-S3  (%d cores)\n"
-             "CPU  : %lu MHz\n"
-             "Flash: %lu KB @ %lu MHz\n"
-             "Heap : %lu B free\n"
-             "MAC  : %s",
+             "FW       : %s\n"
+             "Chip     : ESP32-S3  (%d cores)\n"
+             "CPU      : %lu MHz\n"
+             "Flash    : %lu KB @ %lu MHz\n"
+             "Heap     : %lu B free\n"
+             "Battery  : %.2fV  %d%%  raw:%d\n"
+             "Device MAC: %s\n"
+             "WiFi STA : %s\n"
+             "WiFi AP  : %s\n"
+             "BLE MAC  : %s\n"
+             "eFuse ID : %04X%08lX",
              firmwareVer,
              cores,
              (unsigned long)cpuMHz,
              (unsigned long)flash,
              (unsigned long)flashSpd,
              (unsigned long)heap,
-             macStr);
+             battVolts,
+             battPct,
+             battRaw,
+             staMacStr,
+             staMacStr,
+             apMacStr,
+             btMacStr,
+             (uint16_t)(efuseMac >> 32),
+             (unsigned long)(efuseMac & 0xFFFFFFFF));
+#else
+    snprintf(info, sizeof(info),
+             "FW       : %s\n"
+             "Chip     : ESP32-S3  (%d cores)\n"
+             "CPU      : %lu MHz\n"
+             "Flash    : %lu KB @ %lu MHz\n"
+             "Heap     : %lu B free\n"
+             "Device MAC: %s\n"
+             "WiFi STA : %s\n"
+             "WiFi AP  : %s\n"
+             "BLE MAC  : %s\n"
+             "eFuse ID : %04X%08lX",
+             firmwareVer,
+             cores,
+             (unsigned long)cpuMHz,
+             (unsigned long)flash,
+             (unsigned long)flashSpd,
+             (unsigned long)heap,
+             staMacStr,
+             staMacStr,
+             apMacStr,
+             btMacStr,
+             (uint16_t)(efuseMac >> 32),
+             (unsigned long)(efuseMac & 0xFFFFFFFF));
+#endif
     lv_obj_t *infoLbl = lv_label_create(card);
     lv_label_set_text(infoLbl, info);
     lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
@@ -1400,6 +1687,7 @@ void createDeviceInfo() {
     lv_obj_t *backBtn = createBackBtn(miscToolScreen, cb_miscToolBack);
     deleteGroup(&miscToolGroup);
     miscToolGroup = lv_group_create();
+    lv_group_add_obj(miscToolGroup, card);     // Focus card first so encoder can scroll Device Info.
     lv_group_add_obj(miscToolGroup, backBtn);
     setGroup(miscToolGroup);
 
@@ -1865,6 +2153,338 @@ void createBrightnessControl() {
     lv_screen_load_anim(miscToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
+
+
+// ════════════════════════════════════════════════════════════════
+//  MISC TOOL 3A – ALERT SOUND VOLUME
+//
+//  Controls detection alert chirp volume at runtime.
+//  Menu feedback volume remains separate.
+//  Level resets after reboot and starts from SOUND_VOLUME_PERCENT.
+// ════════════════════════════════════════════════════════════════
+static lv_obj_t *alertVolBar       = nullptr;
+static lv_obj_t *alertVolPctLbl    = nullptr;
+static lv_obj_t *alertVolHintLbl   = nullptr;
+static lv_obj_t *alertVolDownBtn   = nullptr;
+static lv_obj_t *alertVolUpBtn     = nullptr;
+static lv_obj_t *alertVolBackBtn   = nullptr;
+static unsigned long alertVolLastAdjustMs = 0;
+
+static void applyAlertSoundVolume(bool previewTone = false) {
+    resetInactivityTimer();
+
+    if (alertSoundVolumePercent < SOUND_VOLUME_MIN_PERCENT) {
+        alertSoundVolumePercent = SOUND_VOLUME_MIN_PERCENT;
+    }
+    if (alertSoundVolumePercent > SOUND_VOLUME_MAX_PERCENT) {
+        alertSoundVolumePercent = SOUND_VOLUME_MAX_PERCENT;
+    }
+
+    if (alertVolBar) {
+        lv_bar_set_value(alertVolBar, alertSoundVolumePercent, LV_ANIM_ON);
+    }
+
+    if (alertVolPctLbl) {
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%d%%", alertSoundVolumePercent);
+        lv_label_set_text(alertVolPctLbl, buf);
+    }
+
+    updateAlertVolumeMenuLabel();
+
+    // Safety note:
+    // Do NOT play a preview tone from this page. Earlier testing showed that
+    // extra I2S activity during volume adjustment could make the T-Embed think
+    // the power/encoder button was being held and trigger the power-off screen.
+    (void)previewTone;
+}
+
+static void updateAlertVolumeHint(const char *msg) {
+    if (!alertVolHintLbl) return;
+    lv_label_set_text(alertVolHintLbl, msg);
+}
+
+static void armAlertVolumeAutoSet() {
+    alertVolPendingAutoSet = true;
+    alertVolLastAdjustMs = millis();
+    updateAlertVolumeHint("Release to set...");
+}
+
+static void alertVolumeAutoSetTimerCb(lv_timer_t *timer) {
+    (void)timer;
+    if (!alertVolPendingAutoSet) return;
+
+    unsigned long now = millis();
+    if (now - alertVolLastAdjustMs < SOUND_VOLUME_AUTO_SET_MS) return;
+
+    alertVolPendingAutoSet = false;
+    updateAlertVolumeHint("Set. Back highlighted.");
+
+    // Highlight/focus Back after the chosen value sits for a moment.
+    if (miscToolGroup && alertVolBackBtn) {
+        lv_group_focus_obj(alertVolBackBtn);
+    }
+}
+
+static void cb_alertVolDown(lv_event_t *e) {
+    (void)e;
+    alertSoundVolumePercent -= SOUND_VOLUME_STEP_PERCENT;
+    applyAlertSoundVolume(false);
+    armAlertVolumeAutoSet();
+}
+
+static void cb_alertVolUp(lv_event_t *e) {
+    (void)e;
+    alertSoundVolumePercent += SOUND_VOLUME_STEP_PERCENT;
+    applyAlertSoundVolume(false);
+    armAlertVolumeAutoSet();
+}
+
+void createAlertSoundVolumeControl() {
+    alertVolBar       = nullptr;
+    alertVolPctLbl    = nullptr;
+    alertVolHintLbl   = nullptr;
+    alertVolDownBtn   = nullptr;
+    alertVolUpBtn     = nullptr;
+    alertVolBackBtn   = nullptr;
+    alertVolPendingAutoSet = false;
+
+    if (alertVolAutoTimer) {
+        lv_timer_delete(alertVolAutoTimer);
+        alertVolAutoTimer = nullptr;
+    }
+
+    if (miscToolScreen) { lv_obj_delete(miscToolScreen); miscToolScreen = nullptr; }
+    miscToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(miscToolScreen);
+    createHeader(miscToolScreen, LV_SYMBOL_AUDIO "  Alert Volume");
+
+    // Current percentage label
+    alertVolPctLbl = lv_label_create(miscToolScreen);
+    lv_obj_set_style_text_color(alertVolPctLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(alertVolPctLbl, LV_ALIGN_CENTER, 0, -30);
+
+    // Small status/instruction label
+    alertVolHintLbl = lv_label_create(miscToolScreen);
+    lv_label_set_text(alertVolHintLbl, "Use -/+ then wait to set");
+    lv_obj_set_style_text_color(alertVolHintLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_align(alertVolHintLbl, LV_ALIGN_CENTER, 0, -14);
+
+    // Detection alert volume bar
+    alertVolBar = lv_bar_create(miscToolScreen);
+    lv_obj_set_size(alertVolBar, SCREEN_W - 32, 16);
+    lv_obj_align(alertVolBar, LV_ALIGN_CENTER, 0, 0);
+    lv_bar_set_range(alertVolBar, SOUND_VOLUME_MIN_PERCENT, SOUND_VOLUME_MAX_PERCENT);
+    lv_obj_set_style_bg_color(alertVolBar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(alertVolBar, lv_color_hex(TH.accent), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(alertVolBar, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(alertVolBar, 4, LV_PART_INDICATOR);
+
+    // – button
+    alertVolDownBtn = lv_btn_create(miscToolScreen);
+    lv_obj_set_size(alertVolDownBtn, 52, 30);
+    lv_obj_align(alertVolDownBtn, LV_ALIGN_CENTER, -46, 36);
+    lv_obj_set_style_bg_color(alertVolDownBtn, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_radius(alertVolDownBtn, 6, LV_PART_MAIN);
+    lv_obj_add_event_cb(alertVolDownBtn, cb_alertVolDown, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *dLbl = lv_label_create(alertVolDownBtn);
+    lv_label_set_text(dLbl, LV_SYMBOL_MINUS);
+    lv_obj_center(dLbl);
+
+    // + button
+    alertVolUpBtn = lv_btn_create(miscToolScreen);
+    lv_obj_set_size(alertVolUpBtn, 52, 30);
+    lv_obj_align(alertVolUpBtn, LV_ALIGN_CENTER, 46, 36);
+    lv_obj_set_style_bg_color(alertVolUpBtn, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_radius(alertVolUpBtn, 6, LV_PART_MAIN);
+    lv_obj_add_event_cb(alertVolUpBtn, cb_alertVolUp, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *uLbl = lv_label_create(alertVolUpBtn);
+    lv_label_set_text(uLbl, LV_SYMBOL_PLUS);
+    lv_obj_center(uLbl);
+
+    alertVolBackBtn = createBackBtn(miscToolScreen, cb_miscToolBack);
+    deleteGroup(&miscToolGroup);
+    miscToolGroup = lv_group_create();
+    lv_group_add_obj(miscToolGroup, alertVolDownBtn);
+    lv_group_add_obj(miscToolGroup, alertVolUpBtn);
+    lv_group_add_obj(miscToolGroup, alertVolBackBtn);
+    setGroup(miscToolGroup);
+    lv_group_focus_obj(alertVolDownBtn);
+
+    alertVolAutoTimer = lv_timer_create(alertVolumeAutoSetTimerCb, 100, nullptr);
+
+    setAllLEDs(MENU_COLORS[2].r, MENU_COLORS[2].g, MENU_COLORS[2].b, LED_BRIGHTNESS);
+
+    // Set bar and label to current value
+    applyAlertSoundVolume(false);
+
+    lv_screen_load_anim(miscToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MISC TOOL 3B – MENU FEEDBACK VOLUME
+//
+//  Controls encoder/menu feedback volume at runtime.
+//  Detection alert chirp volume still uses SOUND_VOLUME_PERCENT.
+//  Level resets after reboot and starts from MENU_FEEDBACK_VOLUME_PERCENT.
+// ════════════════════════════════════════════════════════════════
+static lv_obj_t *menuVolBar       = nullptr;
+static lv_obj_t *menuVolPctLbl    = nullptr;
+static lv_obj_t *menuVolHintLbl   = nullptr;
+static lv_obj_t *menuVolDownBtn   = nullptr;
+static lv_obj_t *menuVolUpBtn     = nullptr;
+static lv_obj_t *menuVolBackBtn   = nullptr;
+static unsigned long menuVolLastAdjustMs = 0;
+
+static void applyMenuFeedbackVolume(bool previewTone = false) {
+    resetInactivityTimer();
+
+    if (menuFeedbackVolumePercent < MENU_FEEDBACK_VOLUME_MIN_PERCENT) {
+        menuFeedbackVolumePercent = MENU_FEEDBACK_VOLUME_MIN_PERCENT;
+    }
+    if (menuFeedbackVolumePercent > MENU_FEEDBACK_VOLUME_MAX_PERCENT) {
+        menuFeedbackVolumePercent = MENU_FEEDBACK_VOLUME_MAX_PERCENT;
+    }
+
+    if (menuVolBar) {
+        lv_bar_set_value(menuVolBar, menuFeedbackVolumePercent, LV_ANIM_ON);
+    }
+
+    if (menuVolPctLbl) {
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%d%%", menuFeedbackVolumePercent);
+        lv_label_set_text(menuVolPctLbl, buf);
+    }
+
+    // Safety note:
+    // Do NOT play a preview tone from this page. Earlier testing showed that
+    // extra I2S activity during volume adjustment could make the T-Embed think
+    // the power/encoder button was being held and trigger the power-off screen.
+    (void)previewTone;
+}
+
+static void updateMenuVolumeHint(const char *msg) {
+    if (!menuVolHintLbl) return;
+    lv_label_set_text(menuVolHintLbl, msg);
+}
+
+static void armMenuVolumeAutoSet() {
+    menuVolPendingAutoSet = true;
+    menuVolLastAdjustMs = millis();
+    updateMenuVolumeHint("Release to set...");
+}
+
+static void menuVolumeAutoSetTimerCb(lv_timer_t *timer) {
+    (void)timer;
+    if (!menuVolPendingAutoSet) return;
+
+    unsigned long now = millis();
+    if (now - menuVolLastAdjustMs < MENU_FEEDBACK_VOLUME_AUTO_SET_MS) return;
+
+    menuVolPendingAutoSet = false;
+    updateMenuVolumeHint("Set. Back highlighted.");
+
+    // Highlight/focus Back after the chosen value sits for a moment.
+    if (miscToolGroup && menuVolBackBtn) {
+        lv_group_focus_obj(menuVolBackBtn);
+    }
+}
+
+static void cb_menuVolDown(lv_event_t *e) {
+    (void)e;
+    menuFeedbackVolumePercent -= MENU_FEEDBACK_VOLUME_STEP_PERCENT;
+    applyMenuFeedbackVolume(false);
+    armMenuVolumeAutoSet();
+}
+
+static void cb_menuVolUp(lv_event_t *e) {
+    (void)e;
+    menuFeedbackVolumePercent += MENU_FEEDBACK_VOLUME_STEP_PERCENT;
+    applyMenuFeedbackVolume(false);
+    armMenuVolumeAutoSet();
+}
+
+void createMenuFeedbackVolumeControl() {
+    menuVolBar       = nullptr;
+    menuVolPctLbl    = nullptr;
+    menuVolHintLbl   = nullptr;
+    menuVolDownBtn   = nullptr;
+    menuVolUpBtn     = nullptr;
+    menuVolBackBtn   = nullptr;
+    menuVolPendingAutoSet = false;
+
+    if (menuVolAutoTimer) {
+        lv_timer_delete(menuVolAutoTimer);
+        menuVolAutoTimer = nullptr;
+    }
+
+    if (miscToolScreen) { lv_obj_delete(miscToolScreen); miscToolScreen = nullptr; }
+    miscToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(miscToolScreen);
+    createHeader(miscToolScreen, LV_SYMBOL_AUDIO "  Menu Volume");
+
+    // Current percentage label
+    menuVolPctLbl = lv_label_create(miscToolScreen);
+    lv_obj_set_style_text_color(menuVolPctLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(menuVolPctLbl, LV_ALIGN_CENTER, 0, -30);
+
+    // Small status/instruction label
+    menuVolHintLbl = lv_label_create(miscToolScreen);
+    lv_label_set_text(menuVolHintLbl, "Use -/+ then wait to set");
+    lv_obj_set_style_text_color(menuVolHintLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_align(menuVolHintLbl, LV_ALIGN_CENTER, 0, -14);
+
+    // Menu feedback volume bar
+    menuVolBar = lv_bar_create(miscToolScreen);
+    lv_obj_set_size(menuVolBar, SCREEN_W - 32, 16);
+    lv_obj_align(menuVolBar, LV_ALIGN_CENTER, 0, 0);
+    lv_bar_set_range(menuVolBar, MENU_FEEDBACK_VOLUME_MIN_PERCENT, MENU_FEEDBACK_VOLUME_MAX_PERCENT);
+    lv_obj_set_style_bg_color(menuVolBar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(menuVolBar, lv_color_hex(TH.accent), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(menuVolBar, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(menuVolBar, 4, LV_PART_INDICATOR);
+
+    // – button
+    menuVolDownBtn = lv_btn_create(miscToolScreen);
+    lv_obj_set_size(menuVolDownBtn, 52, 30);
+    lv_obj_align(menuVolDownBtn, LV_ALIGN_CENTER, -46, 36);
+    lv_obj_set_style_bg_color(menuVolDownBtn, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_radius(menuVolDownBtn, 6, LV_PART_MAIN);
+    lv_obj_add_event_cb(menuVolDownBtn, cb_menuVolDown, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *dLbl = lv_label_create(menuVolDownBtn);
+    lv_label_set_text(dLbl, LV_SYMBOL_MINUS);
+    lv_obj_center(dLbl);
+
+    // + button
+    menuVolUpBtn = lv_btn_create(miscToolScreen);
+    lv_obj_set_size(menuVolUpBtn, 52, 30);
+    lv_obj_align(menuVolUpBtn, LV_ALIGN_CENTER, 46, 36);
+    lv_obj_set_style_bg_color(menuVolUpBtn, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_radius(menuVolUpBtn, 6, LV_PART_MAIN);
+    lv_obj_add_event_cb(menuVolUpBtn, cb_menuVolUp, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *uLbl = lv_label_create(menuVolUpBtn);
+    lv_label_set_text(uLbl, LV_SYMBOL_PLUS);
+    lv_obj_center(uLbl);
+
+    menuVolBackBtn = createBackBtn(miscToolScreen, cb_miscToolBack);
+    deleteGroup(&miscToolGroup);
+    miscToolGroup = lv_group_create();
+    lv_group_add_obj(miscToolGroup, menuVolDownBtn);
+    lv_group_add_obj(miscToolGroup, menuVolUpBtn);
+    lv_group_add_obj(miscToolGroup, menuVolBackBtn);
+    setGroup(miscToolGroup);
+    lv_group_focus_obj(menuVolDownBtn);
+
+    menuVolAutoTimer = lv_timer_create(menuVolumeAutoSetTimerCb, 100, nullptr);
+
+    setAllLEDs(MENU_COLORS[2].r, MENU_COLORS[2].g, MENU_COLORS[2].b, LED_BRIGHTNESS);
+
+    // Set bar and label to current value
+    applyMenuFeedbackVolume(false);
+
+    lv_screen_load_anim(miscToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
 // ════════════════════════════════════════════════════════════════
 //  MISC TOOL 4 – THEME PICKER
 //
@@ -2090,7 +2710,11 @@ void createGPSStats() {
     lv_obj_set_style_border_width(card, 1,                      LV_PART_MAIN);
     lv_obj_set_style_radius(card,       6,                      LV_PART_MAIN);
     lv_obj_set_style_pad_all(card,      6,                      LV_PART_MAIN);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Device Info can grow as we add useful diagnostics, so keep this card scrollable.
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
 
     const int rowH = 18;
 
@@ -2627,6 +3251,13 @@ static int doWiFiScan() {
     return n;
 }
 
+// Deauth Detector UI object pointers.
+// Kept above shared back/cleanup callbacks so those callbacks can safely clear them.
+static lv_obj_t *deauthCountLbl  = nullptr;
+static lv_obj_t *deauthEventList = nullptr;
+static lv_obj_t *deauthStatsLbl  = nullptr;
+static lv_obj_t *deauthStatsBar  = nullptr;
+
 // ════════════════════════════════════════════════════════════════
 //  SHARED BACK CALLBACKS
 // ════════════════════════════════════════════════════════════════
@@ -2660,6 +3291,10 @@ static void cb_wifiToolBack(lv_event_t *e) {
         stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
     }
     if (deauthTimer) { lv_timer_delete(deauthTimer); deauthTimer = nullptr; }
+    deauthCountLbl = nullptr;
+    deauthStatsLbl = nullptr;
+    deauthStatsBar = nullptr;
+    deauthEventList = nullptr;
     if (pwnTimer)    { lv_timer_delete(pwnTimer);    pwnTimer    = nullptr; }
     if (flockTimer)  { lv_timer_delete(flockTimer);  flockTimer  = nullptr; }
     if (hybridStartTimer) { lv_timer_delete(hybridStartTimer); hybridStartTimer = nullptr; }
@@ -2856,9 +3491,6 @@ typedef struct {
     uint16_t seqCtrl;
 } __attribute__((packed)) Dot11MgmtHdr;
 
-static lv_obj_t *deauthCountLbl  = nullptr;
-static lv_obj_t *deauthEventList = nullptr;
-
 static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!deauthActive || type != WIFI_PKT_MGMT) return;
 
@@ -2885,11 +3517,113 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     deauthLog[slot].reason  = (pkt->rx_ctrl.sig_len >= 26)
                               ? (uint16_t)(data[24] | (data[25] << 8))
                               : 0;
+    deauthLog[slot].rssi    = pkt->rx_ctrl.rssi;
+
+    deauthRssiSum += pkt->rx_ctrl.rssi;
+    if (deauthRssiCount < 9999) deauthRssiCount++;
+    if (pkt->rx_ctrl.rssi > deauthStrongestRSSI) deauthStrongestRSSI = pkt->rx_ctrl.rssi;
+
     deauthHead = (deauthHead + 1) % MAX_DEAUTH;
+}
+
+
+static int deauthUniqueRecentSources(int total) {
+    int unique = 0;
+    char seen[MAX_DEAUTH][18];
+    memset(seen, 0, sizeof(seen));
+
+    for (int i = 0; i < total; i++) {
+        int slot = ((deauthHead - 1 - i) + MAX_DEAUTH) % MAX_DEAUTH;
+        bool exists = false;
+        for (int j = 0; j < unique; j++) {
+            if (strncmp(seen[j], deauthLog[slot].src, 18) == 0) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists && unique < MAX_DEAUTH) {
+            strncpy(seen[unique], deauthLog[slot].src, 17);
+            seen[unique][17] = '\0';
+            unique++;
+        }
+    }
+    return unique;
+}
+
+static int deauthAverageRSSI() {
+    int count = deauthRssiCount;
+    if (count <= 0) return -100;
+    return (int)(deauthRssiSum / count);
+}
+
+static const char *deauthLastSource() {
+    static char lastSrc[18];
+    if (deauthTotal <= 0) {
+        snprintf(lastSrc, sizeof(lastSrc), "--:--:--:--:--:--");
+        return lastSrc;
+    }
+    int slot = ((deauthHead - 1) + MAX_DEAUTH) % MAX_DEAUTH;
+    snprintf(lastSrc, sizeof(lastSrc), "%s", deauthLog[slot].src);
+    return lastSrc;
+}
+
+static void updateDeauthRate() {
+    uint32_t now = millis();
+    if (deauthLastRateMs == 0) {
+        deauthLastRateMs = now;
+        deauthLastRateTotal = deauthTotal;
+        deauthCurrentRate = 0;
+        return;
+    }
+
+    uint32_t elapsed = now - deauthLastRateMs;
+    if (elapsed < 250) return;
+
+    int delta = deauthTotal - deauthLastRateTotal;
+    if (delta < 0) delta = 0;
+    deauthCurrentRate = (int)((delta * 1000UL) / elapsed);
+    deauthLastRateMs = now;
+    deauthLastRateTotal = deauthTotal;
+}
+
+static void formatDeauthStats(char *buf, size_t len, bool compact) {
+    int totalRecent = (deauthTotal < MAX_DEAUTH) ? deauthTotal : MAX_DEAUTH;
+    int avgRssi = deauthAverageRSSI();
+    int strongest = (deauthRssiCount > 0) ? deauthStrongestRSSI : -100;
+    int uniqueSources = deauthUniqueRecentSources(totalRecent);
+
+    if (compact) {
+        snprintf(buf, len,
+                 "Rate:%d/s  Ch:%d  Avg:%d  Strong:%d\nUnique:%d  Last:%s",
+                 deauthCurrentRate,
+                 deauthChannel,
+                 avgRssi,
+                 strongest,
+                 uniqueSources,
+                 deauthLastSource());
+    } else {
+        snprintf(buf, len,
+                 "Total Frames : %d\n"
+                 "Packet/sec   : %d\n"
+                 "Current Ch   : %d\n"
+                 "Avg RSSI     : %d dBm\n"
+                 "Strongest    : %d dBm\n"
+                 "Unique Src   : %d recent\n"
+                 "Last Source  : %s",
+                 deauthTotal,
+                 deauthCurrentRate,
+                 deauthChannel,
+                 avgRssi,
+                 strongest,
+                 uniqueSources,
+                 deauthLastSource());
+    }
 }
 
 static void deauth_refresh_cb(lv_timer_t *) {
     if (!deauthCountLbl || !deauthEventList) return;
+
+    updateDeauthRate();
 
     if (deauthTotal > deauthSoundedTotal) {
         playDeauthChirp();
@@ -2904,6 +3638,18 @@ static void deauth_refresh_cb(lv_timer_t *) {
         deauthTotal > 0 ? lv_color_hex(TH.alert) : lv_color_hex(TH.success),
         LV_PART_MAIN);
 
+    if (deauthStatsLbl) {
+        char stats[128];
+        formatDeauthStats(stats, sizeof(stats), true);
+        lv_label_set_text(deauthStatsLbl, stats);
+        lv_obj_set_style_text_color(deauthStatsLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    }
+    if (deauthStatsBar) {
+        int barRssi = (deauthRssiCount > 0) ? deauthStrongestRSSI : -100;
+        lv_bar_set_value(deauthStatsBar, barRssi, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(deauthStatsBar, rssiColor(barRssi), LV_PART_INDICATOR);
+    }
+
     lv_obj_clean(deauthEventList);
     int total = (deauthTotal < MAX_DEAUTH) ? deauthTotal : MAX_DEAUTH;
 
@@ -2916,14 +3662,76 @@ static void deauth_refresh_cb(lv_timer_t *) {
     for (int i = 0; i < total; i++) {
         int slot = ((deauthHead - 1 - i) + MAX_DEAUTH) % MAX_DEAUTH;
         char row[60];
-        snprintf(row, sizeof(row), "Ch%d  %s  [R:%d]",
+        snprintf(row, sizeof(row), "Ch%d  %s  %ddBm [R:%d]",
                  deauthLog[slot].channel,
                  deauthLog[slot].src,
+                 deauthLog[slot].rssi,
                  deauthLog[slot].reason);
         lv_obj_t *entry = lv_list_add_text(deauthEventList, row);
         if (entry)
             lv_obj_set_style_text_color(entry, lv_color_hex(TH.alert), LV_PART_MAIN);
     }
+}
+
+
+static void cb_deauthStatsBack(lv_event_t *e) {
+    wifiDetailScreen = nullptr;
+    setGroup(wifiToolGroup);
+    lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, true);
+}
+
+static void cb_deauthStatsOpen(lv_event_t *e) {
+    createDeauthStats();
+}
+
+void createDeauthStats() {
+    if (wifiDetailScreen) { lv_obj_delete(wifiDetailScreen); wifiDetailScreen = nullptr; }
+    wifiDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiDetailScreen);
+    createHeader(wifiDetailScreen, LV_SYMBOL_WARNING "  Deauth Stats");
+
+    updateDeauthRate();
+
+    lv_obj_t *card = lv_obj_create(wifiDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 40);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card,      lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,        LV_OPA_COVER,           LV_PART_MAIN);
+    lv_obj_set_style_border_color(card,  lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card,  1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,        6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,       6, LV_PART_MAIN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    char info[260];
+    formatDeauthStats(info, sizeof(info), false);
+
+    lv_obj_t *infoLbl = lv_label_create(card);
+    lv_label_set_text(infoLbl, info);
+    lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(infoLbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(infoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(infoLbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    int barRssi = (deauthRssiCount > 0) ? deauthStrongestRSSI : -100;
+    lv_obj_t *bar = lv_bar_create(wifiDetailScreen);
+    lv_obj_set_size(bar, SCREEN_W - 12, 5);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
+    lv_bar_set_range(bar, -100, -30);
+    lv_bar_set_value(bar, barRssi, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, rssiColor(barRssi), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar,   3, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar,   3, LV_PART_INDICATOR);
+
+    lv_obj_t *backBtn = createBackBtn(wifiDetailScreen, cb_deauthStatsBack);
+
+    deleteGroup(&wifiDetailGroup);
+    wifiDetailGroup = lv_group_create();
+    lv_group_add_obj(wifiDetailGroup, backBtn);
+    setGroup(wifiDetailGroup);
+
+    lv_screen_load_anim(wifiDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
 void createDeauthDetector() {
@@ -2943,9 +3751,26 @@ void createDeauthDetector() {
     lv_obj_set_style_text_color(hopLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_align(hopLbl, LV_ALIGN_TOP_RIGHT, -8, 30);
 
+    deauthStatsLbl = lv_label_create(wifiToolScreen);
+    lv_label_set_text(deauthStatsLbl, "Rate:0/s  Ch:1  Avg:--  Strong:--\nUnique:0  Last:--:--:--:--:--:--");
+    lv_label_set_long_mode(deauthStatsLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(deauthStatsLbl, SCREEN_W - 16);
+    lv_obj_set_style_text_color(deauthStatsLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(deauthStatsLbl, 8, 48);
+
+    deauthStatsBar = lv_bar_create(wifiToolScreen);
+    lv_obj_set_size(deauthStatsBar, SCREEN_W - 16, 5);
+    lv_obj_set_pos(deauthStatsBar, 8, 83);
+    lv_bar_set_range(deauthStatsBar, -100, -30);
+    lv_bar_set_value(deauthStatsBar, -100, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(deauthStatsBar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(deauthStatsBar, lv_color_hex(TH.textDim), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(deauthStatsBar, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(deauthStatsBar, 3, LV_PART_INDICATOR);
+
     deauthEventList = lv_list_create(wifiToolScreen);
-    lv_obj_set_size(deauthEventList, SCREEN_W, SCREEN_H - 80);
-    lv_obj_set_pos(deauthEventList, 0, 48);
+    lv_obj_set_size(deauthEventList, SCREEN_W, SCREEN_H - 128);
+    lv_obj_set_pos(deauthEventList, 0, 93);
     lv_obj_set_style_bg_color(deauthEventList, lv_color_hex(TH.bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(deauthEventList,   LV_OPA_COVER,           LV_PART_MAIN);
     lv_obj_set_style_border_width(deauthEventList, 0, LV_PART_MAIN);
@@ -2958,15 +3783,24 @@ void createDeauthDetector() {
         lv_obj_set_style_text_color(initLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
 
     lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
+    lv_obj_t *statsBtn = createActionBtn(wifiToolScreen, "Stats", cb_deauthStatsOpen);
+
     deleteGroup(&wifiToolGroup);
     wifiToolGroup = lv_group_create();
     lv_group_add_obj(wifiToolGroup, backBtn);
+    lv_group_add_obj(wifiToolGroup, statsBtn);
     setGroup(wifiToolGroup);
 
     // Start sniffer
     deauthTotal  = 0;
     deauthHead   = 0;
     deauthSoundedTotal = 0;
+    deauthRssiSum = 0;
+    deauthRssiCount = 0;
+    deauthStrongestRSSI = -127;
+    deauthCurrentRate = 0;
+    deauthLastRateMs = 0;
+    deauthLastRateTotal = 0;
     deauthActive = true;
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -4602,7 +5436,8 @@ static int doBLEScan(int durationSec, BLEDeviceType filterType) {
 //  Pwnagotchi broadcasts 802.11 beacon frames with a hardcoded
 //  source MAC of de:ad:be:ef:de:ad. The SSID field carries a JSON
 //  blob: {"name":"pikachu","pwnd_tot":42,...}
-//  We run promiscuous mode and sniff for those beacons.
+//  We run promiscuous mode and sniff for those beacons. This parser
+//  also pulls Minigotchi-style fields such as pal/minigotchi when present.
 //
 //  Beacon frame layout (bytes):
 //    [0-1]   Frame Control  (0x80 0x00)
@@ -4616,6 +5451,7 @@ static int doBLEScan(int durationSec, BLEDeviceType filterType) {
 // ════════════════════════════════════════════════════════════════
 static lv_obj_t *pwnStatusLbl = nullptr;
 static lv_obj_t *pwnList      = nullptr;
+static lv_obj_t *pwnBackBtn   = nullptr;
 
 // ISR-safe: just verify the MAC and copy the raw SSID/BSSID into
 // the pending slot. The refresh timer does the JSON parsing.
@@ -4645,8 +5481,66 @@ static void IRAM_ATTR pwn_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type
     snprintf(pwnPendingBSSID, sizeof(pwnPendingBSSID),
              "%02X:%02X:%02X:%02X:%02X:%02X",
              d[16], d[17], d[18], d[19], d[20], d[21]);
-    pwnPendingRSSI  = pkt->rx_ctrl.rssi;
-    pwnPendingReady = true;
+    pwnPendingRSSI    = pkt->rx_ctrl.rssi;
+    pwnPendingChannel = deauthChannel;
+    pwnPendingReady   = true;
+}
+
+// Tiny JSON helpers for the simple Pwnagotchi beacon payload.
+// These avoid adding ArduinoJson just for a few fields.
+static bool pwnJsonString(const char *json, const char *key, char *out, size_t outLen) {
+    if (!json || !key || !out || outLen == 0) return false;
+    out[0] = '\0';
+
+    char needle[32];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+
+    char *start = strstr((char *)json, needle);
+    if (!start) return false;
+    start += strlen(needle);
+
+    char *end = strchr(start, '"');
+    if (!end) return false;
+
+    size_t n = (size_t)(end - start);
+    if (n >= outLen) n = outLen - 1;
+    memcpy(out, start, n);
+    out[n] = '\0';
+    return true;
+}
+
+static bool pwnJsonInt(const char *json, const char *key, int *out) {
+    if (!json || !key || !out) return false;
+
+    char needle[32];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+
+    char *start = strstr((char *)json, needle);
+    if (!start) return false;
+    start += strlen(needle);
+
+    *out = atoi(start);
+    return true;
+}
+
+static bool pwnJsonBool(const char *json, const char *key) {
+    if (!json || !key) return false;
+
+    char needle[32];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+
+    char *start = strstr((char *)json, needle);
+    if (!start) return false;
+    start += strlen(needle);
+    while (*start == ' ' || *start == '\t') start++;
+
+    return (strncmp(start, "true", 4) == 0 || strncmp(start, "1", 1) == 0);
+}
+
+static const char *pwnDeviceType(const PwnEntry &e) {
+    if (e.minigotchi) return "Minigotchi";
+    if (e.pal)        return "Palnagotchi";
+    return "Pwnagotchi";
 }
 
 // Parse a pending SSID JSON blob and update pwnEntries[].
@@ -4658,35 +5552,32 @@ static void processPwnPending() {
     char ssid[PWN_BUF_LEN];
     char bssid[18];
     int8_t rssi = pwnPendingRSSI;
+    uint8_t ch = pwnPendingChannel;
     memcpy(ssid,  pwnPendingSSID,  PWN_BUF_LEN);
     memcpy(bssid, pwnPendingBSSID, 18);
     pwnPendingReady = false;
 
-    // Parse "name":"..." from JSON
+    // Parse useful Pwnagotchi / Minigotchi fields.
     char name[33] = "<unknown>";
-    char *ns = strstr(ssid, "\"name\":\"");
-    if (ns) {
-        ns += 8;
-        char *ne = strchr(ns, '"');
-        if (ne) {
-            int nl = (int)(ne - ns);
-            if (nl > 32) nl = 32;
-            memcpy(name, ns, nl);
-            name[nl] = '\0';
-        }
-    }
+    pwnJsonString(ssid, "name", name, sizeof(name));
 
-    // Parse "pwnd_tot":N
     int pwnd = 0;
-    char *ps = strstr(ssid, "\"pwnd_tot\":");
-    if (ps) pwnd = atoi(ps + 11);
+    pwnJsonInt(ssid, "pwnd_tot", &pwnd);
+
+    bool pal = pwnJsonBool(ssid, "pal");
+    bool minigotchi = pwnJsonBool(ssid, "minigotchi");
 
     // Update existing entry by name, or add new one
     for (int i = 0; i < pwnCount; i++) {
         if (strcmp(pwnEntries[i].name, name) == 0) {
-            pwnEntries[i].rssi     = rssi;
-            pwnEntries[i].pwnd_tot = pwnd;
-            pwnEntries[i].lastSeen = millis();
+            pwnEntries[i].rssi       = rssi;
+            pwnEntries[i].channel    = ch;
+            pwnEntries[i].pwnd_tot   = pwnd;
+            pwnEntries[i].pal        = pal;
+            pwnEntries[i].minigotchi = minigotchi;
+            strncpy(pwnEntries[i].rawJson, ssid, sizeof(pwnEntries[i].rawJson) - 1);
+            pwnEntries[i].rawJson[sizeof(pwnEntries[i].rawJson) - 1] = '\0';
+            pwnEntries[i].lastSeen   = millis();
             return;
         }
     }
@@ -4695,9 +5586,14 @@ static void processPwnPending() {
     strncpy(pwnEntries[pwnCount].bssid, bssid, 17);
     pwnEntries[pwnCount].name[32]  = '\0';
     pwnEntries[pwnCount].bssid[17] = '\0';
-    pwnEntries[pwnCount].pwnd_tot  = pwnd;
-    pwnEntries[pwnCount].rssi      = rssi;
-    pwnEntries[pwnCount].lastSeen  = millis();
+    pwnEntries[pwnCount].pwnd_tot   = pwnd;
+    pwnEntries[pwnCount].pal        = pal;
+    pwnEntries[pwnCount].minigotchi = minigotchi;
+    pwnEntries[pwnCount].channel    = ch;
+    pwnEntries[pwnCount].rssi       = rssi;
+    strncpy(pwnEntries[pwnCount].rawJson, ssid, sizeof(pwnEntries[pwnCount].rawJson) - 1);
+    pwnEntries[pwnCount].rawJson[sizeof(pwnEntries[pwnCount].rawJson) - 1] = '\0';
+    pwnEntries[pwnCount].lastSeen   = millis();
     pwnCount++;
     playPwnagotchiChirp();
 }
@@ -4706,6 +5602,10 @@ static void pwn_refresh_cb(lv_timer_t *) {
     if (!pwnStatusLbl || !pwnList) return;
 
     processPwnPending();
+
+    // Keep parsing while the detail page is open, but do not rebuild the
+    // hidden list or steal encoder focus away from the detail screen.
+    if (lv_screen_active() != wifiToolScreen) return;
 
     // Status label
     if (pwnCount == 0) {
@@ -4723,29 +5623,117 @@ static void pwn_refresh_cb(lv_timer_t *) {
             lv_color_hex(TH.alert), LV_PART_MAIN);
     }
 
-    // Rebuild list
+    // Rebuild list and encoder group so results are selectable.
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    if (pwnBackBtn) lv_group_add_obj(wifiToolGroup, pwnBackBtn);
+
     lv_obj_clean(pwnList);
     if (pwnCount == 0) {
         lv_obj_t *e = lv_list_add_text(pwnList,
             "Hopping ch 1-13 — waiting for beacon...");
         if (e) lv_obj_set_style_text_color(e,
                     lv_color_hex(TH.textDim), LV_PART_MAIN);
+        setGroup(wifiToolGroup);
         return;
     }
 
     for (int i = 0; i < pwnCount; i++) {
         uint32_t ageSec = (millis() - pwnEntries[i].lastSeen) / 1000;
-        char row[64];
-        snprintf(row, sizeof(row), "%s  %ddBm  %d pwnd  %lus",
+        char row[80];
+        snprintf(row, sizeof(row), "%s  %s  Ch%d  %ddBm  %d pwnd  %lus",
+                 pwnDeviceType(pwnEntries[i]),
                  pwnEntries[i].name,
+                 pwnEntries[i].channel,
                  pwnEntries[i].rssi,
                  pwnEntries[i].pwnd_tot,
                  (unsigned long)ageSec);
-        lv_obj_t *entry = lv_list_add_text(pwnList, row);
-        if (entry)
-            lv_obj_set_style_text_color(entry,
-                lv_color_hex(TH.alert), LV_PART_MAIN);
+        lv_obj_t *btn = lv_list_add_btn(pwnList, nullptr, row);
+        styleListBtn(btn);
+        lv_obj_set_style_text_color(btn, lv_color_hex(TH.alert),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            createPwnagotchiDetail((int)(intptr_t)lv_event_get_user_data(ev));
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_group_add_obj(wifiToolGroup, btn);
     }
+    setGroup(wifiToolGroup);
+}
+
+void createPwnagotchiDetail(int idx) {
+    if (idx < 0 || idx >= pwnCount) return;
+
+    if (wifiDetailScreen) { lv_obj_delete(wifiDetailScreen); wifiDetailScreen = nullptr; }
+    wifiDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiDetailScreen);
+
+    char hdr[64];
+    snprintf(hdr, sizeof(hdr), LV_SYMBOL_EYE_OPEN "  %.20s", pwnEntries[idx].name);
+    createHeader(wifiDetailScreen, hdr);
+
+    lv_obj_t *card = lv_obj_create(wifiDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card,     lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,       LV_OPA_COVER,           LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,       6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,      6, LV_PART_MAIN);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+
+    uint32_t ageSec = (millis() - pwnEntries[idx].lastSeen) / 1000;
+    char info[520];
+    snprintf(info, sizeof(info),
+             "Type      : %s\n"
+             "Name      : %s\n"
+             "Pwnd Tot  : %d\n"
+             "RSSI      : %d dBm\n"
+             "Channel   : %d\n"
+             "BSSID     : %s\n"
+             "Source    : DE:AD:BE:EF:DE:AD\n"
+             "Pal       : %s\n"
+             "Minigotchi: %s\n"
+             "Age       : %lus\n\n"
+             "Raw JSON / SSID:\n%s",
+             pwnDeviceType(pwnEntries[idx]),
+             pwnEntries[idx].name,
+             pwnEntries[idx].pwnd_tot,
+             pwnEntries[idx].rssi,
+             pwnEntries[idx].channel,
+             pwnEntries[idx].bssid,
+             pwnEntries[idx].pal ? "yes" : "no",
+             pwnEntries[idx].minigotchi ? "yes" : "no",
+             (unsigned long)ageSec,
+             pwnEntries[idx].rawJson[0] ? pwnEntries[idx].rawJson : "<not available>");
+
+    lv_obj_t *infoLbl = lv_label_create(card);
+    lv_label_set_text(infoLbl, info);
+    lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(infoLbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(infoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(infoLbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *bar = lv_bar_create(wifiDetailScreen);
+    lv_obj_set_size(bar, SCREEN_W - 12, 5);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
+    lv_bar_set_range(bar, -100, -30);
+    lv_bar_set_value(bar, pwnEntries[idx].rssi, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, rssiColor(pwnEntries[idx].rssi), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
+
+    lv_obj_t *backBtn = createBackBtn(wifiDetailScreen, cb_wifiDetailBack);
+
+    deleteGroup(&wifiDetailGroup);
+    wifiDetailGroup = lv_group_create();
+    lv_group_add_obj(wifiDetailGroup, card);
+    lv_group_add_obj(wifiDetailGroup, backBtn);
+    setGroup(wifiDetailGroup);
+
+    lv_screen_load_anim(wifiDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
 void createPwnagotchiDetector() {
@@ -4754,6 +5742,7 @@ void createPwnagotchiDetector() {
     pwnPendingReady = false;
     pwnStatusLbl    = nullptr;
     pwnList         = nullptr;
+    pwnBackBtn      = nullptr;
     memset(pwnEntries, 0, sizeof(pwnEntries));
 
     if (wifiToolScreen) { lv_obj_delete(wifiToolScreen); wifiToolScreen = nullptr; }
@@ -4784,10 +5773,10 @@ void createPwnagotchiDetector() {
         lv_obj_set_style_text_color(initLbl,
             lv_color_hex(TH.textDim), LV_PART_MAIN);
 
-    lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
+    pwnBackBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
     deleteGroup(&wifiToolGroup);
     wifiToolGroup = lv_group_create();
-    lv_group_add_obj(wifiToolGroup, backBtn);
+    lv_group_add_obj(wifiToolGroup, pwnBackBtn);
     setGroup(wifiToolGroup);
 
     // Hot-pink LEDs to distinguish from deauth (green)
@@ -7017,6 +8006,10 @@ static void cleanupForAutoReturnHome(lv_obj_t *activeScr) {
     }
 
     if (deauthTimer) { lv_timer_delete(deauthTimer); deauthTimer = nullptr; }
+    deauthCountLbl = nullptr;
+    deauthStatsLbl = nullptr;
+    deauthStatsBar = nullptr;
+    deauthEventList = nullptr;
     if (pwnTimer)    { lv_timer_delete(pwnTimer);    pwnTimer    = nullptr; }
     if (flockTimer)  { lv_timer_delete(flockTimer);  flockTimer  = nullptr; }
     if (hybridStartTimer) { lv_timer_delete(hybridStartTimer); hybridStartTimer = nullptr; }
@@ -7088,14 +8081,25 @@ static void updateAutoReturnHome() {
 // ════════════════════════════════════════════════════════════════
 void setup() {
     Serial.begin(115200);
+    delay(300);
+
+    Serial.println();
+    Serial.println("====================================");
+    Serial.println("[Rogue-Radar] Boot sequence started...");
     gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     // SD card on dedicated HSPI bus — must not share with TFT
     sdSPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
     pinMode(POWER_PIN, OUTPUT);
+    delay(10);
     digitalWrite(POWER_PIN, HIGH);
+    delay(10);
     pinMode(ENCODER_BTN, INPUT_PULLUP);
-    // Sound uses lazy init. Do not start I2S during boot.
-    // initSound();
+#if BATTERY_METER_ENABLED
+    analogReadResolution(12);
+    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+#endif
+
+// I2S sound is lazy-initialized only when a chirp plays.
 
     tft.begin();
     tft.writecommand(0x11);
@@ -7125,7 +8129,31 @@ void setup() {
     ledStartupFlash();
     createMainMenu();
 
-    Serial.println("[T-Embed] Boot complete.");
+    Serial.printf("[Rogue-Radar] Device: %s\n", DEVICE_NAME);
+    Serial.printf("[Rogue-Radar] Firmware: %s\n", FIRMWARE_VERSION);
+    Serial.printf("[Rogue-Radar] Chip: %s rev %d\n", ESP.getChipModel(), ESP.getChipRevision());
+    Serial.printf("[Rogue-Radar] CPU: %u MHz\n", ESP.getCpuFreqMHz());
+    Serial.printf("[Rogue-Radar] Free heap: %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("[Rogue-Radar] Flash size: %u bytes\n", ESP.getFlashChipSize());
+    Serial.printf("[Rogue-Radar] Sketch size: %u bytes\n", ESP.getSketchSize());
+    Serial.printf("[Rogue-Radar] Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
+    Serial.printf("[Rogue-Radar] WiFi STA MAC: %s\n", WiFi.macAddress().c_str());
+    Serial.printf("[Rogue-Radar] WiFi AP MAC: %s\n", WiFi.softAPmacAddress().c_str());
+
+#if BATTERY_METER_ENABLED
+    int bootBattRaw = 0;
+    float bootBattVolts = 0.0f;
+    int bootBattPercent = 0;
+
+    readBatterySnapshot(&bootBattRaw, &bootBattVolts, &bootBattPercent);
+
+    Serial.printf("[Rogue-Radar] Battery: %.2f V / %d%%  raw:%d\n",
+                bootBattVolts, bootBattPercent, bootBattRaw);
+#endif
+
+    Serial.println("[Rogue-Radar] Boot complete.");
+    Serial.println("====================================");
+    Serial.println();
 }
 
 // ════════════════════════════════════════════════════════════════

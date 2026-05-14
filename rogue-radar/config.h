@@ -1,5 +1,5 @@
 // ============================================================
-//  config.h — Rogue Radar T-Embed v1.0.2
+//  config.h — Rogue Radar T-Embed v1.0.3
 //  Edit this file to customise pins, limits, themes, and behaviour.
 //  Do not edit rogue-radar.ino unless you know what you're doing.
 // ============================================================
@@ -7,7 +7,7 @@
 
 // ─── Device Name / Firmware Version ─────────────────────────────
 #define DEVICE_NAME       "Rogue Radar"
-#define FIRMWARE_VERSION  "RR v1.0.2"
+#define FIRMWARE_VERSION  "RR v1.0.3"
 
 // ─── Pin Definitions ────────────────────────────────────────────
 #define POWER_PIN       46
@@ -53,7 +53,11 @@
 #define SOUND_I2S_WCLK            5
 #define SOUND_I2S_DOUT            6
 #define SOUND_SAMPLE_RATE         16000
-#define SOUND_VOLUME_PERCENT      35   // 0-100 for detection alert chirps
+#define SOUND_VOLUME_PERCENT      35   // 0-100 default for detection alert chirps
+#define SOUND_VOLUME_MIN_PERCENT   0
+#define SOUND_VOLUME_MAX_PERCENT   70   // runtime cap for the small T-Embed speaker
+#define SOUND_VOLUME_STEP_PERCENT  5
+#define SOUND_VOLUME_AUTO_SET_MS   1500 // after last +/- press, focus returns to Back
 #define SOUND_ALERT_COOLDOWN_MS   1200 // prevents repeated chirp spam
 
 // ─── Menu Feedback Sounds ──────────────────────────────────────
@@ -63,6 +67,10 @@
 // Misc > Menu Sounds ON/OFF.
 #define MENU_FEEDBACK_ENABLED_DEFAULT  1
 #define MENU_FEEDBACK_VOLUME_PERCENT  8   // 0-100, kept low on purpose
+#define MENU_FEEDBACK_VOLUME_MIN_PERCENT  0
+#define MENU_FEEDBACK_VOLUME_MAX_PERCENT  30
+#define MENU_FEEDBACK_VOLUME_STEP_PERCENT 2
+#define MENU_FEEDBACK_VOLUME_AUTO_SET_MS   1500  // after last +/- press, focus returns to Back
 #define MENU_FEEDBACK_TICK_COOLDOWN_MS 85  // prevents noisy encoder tick spam
 
 // ─── Auto-return Home ──────────────────────────────────────────
@@ -70,6 +78,22 @@
 // back to the main home menu after no encoder movement/button activity.
 // Set AUTO_RETURN_HOME_TIMEOUT_MS to 0 to disable auto-return.
 #define AUTO_RETURN_HOME_TIMEOUT_MS  120000  // 2 minutes
+
+
+// ─── Battery Meter ──────────────────────────────────────────────
+// T-Embed LiPo battery monitor. GPIO4 is the expected ADC battery pin.
+// If your board revision uses a different ADC pin, change BATTERY_ADC_PIN here.
+// Note: GPIO1 is used by the encoder in this sketch, so test carefully before using 1.
+#define BATTERY_METER_ENABLED       1
+#define BATTERY_ADC_PIN             4
+#define BATTERY_ADC_RESOLUTION   4095.0f
+#define BATTERY_ADC_REF_VOLTAGE     3.30f
+#define BATTERY_DIVIDER_RATIO       2.12f
+#define BATTERY_UPDATE_MS        15000
+#define BATTERY_DISPLAY_UPDATE_MS 30000  // top-bar percent sticks across screens
+#define BATTERY_WARN_PERCENT       20
+#define BATTERY_CRITICAL_PERCENT   10
+#define BATTERY_AVG_SAMPLES         8
 
 // ─── Display ────────────────────────────────────────────────────
 #define SCREEN_W  320
@@ -298,7 +322,7 @@ static const char* FLIPPER_NAME_MATCHES[FLIPPER_NAME_MATCH_COUNT] = {
 #define WIGGLE_SCAN_INTERVAL_MS  15000
 
 // ─── Default Theme ──────────────────────────────────────────────
-// 0 = Dark  |  1 = Flipper  |  2 = Matrix
+// 0 = Dark  |  1 = Flipper  |  2 = Matrix | 3 = POSEIDON and so on.
 #define DEFAULT_THEME  0
 
 // ─── UI Themes ──────────────────────────────────────────────────
@@ -379,3 +403,21 @@ static const char* FLIPPER_NAME_MATCHES[FLIPPER_NAME_MATCH_COUNT] = {
     0x00205a, 0x00209c, 0x00ffff, \
     0x00ffff, 0xff0000
 
+#define THEME_TYPER \
+    "TypeR", \
+    0x0b0b0b, 0x1a1a1a, 0x111111, 0x5a0000, 0x210000, \
+    0xffffff, 0xb8b8b8, 0xff1a1a, \
+    0xffffff, 0xffcc00, 0xff0000, \
+    0x2a0000, 0x7a0000, 0xff1a1a, \
+    0x3a0000, 0x7a0000, 0xff1a1a, \
+    0xffffff, 0xff0000
+
+#define THEME_JOKER \
+    "Joker", \
+    0x1a001a, 0x2e002e, 0x220022, 0x00ff66, 0x006600, \
+    0xe0e0ff, 0x660066, 0x00cc33, \
+    0x9900ff, 0xff00ff, 0xffcc00, \
+    0x330033, 0x660066, 0x00ff66, \
+    0x220022, 0x440044, 0x00cc33
+
+    
