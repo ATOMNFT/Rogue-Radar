@@ -311,3 +311,7 @@ Rogue Radar would not be possible without the work and inspiration from these pr
 - **Esp32vsEvil / TeslaScanner**  
   Credit to Esp32vsEvil for the TeslaScanner idea that inspired the Tesla BLE detector added to Rogue Radar.  
   https://github.com/Esp32vsEvil/TeslaScanner
+  
+- **0xXyc / flock-you-wifi-recon**  
+  Credit to 0xXyc for the flock-you-wifi-recon project, which helped inspire Rogue Radar’s expanded Flock detection improvements, including Flock-related MAC/OUI matching, confidence labels, method labels, BLE manufacturer ID checks, and improved Flock Hybrid detail handling. This project is also helping guide the upcoming Raven Detector feature planned for Rogue Radar.  
+  https://github.com/0xXyc/flock-you-wifi-recon
