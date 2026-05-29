@@ -9,12 +9,13 @@
 
 | Version | Status | Notes |
 |--------|--------|-------|
+| v1.0.4 | Stable | Adds Audio Tools with Sound Recorder, Connect to AP, LAN Host Discovery, Gateway Info, WiFi Mapper, Station Scanner, Raven Detector, improved Flock detection, menu-based Power Off, and general UI/stability cleanup |
 | v1.0.3 | Stable | Adds battery display, adds Menu Feedback Volume and Alert Sound Volume controls, adds Deauth Stats, expands Pwnagotchi Watch details, improves Device Info and other features, and fixes theme focus styling |
 | v1.0.2 | Stable | Adds Packet Monitor with live graph and hop presets, Flock Hybrid, nyanBOX/Axon/Tesla detectors, improved AirTag/Flipper/Skimmer detection, extra themes, and menu cleanup |
 | v1.0.1 | Stable | Adds display/LED dimming controls, scan defaults, rotation toggle, audio feedback, and improved Flock detection |
 | v1.0.0 | Stable | Initial public release of the Rogue Radar Firmware |
 
-> **Latest Release:** `v1.0.3` — Rogue Radar Firmware
+> **Latest Release:** `v1.0.4` — Rogue Radar Firmware
 ---
 
 ## Overview
@@ -44,34 +45,43 @@ It is designed around fast menu navigation, onboard scanning tools, live signal 
 
 ### WiFi Tools
 - **Network Scanner** – scans nearby access points and shows SSID, BSSID, RSSI, channel, and security type.
+- **Connect to AP** – scans nearby access points, lets you select one, enter a password, connect to WiFi, and keep the connection available for connected tools.
+- **LAN Host Discovery** – performs safe local subnet discovery using lightweight TCP checks and lists discovered LAN hosts.
+- **Gateway Info** – shows connected network details such as SSID, signal, local IP, gateway, subnet, DNS, router TCP status, internet check, and station MAC.
+- **Station Scanner** – passively scans for nearby WiFi station/client activity.
 - **Deauth Detector** – monitors for deauthentication and disassociation activity using promiscuous mode, with live event tracking and a Deauth Stats view.
 - **Channel Analyzer** – surveys channel activity and signal strength across WiFi channels.
 - **Packet Monitor** – live WiFi packet monitor with channel selection, packet rate, packet type counts, average RSSI, optional channel hopping, and a live bar graph.
+- **WiFi Mapper** – visual WiFi mapping-style scanner with RSSI scaling and speed presets.
 - **PineAP Hunter** – watches for BSSIDs cycling through many SSIDs across scans.
 - **Pwnagotchi Watch** – looks for Pwnagotchi beacon behavior, parses status data, and includes selectable results with a detail page showing name, type, pwnd total, RSSI, channel, MAC data, and raw preview.
-- **Flock Detector** – flags WiFi activity associated with Flock-related SSID keywords, deduplicates hits by source MAC, and can show the source MAC in the results.
+- **Flock Detector** – flags WiFi activity associated with Flock-related SSID keywords, stronger ID patterns, MAC/OUI hints, adaptive dwell timing, and source MAC details.
 - **Flock Hybrid** – combines BLE and WiFi Flock-style detection into one scanner with merged results and selectable scan presets.
 
 ### BLE Tools
 - **BLE Scanner** – scans nearby Bluetooth Low Energy devices and lists signal details.
 - **AirTag Detector** – identifies AirTag-like BLE activity using manufacturer data, UUID fallback, and passive Apple Find My / AirTag payload pattern detection.
 - **Flipper Detector** – detects Flipper-style BLE devices using name matching, OUI fallback, and UUID detection for Black, White, and Transparent variants; results are selectable with a detail page.
-- **Skimmer Detector** – checks for suspicious BLE serial/module names including HC-03, HC-05, HC-06, HC-08, BT-HC05, JDY-31, AT-09, HM-10, CC41-A, MLT-BT05, SPP-CA, and FFD0.
-- **Meta Detector** – looks for Meta / Ray-Ban smart-glasses related BLE advertisements.
 - **nyanBOX Detector** – detects nyanBOX / Nyan Devices BLE badges and shows name, MAC, RSSI, level, version, age, and Locate Mode.
 - **Axon Detector** – detects Axon-style BLE devices by configurable MAC/OUI prefix with detail view and Locate Mode.
+- **Raven Detector** – passively detects Raven / SoundThinking-style BLE service UUID patterns and shows matching device details.
 - **Tesla Detector** – detects Tesla-style BLE name patterns and shows name, MAC, RSSI, age, signal quality, and detail view.
+- **Skimmer Detector** – checks for suspicious BLE serial/module names including HC-03, HC-05, HC-06, HC-08, BT-HC05, JDY-31, AT-09, HM-10, CC41-A, MLT-BT05, SPP-CA, and FFD0.
+- **Meta Detector** – looks for Meta / Ray-Ban smart-glasses related BLE advertisements.
 
 ### GPS Tools
 - **GPS Stats** – displays live latitude, longitude, speed, altitude, and satellite data.
 - **Wiggle Wars** – included as a GPS menu item for expansion / custom use.
 
+### Audio Tools
+- **Sound Recorder** – records from the T-Embed ES7210 microphone into RAM, supports manual Record/Stop, playback through the I2S speaker, playback speed tuning, and a scroll-ready layout for future recording file browsing.
+
 ### Misc Tools
 - **Battery Display** – shows battery percentage in the top bar with a shared/stable display value across menus.
-- **Device Info** – scrollable device information page showing firmware version, chip, flash, heap, CPU, battery details, MAC addresses, and eFuse ID.
+- **Device Info** – scrollable device information page showing firmware version, device type, chip, flash, heap, CPU, battery details, MAC addresses, and eFuse ID.
 - **SD Update** – supports firmware update flow from SD card.
 - **Brightness** – adjusts the TFT backlight with PWM brightness control.
-- **Themes** – switches between built-in UI themes including Dark, Flipper, Matrix, Poseidon, Phantom, Amber, and Tron.
+- **Themes** – switches between built-in UI themes including Dark, Flipper, Matrix, Poseidon, Phantom, Amber, Tron, TypeR, and Joker.
 - **Scan Defaults** – adjusts BLE scan time, WiFi scan time, WiFi result limit, deauth hop timing, Flock Hybrid presets, Packet Monitor hopping ON/OFF, and Packet Monitor hop timing for the current session.
 - **Dimming** – toggles inactivity-based screen and APA102 LED dimming.
 - **LEDs** – toggles the APA102 ring on or off at runtime.
@@ -80,6 +90,8 @@ It is designed around fast menu navigation, onboard scanning tools, live signal 
 - **Alert Volume** – adjusts detection alert chirp volume with a bar-style control.
 - **Menu Sounds** – toggles encoder/menu feedback sounds separately from detection alerts.
 - **Menu Volume** – adjusts encoder/menu feedback volume with a bar-style control.
+- **Reset Settings** – clears saved runtime preferences and restores default settings.
+- **Power Off** – safely powers down from the menu instead of using GPIO0 long-hold shutdown.
 
 ---
 
