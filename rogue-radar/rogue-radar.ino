@@ -1,16 +1,17 @@
 // ============================================================
-//  Rogue Radar v1.0.3 Firmware
+//  Rogue Radar v1.0.4 Firmware
 //  Check config.h for adjustable settings
 // ============================================================
 //
 //  Tool Categories:
-//  WiFi Tools: Network Scanner | Deauth Detector | Channel Analyzer
-//              Packet Monitor | PineAP Hunter | Pwnagotchi Watch | Flock Detector | Flock Hybrid
+//  WiFi Tools: Network Scanner | Connect to AP | LAN Host Discovery (simple) | Gateway Info | Station Scanner | Deauth Detector | Channel Analyzer 
+//              Packet Monitor | WiFi Mapper | PineAP Hunter | Pwnagotchi Watch | Flock Detector | Flock Hybrid
 //  BLE Tools:  BLE Scanner | AirTag Detector | Flipper Zero Detector | Tesla BLE Detector
-//              nyanBOX Detector | Axon Detector | Skimmer Detector | Meta Detector
+//              nyanBOX Detector | Axon Detector | Raven Detector | Skimmer Detector | Meta Detector
 //  GPS Tools:  GPS Stats | Wiggle Wars
-//  Misc Tools: Device Info | SD Update | Brightness ADJ | Themes | Dimming | Scan Times | LEDs | Detection Sounds | Menu Sounds | Rotation
-//              Packet Monitor chan hopping | Battery Gauge | Volume Adjustments |
+//  Audio Tools: Sound Recorder
+//  Misc Tools: Device Info | SD Update | Brightness ADJ | Themes | Dimming | Scan Times | LEDs | Detection Sounds | Menu Sounds | Rotation | Power Off
+//              | Battery Gauge | Volume Adjustments |
 //
 //  Display / UI:
 //  - ST7789 320x170 display
@@ -20,7 +21,7 @@
 //  - APA102 status LED support
 //
 //  Hardware Target:
-//  - LilyGO T-Embed ESP32-S3
+//  - LilyGO T-Embed ESP32-S3 (Non CC1101)
 //
 //  Arduino IDE Settings:
 //  - Board: ESP32S3 Dev Module
@@ -52,6 +53,15 @@
 
 #include <Arduino.h>
 #include "config.h"
+
+#ifndef AUDIO_RECORD_STOP_POLL_MS
+#define AUDIO_RECORD_STOP_POLL_MS 20
+#endif
+
+#ifndef AUDIO_RECORD_STOP_RESTART_GUARD_MS
+#define AUDIO_RECORD_STOP_RESTART_GUARD_MS 900
+#endif
+
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <TFT_eSPI.h>
@@ -65,10 +75,14 @@
 #include <SPI.h>
 #include <SD.h>
 #include <Update.h>
+#include <Preferences.h>
 #include <driver/i2s.h>
+#include <esp_heap_caps.h>
+#include <Wire.h>
 #include "splash.h"
 
 static SPIClass sdSPI(HSPI);
+static Preferences settingsPrefs;
 
 static HardwareSerial gpsSerial(1);   // UART1 — free since BLE uses its own stack
 static TinyGPSPlus    gps;
@@ -133,10 +147,11 @@ APA102<APA102_DI, APA102_CLK> ledStrip;
 rgb_color ledBuf[NUM_LEDS];
 
 struct MenuLED { uint8_t r, g, b; };
-const MenuLED MENU_COLORS[4] = {
+const MenuLED MENU_COLORS[5] = {
     LED_COLOR_WIFI,
     LED_COLOR_BLE,
     LED_COLOR_GPS,
+    LED_COLOR_AUDIO,
     LED_COLOR_MISC
 };
 
@@ -146,12 +161,13 @@ static volatile bool  spinnerRunning     = false;
 static TaskHandle_t   spinnerTaskHandle  = nullptr;
 static SpinnerColor   spinnerColor       = {0, 200, 0};
 static volatile uint16_t spinnerDelayMs   = 80;
+static volatile bool     rainbowSpinnerRunning = false;
+static TaskHandle_t      rainbowSpinnerTaskHandle = nullptr;
+static volatile uint16_t rainbowSpinnerDelayMs = 70;
 
 // ─── Global UI State ────────────────────────────────────────────
 static int            currentMenu       = 0;
 static bool           powerOffTriggered = false;
-static bool           powerButtonReleasedAfterBoot = false;  // safety: power-off hold is ignored until button is released once after boot
-static unsigned long  btnHoldStart      = 0;
 static int            lcdBrightness     = LCD_BL_DEFAULT;
 
 // ─── Inactivity Dimmer State ───────────────────────────────────
@@ -186,6 +202,7 @@ static unsigned long  lastDeauthSoundMs = 0;
 static unsigned long  lastFlockSoundMs  = 0;
 static unsigned long  lastPwnSoundMs    = 0;
 static unsigned long  lastFlipSoundMs   = 0;
+static unsigned long  lastTeslaSoundMs  = 0;
 static unsigned long  lastBleSusSoundMs = 0;
 static unsigned long  lastMenuTickMs    = 0;
 static unsigned long  lastMenuClickMs   = 0;
@@ -194,20 +211,168 @@ static unsigned long  lastMenuClickMs   = 0;
 // between the two landscape orientations so the 320x170 LVGL layout stays safe.
 static uint8_t displayRotation = DISPLAY_ROTATION_DEFAULT;
 
+// ════════════════════════════════════════════════════════════════
+//  PERSISTENT SETTINGS / NVS — v1.0.4 PASS 1 + PASS 2 + PASS 3
+//
+//  Saves UI, sound, and scan-default settings so they survive reboot:
+//  Pass 1: theme, brightness, rotation, LEDs ON/OFF, dimming ON/OFF.
+//  Pass 2: Alert Sound ON/OFF, Alert Volume, Menu Sounds ON/OFF, Menu Volume.
+//  Pass 3: Scan Defaults, Packet Monitor settings, Flock Hybrid preset.
+//  Config.h still provides the defaults when no saved value exists.
+// ════════════════════════════════════════════════════════════════
+static int themeCount() {
+    return (int)(sizeof(THEMES) / sizeof(THEMES[0]));
+}
+
+static int clampIntValue(int value, int minValue, int maxValue) {
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
+static bool isValidDisplayRotation(uint8_t rot) {
+    return (rot == DISPLAY_ROTATION_NORMAL || rot == DISPLAY_ROTATION_FLIPPED);
+}
+
+static void loadPersistentSettings() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, true);
+
+    int savedTheme = settingsPrefs.getUChar("theme", DEFAULT_THEME);
+    if (savedTheme >= 0 && savedTheme < themeCount()) {
+        currentTheme = savedTheme;
+    } else {
+        currentTheme = DEFAULT_THEME;
+    }
+
+    lcdBrightness = settingsPrefs.getUChar("bright", LCD_BL_DEFAULT);
+    lcdBrightness = clampIntValue(lcdBrightness, 13, 255);
+
+    uint8_t savedRotation = settingsPrefs.getUChar("rot", DISPLAY_ROTATION_DEFAULT);
+    displayRotation = isValidDisplayRotation(savedRotation)
+                    ? savedRotation
+                    : DISPLAY_ROTATION_DEFAULT;
+
+    ledsEnabled = settingsPrefs.getBool("leds", (LEDS_ENABLED_DEFAULT != 0));
+    dimmingEnabled = settingsPrefs.getBool("dim", (DIMMING_ENABLED_DEFAULT != 0));
+
+    soundEnabled = settingsPrefs.getBool("alertOn", (SOUND_ENABLED_DEFAULT != 0));
+    alertSoundVolumePercent = settingsPrefs.getInt("alertVol", SOUND_VOLUME_PERCENT);
+    alertSoundVolumePercent = clampIntValue(alertSoundVolumePercent,
+                                           SOUND_VOLUME_MIN_PERCENT,
+                                           SOUND_VOLUME_MAX_PERCENT);
+
+    menuFeedbackEnabled = settingsPrefs.getBool("menuOn", (MENU_FEEDBACK_ENABLED_DEFAULT != 0));
+    menuFeedbackVolumePercent = settingsPrefs.getInt("menuVol", MENU_FEEDBACK_VOLUME_PERCENT);
+    menuFeedbackVolumePercent = clampIntValue(menuFeedbackVolumePercent,
+                                             MENU_FEEDBACK_VOLUME_MIN_PERCENT,
+                                             MENU_FEEDBACK_VOLUME_MAX_PERCENT);
+
+    settingsPrefs.end();
+
+    Serial.println("[Rogue-Radar] NVS settings loaded.");
+#endif
+}
+
+static void savePersistentThemeSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putUChar("theme", (uint8_t)currentTheme);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentBrightnessSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putUChar("bright", (uint8_t)clampIntValue(lcdBrightness, 13, 255));
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentRotationSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putUChar("rot", displayRotation);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentLedsSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putBool("leds", ledsEnabled);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentDimmingSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putBool("dim", dimmingEnabled);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentAlertSoundSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putBool("alertOn", soundEnabled);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentAlertVolumeSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putInt("alertVol", clampIntValue(alertSoundVolumePercent,
+                                                   SOUND_VOLUME_MIN_PERCENT,
+                                                   SOUND_VOLUME_MAX_PERCENT));
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentMenuSoundSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putBool("menuOn", menuFeedbackEnabled);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentMenuVolumeSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putInt("menuVol", clampIntValue(menuFeedbackVolumePercent,
+                                                  MENU_FEEDBACK_VOLUME_MIN_PERCENT,
+                                                  MENU_FEEDBACK_VOLUME_MAX_PERCENT));
+    settingsPrefs.end();
+#endif
+}
+
+static void resetPersistentSettings() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.clear();
+    settingsPrefs.end();
+    Serial.println("[Rogue-Radar] NVS settings cleared. Restarting...");
+#endif
+}
+
 // ─── Runtime Scan Defaults ─────────────────────────────────────
-// These start from config.h on each boot and reset after reboot.
+// These start from config.h unless a saved NVS value exists.
 static int bleScanSeconds  = BLE_SCAN_SECS;
 static int wifiScanSeconds = WIFI_SCAN_SECS;
 static int wifiMaxResults  = MAX_WIFI_RESULTS;
 static int deauthHopMs     = DEAUTH_HOP_MS;
 
-// Flock Hybrid runtime scan defaults. These reset after reboot.
+// Flock Hybrid runtime scan defaults. These persist after v1.0.4 Pass 3.
 static int flockHybridPresetIdx = FLOCK_HYBRID_PRESET_DEFAULT;
 static int flockHybridBleSecs   = FLOCK_HYBRID_BLE_SECS;
 static int flockHybridWifiSecs  = FLOCK_HYBRID_WIFI_SECS;
 static int flockHybridHopMs     = FLOCK_HYBRID_WIFI_HOP_MS;
 
-// Packet Monitor runtime state. Display-only first pass: no PCAP writes.
+// Packet Monitor runtime state. Hop settings persist after v1.0.4 Pass 3.
 static bool          packetMonitorActive  = false;
 static bool          packetMonitorHopEnabled = (PACKET_MONITOR_HOP_ENABLED_DEFAULT != 0);
 static int           packetMonitorHopMs = PACKET_MONITOR_HOP_MS;
@@ -233,6 +398,35 @@ static uint32_t packetMonLastUpdate  = 0;
 static uint16_t packetMonRateSamples[PACKET_MONITOR_GRAPH_BARS] = {0};
 static uint8_t  packetMonSampleHead = 0;
 
+// WiFi Mapper runtime state.
+// This is a visual packet map: X = channel 1-13, Y = RSSI -90 to -10 dBm.
+struct WiFiMapperPoint {
+    uint8_t  channel;
+    int8_t   rssi;
+    uint8_t  pktType;   // 0=MGMT, 1=DATA, 2=CTRL, 3=OTHER
+    uint32_t ms;
+};
+
+static volatile bool     wifiMapperActive = false;
+static uint8_t           wifiMapperChannel = 1;
+static uint8_t           wifiMapperSpeedIdx = WIFI_MAPPER_DEFAULT_SPEED;
+static uint32_t          wifiMapperLastHopMs = 0;
+static uint32_t          wifiMapperTotalPackets = 0;
+static volatile uint16_t wifiMapperHead = 0;
+static volatile uint16_t wifiMapperCount = 0;
+static WiFiMapperPoint   wifiMapperPoints[WIFI_MAPPER_MAX_POINTS];
+static volatile int8_t   wifiMapperLastRSSI = -127;
+static volatile uint8_t  wifiMapperLastType = 3;
+
+static lv_timer_t *wifiMapperTimer = nullptr;
+static lv_obj_t   *wifiMapperStatusLbl = nullptr;
+static lv_obj_t   *wifiMapperDetailLbl = nullptr;
+static lv_obj_t   *wifiMapperGridArea = nullptr;
+static lv_obj_t   *wifiMapperPauseBtn = nullptr;
+static lv_obj_t   *wifiMapperPauseLbl = nullptr;
+static lv_obj_t   *wifiMapperSpeedBtn = nullptr;
+static lv_obj_t   *wifiMapperSpeedLbl = nullptr;
+
 // ─── Screen Pointers ────────────────────────────────────────────
 static lv_obj_t *mainScreen       = nullptr;
 static lv_obj_t *wifiMenuScreen   = nullptr;
@@ -246,6 +440,8 @@ static lv_obj_t *miscMenuScreen   = nullptr;
 static lv_obj_t *miscToolScreen   = nullptr;
 static lv_obj_t *gpsMenuScreen    = nullptr;
 static lv_obj_t *gpsToolScreen    = nullptr;
+static lv_obj_t *audioMenuScreen  = nullptr;
+static lv_obj_t *audioToolScreen  = nullptr;
 
 // ─── Input Group Pointers ───────────────────────────────────────
 static lv_group_t *navGroup        = nullptr;
@@ -260,6 +456,31 @@ static lv_group_t *miscMenuGroup   = nullptr;
 static lv_group_t *miscToolGroup   = nullptr;
 static lv_group_t *gpsMenuGroup    = nullptr;
 static lv_group_t *gpsToolGroup    = nullptr;
+static lv_group_t *audioMenuGroup  = nullptr;
+static lv_group_t *audioToolGroup  = nullptr;
+static lv_group_t *keyboardGroup   = nullptr;
+
+// ─── LVGL Keyboard State ───────────────────────────────────────
+typedef void (*RogueKeyboardCallback)(const char *text, bool accepted);
+static lv_obj_t *keyboardScreen     = nullptr;
+static lv_obj_t *keyboardTextLabel  = nullptr;
+static lv_obj_t *keyboardCountLabel = nullptr;
+static lv_obj_t *keyboardCapsLabel  = nullptr;
+static lv_obj_t *keyboardKeyLabels[48];
+static RogueKeyboardCallback keyboardDoneCb = nullptr;
+static String keyboardCurrentText;
+static int keyboardMaxLen = 64;
+static bool keyboardCaps = false;
+static bool keyboardActive = false;  // True while LVGL keyboard is open; keeps input/audio/battery refresh stable.
+static bool keyboardFinishPending = false;
+static bool keyboardFinishAccepted = false;
+static lv_timer_t *keyboardFinishTimer = nullptr;
+static uint32_t keyboardFinishReadyAtMs = 0;  // Wait until encoder button is released before closing keyboard.
+static uint32_t keyboardButtonReleasedAtMs = 0;  // Debounced release time before finishing OK/Esc.
+static bool keyboardClickFeedbackPending = false;  // Delayed keyboard key click; plays only after GPIO0 is released.
+static uint32_t keyboardClickFeedbackReadyAtMs = 0;
+static uint32_t keyboardClickFeedbackReleaseAtMs = 0;
+
 
 // ════════════════════════════════════════════════════════════════
 //  WIFI DATA STRUCTURES
@@ -275,6 +496,98 @@ struct WiFiEntry {
 
 static WiFiEntry wifiEntries[MAX_WIFI_RESULTS];
 static int       wifiEntryCount = 0;
+
+// ── Connect to AP Tool ─────────────────────────────────────────
+// Uses the shared WiFiEntry scan buffer, then keeps WiFi in STA mode
+// once connected so future safe LAN tools can reuse the connection.
+static lv_obj_t *connectApStatusLbl = nullptr;
+static lv_obj_t *connectApList      = nullptr;
+static lv_obj_t *connectApBackBtn   = nullptr;
+static lv_obj_t *connectApScanBtn   = nullptr;
+static lv_obj_t *connectApDiscBtn   = nullptr;
+
+// ── LAN Host Discovery Tool ────────────────────────────────────
+// Connected-only LAN utility. Uses the active STA connection created by
+// Connect to AP, then probes the local subnet for common TCP services.
+static lv_obj_t *lanDiscoveryStatusLbl = nullptr;
+static lv_obj_t *lanDiscoveryList      = nullptr;
+static lv_obj_t *lanDiscoveryBackBtn   = nullptr;
+static lv_obj_t *lanDiscoveryScanBtn   = nullptr;
+
+// ── Gateway Info / Router Check Tool ───────────────────────────
+// Connected-only LAN utility. Shows router/gateway-focused connection details
+// and lets the user refresh the status without leaving the page.
+static lv_obj_t *gatewayInfoStatusLbl = nullptr;
+static lv_obj_t *gatewayInfoList      = nullptr;
+static lv_obj_t *gatewayInfoBackBtn   = nullptr;
+static lv_obj_t *gatewayInfoRefreshBtn = nullptr;
+
+static int       connectApSelectedIdx = -1;
+static char      connectApTargetSsid[33] = {0};
+static char      connectApTargetBssid[18] = {0};
+static char      connectApTargetAuth[10] = {0};
+static bool      connectApTargetOpen = false;
+static int8_t    connectApTargetRssi = 0;
+static uint8_t   connectApTargetChannel = 0;
+
+// True only when Connect to AP is using a previously saved/config password.
+// This prevents a reconnect from immediately re-saving the same credential
+// while the WiFi/LVGL screen transition is happening.
+static bool      connectApUsingCachedPassword = false;
+
+// WiFi connection watchdog used by Connect to AP.
+// It lets Rogue Radar play the disconnect event tone when a connected AP drops
+// unexpectedly (out of range, router reboot, weak signal, etc.).
+// Manual disconnects and intentional reconnect attempts suppress the watchdog
+// briefly so the tone does not double-play.
+static bool      connectApWatchInitialized = false;
+static bool      connectApWasConnected = false;
+static uint32_t  connectApSuppressDropToneUntilMs = 0;
+
+// ── Station Scanner ────────────────────────────────────────────
+struct StationEntry {
+    char     stationMac[18];
+    char     apBssid[18];
+    char     frameType[18];
+    int8_t   rssi;
+    uint8_t  channel;
+    uint16_t packets;
+    uint16_t eapolPackets;
+    bool     eapolSeen;
+    uint32_t lastSeenMs;
+};
+
+struct StationApEntry {
+    char     bssid[18];
+    char     ssid[33];
+    char     authStr[12];
+    int8_t   rssi;
+    uint8_t  channel;
+    uint16_t clientCount;
+    uint16_t eapolPackets;
+    uint32_t lastSeenMs;
+};
+
+static StationEntry   stationEntries[MAX_STATION_RESULTS];
+static StationApEntry stationAps[MAX_STATION_APS];
+static volatile int   stationEntryCount = 0;
+static volatile int   stationApCount = 0;
+static volatile uint16_t stationEapolTotal = 0;
+static volatile bool stationScanActive = false;
+static uint8_t stationScanChannel = 1;
+static lv_timer_t *stationScanTimer = nullptr;
+static lv_obj_t *stationStatusLbl = nullptr;
+static lv_obj_t *stationList = nullptr;
+static lv_obj_t *stationStartBtn = nullptr;
+static lv_obj_t *stationStartLbl = nullptr;
+static lv_obj_t *stationBackBtn = nullptr;
+
+// Station result rows are kept alive and updated in-place while scanning.
+// This prevents encoder focus from jumping back to Back during list refreshes.
+static lv_obj_t *stationRowBtns[MAX_STATION_RESULTS] = {nullptr};
+static lv_obj_t *stationRowLabels[MAX_STATION_RESULTS] = {nullptr};
+static int       stationRowCount = 0;
+static lv_obj_t *stationEmptyLbl = nullptr;
 
 // ── Deauth Detector ─────────────────────────────────────────────
 struct DeauthEvent {
@@ -368,10 +681,16 @@ static volatile bool   pwnPendingReady = false;
 //  substrings. Alerts are latching — stays red until tool is exited.
 //
 struct FlockHit {
-    char    ssid[33];
-    char    src[18];    // source MAC of the frame
-    uint8_t frameType; // 0=beacon/resp, 1=probe req
-    int8_t  rssi;
+    char     ssid[33];
+    char     src[18];       // source MAC of the frame
+    char     method[18];    // Name / MAC Prefix / MFR Prefix / SoundThinking
+    char     confidence[8]; // High / Medium / Low
+    char     type[20];      // Flock / Flock MFR / SoundThinking
+    uint8_t  frameType;     // 0=beacon/resp, 1=probe req
+    int8_t   rssi;
+    uint16_t count;
+    uint32_t firstSeen;
+    uint32_t lastSeen;
 };
 
 static FlockHit       flockHits[MAX_FLOCK_HITS];
@@ -382,6 +701,9 @@ static lv_timer_t    *flockTimer      = nullptr;
 // ISR pending slot — one frame at a time into main task
 static char            flockPendingSSID[33];
 static char            flockPendingSrc[18];
+static char            flockPendingMethod[18];
+static char            flockPendingConfidence[8];
+static char            flockPendingDeviceType[20];
 static volatile uint8_t flockPendingType = 0;
 static volatile int8_t  flockPendingRSSI = 0;
 static volatile bool    flockPendingReady = false;
@@ -390,11 +712,16 @@ static volatile bool    flockPendingReady = false;
 //  Combined BLE + WiFi Flock scan. This intentionally alternates phases
 //  instead of running BLE and WiFi promiscuous mode at the same time.
 struct FlockHybridHit {
-    char     source[6];   // "BLE" or "WiFi"
-    char     name[33];    // BLE name or WiFi SSID
+    char     source[6];      // "BLE" or "WiFi"
+    char     name[33];       // BLE name or WiFi SSID
     char     mac[18];
-    char     reason[24];
+    char     reason[24];     // Short match reason shown in rows
+    char     method[24];     // Name / MAC Prefix / MFR Prefix / BLE MFR ID
+    char     confidence[8];  // High / Medium / Low
+    char     type[20];       // Flock / Flock MFR / SoundThinking
     int8_t   rssi;
+    uint16_t count;
+    uint32_t firstSeen;
     uint32_t lastSeen;
 };
 
@@ -403,12 +730,18 @@ static int            hybridHitCount = 0;
 static volatile bool  hybridWifiActive = false;
 static lv_obj_t      *hybridStatusLbl = nullptr;
 static lv_obj_t      *hybridList      = nullptr;
+static lv_obj_t      *hybridBackBtn   = nullptr;
+static lv_obj_t      *hybridScanBtn   = nullptr;
 static lv_timer_t    *hybridStartTimer = nullptr;
+static uint32_t       hybridBleHeardCount = 0;
 
 // ISR pending slot for the WiFi half of the hybrid scanner
 static char             hybridPendingName[33];
 static char             hybridPendingMac[18];
 static char             hybridPendingReason[24];
+static char             hybridPendingMethod[24];
+static char             hybridPendingConfidence[8];
+static char             hybridPendingType[20];
 static volatile int8_t  hybridPendingRSSI = 0;
 static volatile bool    hybridPendingReady = false;
 
@@ -440,6 +773,11 @@ struct BLEEntry {
 static BLEEntry bleEntries[MAX_BLE_RESULTS];
 static int      bleEntryCount  = 0;
 static bool     bleInitialized = false;  // BLEDevice::init() once only
+
+// ─── Manual prototypes for functions using custom types ─────────
+static const char *mfgHintStr(BLEDeviceType t);
+static int doBLEScan(int durationSec, BLEDeviceType filterType);
+static const char *pwnDeviceType(const PwnEntry &e);
 
 // nyanBOX detector entries. Fixed array keeps memory predictable on ESP32-S3.
 struct NyanBoxEntry {
@@ -476,6 +814,20 @@ struct TeslaEntry {
 static TeslaEntry teslaEntries[MAX_TESLA_RESULTS];
 static int        teslaEntryCount = 0;
 
+// Raven detector entries. Fixed array keeps memory predictable on ESP32-S3.
+struct RavenEntry {
+    char     name[33];
+    char     mac[18];
+    int8_t   rssi;
+    char     matchedUuid[41];
+    char     fwEstimate[16];
+    uint8_t  uuidHitCount;
+    uint32_t lastSeen;
+};
+
+static RavenEntry ravenEntries[MAX_RAVEN_RESULTS];
+static int        ravenEntryCount = 0;
+
 
 // ════════════════════════════════════════════════════════════════
 //  FORWARD DECLARATIONS
@@ -484,16 +836,23 @@ void createMainMenu();
 void createWiFiMenu();
 void createNetworkScanner();
 void createNetworkDetail(int idx);
+void createConnectAPTool();
+void createLANHostDiscovery();
+void createGatewayInfo();
+void createStationScanner();
+void createStationDetail(int idx);
 void createDeauthDetector();
 void createDeauthStats();
 void createChannelAnalyzer();
 void createPacketMonitor();
+void createWiFiMapper();
 void createPineAPHunter();
 void createPineAPDetail(int idx);
 void createPwnagotchiDetector();
 void createPwnagotchiDetail(int idx);
 void createFlockDetector();
 void createFlockHybridScanner();
+void createFlockHybridDetail(int idx);
 void createSubScreen(int idx);
 void createMiscMenu();
 void createDeviceInfo();
@@ -503,9 +862,20 @@ void createMenuFeedbackVolumeControl();
 void createAlertSoundVolumeControl();
 void createThemePicker();
 void createScanDefaults();
+void createResetSettings();
+void createPowerOffConfirm();
 void createGPSMenu();
 void createGPSStats();
 void createWiggleWars();
+void createAudioMenu();
+void createSoundRecorder();
+
+// Reusable Rogue Radar LVGL keyboard.
+// Callback receives (text, true) on OK and ("", false) on Back/Cancel.
+void createKeyboardScreen(const char *title,
+                          const char *currentText,
+                          int maxLen,
+                          RogueKeyboardCallback cb);
 
 static void cb_wifiToolBack(lv_event_t *e);
 static void cb_wifiDetailBack(lv_event_t *e);
@@ -521,6 +891,8 @@ void createNyanBoxLocate(int idx);
 void createAxonDetector();
 void createAxonDetail(int idx);
 void createAxonLocate(int idx);
+void createRavenDetector();
+void createRavenDetail(int idx);
 void createTeslaDetector();
 void createTeslaDetail(int idx);
 void createSkimmerScanner();
@@ -619,7 +991,6 @@ static void initSound() {
     i2sConfig.use_apll = false;
     i2sConfig.tx_desc_auto_clear = true;
     i2sConfig.fixed_mclk = 0;
-
     if (i2s_driver_install(I2S_NUM_0, &i2sConfig, 0, nullptr) != ESP_OK) {
         Serial.println("[Sound] I2S driver install failed");
         soundReady = false;
@@ -700,20 +1071,16 @@ static void soundSilence(uint16_t durationMs) {
 static void stopSoundDriverAfterChirp() {
     if (!soundReady) return;
 
-    // The T-Embed encoder button uses GPIO0. On this board, leaving the
-    // I2S driver active after a chirp can make the button read as held,
-    // which triggers the existing long-press power-off path. Since these
-    // are only short alert chirps, shut I2S back down after each chirp.
+    // These are only short alert/menu chirps, so shut I2S back down after
+    // each chirp. GPIO0 remains a normal encoder/select input only; the old
+    // background GPIO0 long-hold shutdown watcher has been removed.
     soundSilence(25);
     i2s_zero_dma_buffer(I2S_NUM_0);
     i2s_driver_uninstall(I2S_NUM_0);
     soundReady = false;
 
-    // Re-assert the encoder button input mode and require a fresh release
-    // before any long-press power-off can start counting again.
+    // Re-assert the encoder button input mode after I2S shuts down.
     pinMode(ENCODER_BTN, INPUT_PULLUP);
-    btnHoldStart = 0;
-    powerButtonReleasedAfterBoot = false;
 }
 
 static void playDeauthChirp() {
@@ -744,6 +1111,19 @@ static void playPwnagotchiChirp() {
 
 static void playFlipperChirp() {
     if (!soundCooldownReady(lastFlipSoundMs)) return;
+    soundTone(1200, 55, (uint8_t)alertSoundVolumePercent);
+    soundSilence(30);
+    soundTone(1600, 55, (uint8_t)alertSoundVolumePercent);
+    soundSilence(30);
+    soundTone(1000, 70, (uint8_t)alertSoundVolumePercent);
+    stopSoundDriverAfterChirp();
+}
+
+// Tesla Detector uses the same alert-style tone family as Flipper,
+// but keeps its own cooldown so a Tesla hit is not blocked by a
+// recent Flipper alert.
+static void playTeslaChirp() {
+    if (!soundCooldownReady(lastTeslaSoundMs)) return;
     soundTone(1200, 55, (uint8_t)alertSoundVolumePercent);
     soundSilence(30);
     soundTone(1600, 55, (uint8_t)alertSoundVolumePercent);
@@ -787,6 +1167,85 @@ static void playMenuClickFeedback() {
     stopSoundDriverAfterChirp();
 }
 
+static void playConnectApConnectedTone() {
+#if CONNECT_AP_EVENT_SOUNDS_ENABLED
+    if (!menuFeedbackEnabled) return;
+
+    // Distinct rising 3-note "connected" tone.
+    // This follows Misc > Menu Sounds ON/OFF and uses its own config volume.
+    soundTone(660, 55, (uint8_t)CONNECT_AP_EVENT_VOLUME_PERCENT, false);
+    soundSilence(30);
+    soundTone(880, 65, (uint8_t)CONNECT_AP_EVENT_VOLUME_PERCENT, false);
+    soundSilence(30);
+    soundTone(1320, 90, (uint8_t)CONNECT_AP_EVENT_VOLUME_PERCENT, false);
+    stopSoundDriverAfterChirp();
+#endif
+}
+
+static void playConnectApDisconnectedTone() {
+#if CONNECT_AP_EVENT_SOUNDS_ENABLED
+    if (!menuFeedbackEnabled) return;
+
+    // Distinct falling 2-note "disconnected" tone.
+    // Kept short so it does not feel like an alert chirp.
+    soundTone(520, 80, (uint8_t)CONNECT_AP_EVENT_VOLUME_PERCENT, false);
+    soundSilence(40);
+    soundTone(330, 110, (uint8_t)CONNECT_AP_EVENT_VOLUME_PERCENT, false);
+    stopSoundDriverAfterChirp();
+#endif
+}
+
+static void playLanDiscoveryDoneTone() {
+#if LAN_DISCOVERY_DONE_SOUND_ENABLED
+    if (!menuFeedbackEnabled) return;
+
+    // Dedicated "LAN scan complete" tone.
+    // Uses a quick low-high-low chirp pattern so it is distinct from
+    // Connect AP connect/disconnect and detector alert sounds.
+    soundTone(740, 45, (uint8_t)LAN_DISCOVERY_DONE_SOUND_VOLUME_PERCENT, false);
+    soundSilence(25);
+    soundTone(1175, 55, (uint8_t)LAN_DISCOVERY_DONE_SOUND_VOLUME_PERCENT, false);
+    soundSilence(25);
+    soundTone(930, 85, (uint8_t)LAN_DISCOVERY_DONE_SOUND_VOLUME_PERCENT, false);
+    stopSoundDriverAfterChirp();
+#endif
+}
+
+static void connectApSuppressDropTone(uint32_t ms) {
+    // Used for manual disconnects and intentional reconnect attempts.
+    // Unexpected AP loss still plays the disconnect tone.
+    connectApSuppressDropToneUntilMs = millis() + ms;
+}
+
+static void connectApMarkConnectedState(bool connected) {
+    connectApWatchInitialized = true;
+    connectApWasConnected = connected;
+}
+
+static void processConnectApConnectionWatchdog() {
+#if CONNECT_AP_EVENT_SOUNDS_ENABLED
+    bool nowConnected = (WiFi.status() == WL_CONNECTED);
+
+    if (!connectApWatchInitialized) {
+        connectApWatchInitialized = true;
+        connectApWasConnected = nowConnected;
+        return;
+    }
+
+    // Connected -> disconnected without a manual/suppressed operation:
+    // play the AP disconnect tone one time.
+    if (connectApWasConnected && !nowConnected) {
+        bool suppressed = ((int32_t)(millis() - connectApSuppressDropToneUntilMs) < 0);
+        if (!suppressed) {
+            Serial.println("[Connect AP] WiFi connection dropped unexpectedly.");
+            playConnectApDisconnectedTone();
+        }
+    }
+
+    connectApWasConnected = nowConnected;
+#endif
+}
+
 static const char *getSoundMenuLabel() {
     static char label[40];
     snprintf(label, sizeof(label), LV_SYMBOL_BELL " Alert Sound: %s",
@@ -814,6 +1273,7 @@ static void toggleSoundEnabled() {
     // by the first alert chirp so boot/menu input stays stable.
 
     updateSoundMenuLabel();
+    savePersistentAlertSoundSetting();
 }
 
 
@@ -860,6 +1320,7 @@ static void toggleMenuFeedbackEnabled() {
     }
 
     updateMenuSoundMenuLabel();
+    savePersistentMenuSoundSetting();
 }
 
 static const char *getMenuVolumeMenuLabel() {
@@ -902,10 +1363,29 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     // shut I2S back down after each tick/click to avoid the GPIO0
     // false power-off issue seen when I2S stayed active.
     static bool wasPressed = false;
+
+    // Once OK/Esc is selected, freeze LVGL input until loop() safely finishes
+    // the keyboard close after the physical button has been released. This
+    // prevents the disabled button matrix from receiving extra pressed/release
+    // events while the close is pending.
+    if (keyboardFinishPending) {
+        if (pos != 0) encoder.setPosition(0);
+        wasPressed = false;
+        data->enc_diff = 0;
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+
     if (pos != 0) {
+        // Encoder movement uses the normal quiet menu tick everywhere,
+        // including the keyboard, so scrolling across keys has feedback again.
         playMenuTickFeedback();
     }
-    if (pressed && !wasPressed) {
+
+    if (!keyboardActive && pressed && !wasPressed) {
+        // Normal menus can click immediately. Keyboard key clicks are delayed
+        // from cb_keyboardMatrix() until GPIO0 is released, which avoids the
+        // earlier keyboard OK/Back reboot behavior.
         playMenuClickFeedback();
     }
     wasPressed = pressed;
@@ -941,10 +1421,92 @@ void setAllLEDs(uint8_t r, uint8_t g, uint8_t b,
     refreshCurrentLEDs(br);
 }
 
+// Draw one boot spinner frame directly to the APA102 ring.
+// This intentionally avoids the FreeRTOS spinner task because setup() is
+// still booting and we want a simple, predictable startup animation.
+static void writeBootSpinnerFrame(uint8_t pos, uint8_t r, uint8_t g, uint8_t b) {
+    rgb_color frame[NUM_LEDS];
+
+    for (int i = 0; i < NUM_LEDS; i++) frame[i] = {0, 0, 0};
+
+    uint8_t head = pos % NUM_LEDS;
+    uint8_t tail = (pos + NUM_LEDS - 1) % NUM_LEDS;
+
+    frame[head] = {r, g, b};
+    frame[tail] = {
+        (uint8_t)(r * BOOT_LIGHTS_TAIL_PERCENT / 100),
+        (uint8_t)(g * BOOT_LIGHTS_TAIL_PERCENT / 100),
+        (uint8_t)(b * BOOT_LIGHTS_TAIL_PERCENT / 100)
+    };
+
+    // Boot lights have their own brightness setting. If desired, config can
+    // still make them respect the runtime LEDs ON/OFF toggle.
+#if BOOT_LIGHTS_RESPECT_LED_TOGGLE
+    ledStrip.write(frame, NUM_LEDS, activeLedBrightness(BOOT_LIGHTS_BRIGHTNESS));
+#else
+    ledStrip.write(frame, NUM_LEDS, BOOT_LIGHTS_BRIGHTNESS);
+#endif
+}
+
+// Spin one color for the configured boot duration.
+// It always completes at least BOOT_LIGHTS_MIN_REVOLUTIONS full circles so
+// each color is visible even if the duration/step settings are tuned short.
+static void runBootColorSpin(uint8_t r, uint8_t g, uint8_t b) {
+    const uint16_t minFrames = NUM_LEDS * BOOT_LIGHTS_MIN_REVOLUTIONS;
+    const uint16_t timeFrames = (BOOT_LIGHTS_COLOR_MS + BOOT_LIGHTS_STEP_MS - 1) / BOOT_LIGHTS_STEP_MS;
+    const uint16_t totalFrames = (timeFrames > minFrames) ? timeFrames : minFrames;
+
+    for (uint16_t frame = 0; frame < totalFrames; frame++) {
+        writeBootSpinnerFrame(frame % NUM_LEDS, r, g, b);
+        delay(BOOT_LIGHTS_STEP_MS);
+    }
+
+#if BOOT_LIGHTS_COLOR_GAP_MS > 0
+    // Briefly clear the ring between colors so red/green/blue are distinct.
+    rgb_color darkFrame[NUM_LEDS];
+    for (int i = 0; i < NUM_LEDS; i++) darkFrame[i] = {0, 0, 0};
+    ledStrip.write(darkFrame, NUM_LEDS, 0);
+    delay(BOOT_LIGHTS_COLOR_GAP_MS);
+#endif
+}
+
+// Optional boot animation: red circle, green circle, blue circle.
+// This runs before the splash screen is drawn so the LCD image can display
+// cleanly afterward for the full SPLASH_DURATION_MS.
+void runBootLightsAnimation() {
+#if BOOT_LIGHTS_ENABLED
+#if BOOT_LIGHTS_RESPECT_LED_TOGGLE
+    if (!ledsEnabled) {
+        return;
+    }
+#endif
+
+    runBootColorSpin(255, 0, 0);
+    runBootColorSpin(0, 255, 0);
+    runBootColorSpin(0, 0, 255);
+
+#if BOOT_LIGHTS_RESTORE_MENU_COLOR
+    setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+#else
+    setAllLEDs(0, 0, 0, 0);
+#endif
+
+#if BOOT_LIGHTS_END_HOLD_MS > 0
+    delay(BOOT_LIGHTS_END_HOLD_MS);
+#endif
+#endif
+}
+
 void ledStartupFlash() {
+#if BOOT_LIGHTS_ENABLED
+    // When boot lights are enabled, avoid adding the older white flash after
+    // the splash screen. Just restore the normal WiFi/menu LED color.
+    setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+#else
     setAllLEDs(255, 255, 255, 10); delay(300);
     setAllLEDs(0, 0, 0, 0);       delay(150);
     setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+#endif
 }
 // ── LED Spinner Task ─────────────────────────────────────────────
 //  Runs on core 0 while core 1 blocks on a WiFi scan.
@@ -1006,6 +1568,72 @@ void stopLEDSpinner(uint8_t r, uint8_t g, uint8_t b) {
     uint32_t deadline = millis() + 400;
     while (spinnerTaskHandle != nullptr && millis() < deadline) delay(10);
     setAllLEDs(r, g, b);
+}
+
+// Small color wheel used by the LAN Host Discovery rainbow spinner.
+static rgb_color wheelColor(uint8_t pos) {
+    pos = 255 - pos;
+    if (pos < 85) {
+        return { (uint8_t)(255 - pos * 3), 0, (uint8_t)(pos * 3) };
+    }
+    if (pos < 170) {
+        pos -= 85;
+        return { 0, (uint8_t)(pos * 3), (uint8_t)(255 - pos * 3) };
+    }
+    pos -= 170;
+    return { (uint8_t)(pos * 3), (uint8_t)(255 - pos * 3), 0 };
+}
+
+// Rainbow chase spinner for connected LAN tools that perform blocking TCP probes.
+static void ledRainbowSpinnerTask(void *param) {
+    uint8_t pos = 0;
+    rgb_color frame[NUM_LEDS];
+
+    while (rainbowSpinnerRunning) {
+        for (int i = 0; i < NUM_LEDS; i++) frame[i] = {0, 0, 0};
+
+        uint8_t head = pos % NUM_LEDS;
+        uint8_t mid  = (pos + NUM_LEDS - 1) % NUM_LEDS;
+        uint8_t tail = (pos + NUM_LEDS - 2) % NUM_LEDS;
+
+        rgb_color c = wheelColor((uint8_t)(pos * 32));
+        frame[head] = c;
+        frame[mid]  = { (uint8_t)(c.red * 35 / 100),
+                        (uint8_t)(c.green * 35 / 100),
+                        (uint8_t)(c.blue * 35 / 100) };
+        frame[tail] = { (uint8_t)(c.red * 12 / 100),
+                        (uint8_t)(c.green * 12 / 100),
+                        (uint8_t)(c.blue * 12 / 100) };
+
+        ledStrip.write(frame, NUM_LEDS, activeLedBrightness(LED_BRIGHTNESS));
+        pos = (pos + 1) % NUM_LEDS;
+        vTaskDelay(pdMS_TO_TICKS(rainbowSpinnerDelayMs));
+    }
+
+    rainbowSpinnerTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+}
+
+static void startLEDRainbowSpinner(uint16_t delayMs = 70) {
+    if (rainbowSpinnerRunning || rainbowSpinnerTaskHandle != nullptr) return;
+    rainbowSpinnerDelayMs = delayMs;
+    rainbowSpinnerRunning = true;
+    xTaskCreatePinnedToCore(
+        ledRainbowSpinnerTask,
+        "ledRainbowSpin",
+        2048,
+        nullptr,
+        1,
+        &rainbowSpinnerTaskHandle,
+        0
+    );
+}
+
+static void stopLEDRainbowSpinner(uint8_t r, uint8_t g, uint8_t b, uint8_t br = LED_BRIGHTNESS) {
+    rainbowSpinnerRunning = false;
+    uint32_t deadline = millis() + 400;
+    while (rainbowSpinnerTaskHandle != nullptr && millis() < deadline) delay(10);
+    setAllLEDs(r, g, b, br);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1117,7 +1745,16 @@ static void updateBatteryTopLabel() {
     // timer can randomly update a stale label pointer during encoder navigation.
     if (!batteryTopLabel) return;
 
-    refreshBatteryDisplayPercent(false);
+    // Normal screens may refresh the shared battery value when it is stale.
+    // The keyboard screen keeps the existing shared value to avoid an ADC read
+    // during heavy LVGL matrix drawing, which caused an occasional 0% top-bar
+    // reading while plugged in.
+    if (!batteryDisplayValid) {
+        refreshBatteryDisplayPercent(true);
+    } else if (!keyboardActive) {
+        refreshBatteryDisplayPercent(false);
+    }
+
     int percent = batteryDisplayPercent;
 
     char text[20];
@@ -1130,6 +1767,70 @@ static void updateBatteryTopLabel() {
     lv_obj_set_style_text_color(batteryTopLabel, lv_color_hex(col), LV_PART_MAIN);
 }
 #endif
+
+static const char *getTopbarWifiIconText() {
+#if defined(TOPBAR_WIFI_ICON_CUSTOM_TEXT)
+    // Config override: leave blank to use LVGL's built-in WiFi symbol.
+    if (strlen(TOPBAR_WIFI_ICON_CUSTOM_TEXT) > 0) {
+        return TOPBAR_WIFI_ICON_CUSTOM_TEXT;
+    }
+#endif
+    return LV_SYMBOL_WIFI;
+}
+
+static lv_obj_t *topbarWifiOverlayLabel = nullptr;
+static wl_status_t topbarWifiLastStatus = WL_IDLE_STATUS;
+static int topbarWifiLastTheme = -1;
+
+// Persistent top-layer WiFi indicator.
+// Unlike the per-screen header label, this stays visible across every page
+// while the device remains connected to an AP.
+static void updateTopbarWifiOverlay(bool force = false) {
+#if TOPBAR_WIFI_ICON_ENABLED
+    if (!lvDisp) return;
+
+    wl_status_t status = WiFi.status();
+    bool connected = (status == WL_CONNECTED);
+
+    if (!topbarWifiOverlayLabel) {
+        topbarWifiOverlayLabel = lv_label_create(lv_layer_top());
+        lv_obj_set_width(topbarWifiOverlayLabel, 22);
+        lv_label_set_long_mode(topbarWifiOverlayLabel, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_align(topbarWifiOverlayLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_text_color(topbarWifiOverlayLabel, TC(accent), LV_PART_MAIN);
+#if BATTERY_METER_ENABLED
+        lv_obj_align(topbarWifiOverlayLabel, LV_ALIGN_TOP_RIGHT, -88, 5);
+#else
+        lv_obj_align(topbarWifiOverlayLabel, LV_ALIGN_TOP_RIGHT, -8, 5);
+#endif
+        lv_obj_add_flag(topbarWifiOverlayLabel, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (force || status != topbarWifiLastStatus || currentTheme != topbarWifiLastTheme) {
+        lv_label_set_text(topbarWifiOverlayLabel, getTopbarWifiIconText());
+        lv_obj_set_style_text_color(topbarWifiOverlayLabel, TC(accent), LV_PART_MAIN);
+#if BATTERY_METER_ENABLED
+        lv_obj_align(topbarWifiOverlayLabel, LV_ALIGN_TOP_RIGHT, -88, 5);
+#else
+        lv_obj_align(topbarWifiOverlayLabel, LV_ALIGN_TOP_RIGHT, -8, 5);
+#endif
+
+        if (connected) {
+            lv_obj_clear_flag(topbarWifiOverlayLabel, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(topbarWifiOverlayLabel);
+        } else {
+            lv_obj_add_flag(topbarWifiOverlayLabel, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        topbarWifiLastStatus = status;
+        topbarWifiLastTheme = currentTheme;
+    }
+#else
+    if (topbarWifiOverlayLabel) {
+        lv_obj_add_flag(topbarWifiOverlayLabel, LV_OBJ_FLAG_HIDDEN);
+    }
+#endif
+}
 
 static lv_obj_t *createHeader(lv_obj_t *parent, const char *text) {
     lv_obj_t *bar = lv_obj_create(parent);
@@ -1197,6 +1898,430 @@ static lv_obj_t *createActionBtn(lv_obj_t *parent,
     return btn;
 }
 
+
+// ════════════════════════════════════════════════════════════════
+//  REUSABLE LVGL KEYBOARD
+// ════════════════════════════════════════════════════════════════
+// Inspired by the Launcher keyboard layout concept, but rewritten for
+// Rogue Radar's LVGL + encoder UI instead of direct TFT drawing.
+//
+// IMPORTANT:
+// This version uses ONE lv_btnmatrix object instead of 48 separate LVGL
+// buttons. An early standalone keyboard validation build froze on-device right before the
+// keyboard loaded, most likely because the old test created too many LVGL
+// button/label objects at once from a menu callback. The button-matrix
+// version is much lighter and should be safer on the T-Embed.
+//
+// Future tools can call:
+//
+//   createKeyboardScreen("SSID", "", 32, myCallback);
+//
+// The callback receives:
+//   accepted=true  -> text contains the entered value
+//   accepted=false -> user cancelled with Back/Esc
+
+static lv_obj_t *keyboardMatrix = nullptr;
+static lv_obj_t *keyboardScreenDeletePending = nullptr;
+static lv_timer_t *keyboardScreenDeleteTimer = nullptr;
+
+static const char *RR_KB_MAP_LOWER[] = {
+    "OK", "caps", "Del", "Space", "Esc", "\n",
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=", "\n",
+    "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "[", "]", "\n",
+    "a", "s", "d", "f", "g", "h", "j", "k", "l", ";", "'", "\\", "\n",
+    "z", "x", "c", "v", "b", "n", "m", ",", ".", "/", "@", ".",
+    ""
+};
+
+static const char *RR_KB_MAP_UPPER[] = {
+    "OK", "CAPS", "Del", "Space", "Esc", "\n",
+    "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "_", "+", "\n",
+    "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "{", "}", "\n",
+    "A", "S", "D", "F", "G", "H", "J", "K", "L", ":", "\"", "|", "\n",
+    "Z", "X", "C", "V", "B", "N", "M", "<", ">", "?", "@", ".",
+    ""
+};
+
+static void keyboardRefreshText() {
+    if (keyboardTextLabel) {
+        lv_label_set_text(keyboardTextLabel,
+                          keyboardCurrentText.length() ? keyboardCurrentText.c_str() : "_");
+    }
+
+    if (keyboardCountLabel) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%u/%d",
+                 (unsigned)keyboardCurrentText.length(), keyboardMaxLen);
+        lv_label_set_text(keyboardCountLabel, buf);
+    }
+}
+
+static void keyboardRefreshCaps() {
+    if (keyboardCapsLabel) {
+        lv_label_set_text(keyboardCapsLabel, keyboardCaps ? "CAPS" : "caps");
+    }
+
+    if (keyboardMatrix) {
+        lv_btnmatrix_set_map(keyboardMatrix, keyboardCaps ? RR_KB_MAP_UPPER : RR_KB_MAP_LOWER);
+    }
+}
+
+// Keyboard close helper:
+// Do not delete the active keyboard screen before the next screen has loaded.
+// Deleting the active screen while LVGL is still processing the encoder/button
+// event can cause a LoadProhibited-style reboot on the T-Embed.
+static void keyboardDeleteOldScreenTimerCb(lv_timer_t *timer) {
+    if (timer) {
+        lv_timer_delete(timer);
+    }
+    keyboardScreenDeleteTimer = nullptr;
+
+    if (!keyboardScreenDeletePending) return;
+
+    // If the old keyboard screen is still active, leave it alone rather than
+    // deleting the currently loaded screen. This keeps the fail-safe behavior
+    // as "minor memory leak during testing" instead of "reboot".
+    if (keyboardScreenDeletePending != lv_screen_active()) {
+        lv_obj_delete(keyboardScreenDeletePending);
+    }
+
+    keyboardScreenDeletePending = nullptr;
+}
+
+static void keyboardQueueOldScreenDelete(lv_obj_t *oldScreen, uint32_t delayMs) {
+    if (!oldScreen) return;
+
+    if (keyboardScreenDeleteTimer) {
+        lv_timer_delete(keyboardScreenDeleteTimer);
+        keyboardScreenDeleteTimer = nullptr;
+    }
+
+    // Clean up any older pending screen first, but never delete the active one.
+    if (keyboardScreenDeletePending &&
+        keyboardScreenDeletePending != oldScreen &&
+        keyboardScreenDeletePending != lv_screen_active()) {
+        lv_obj_delete(keyboardScreenDeletePending);
+    }
+
+    keyboardScreenDeletePending = oldScreen;
+    keyboardScreenDeleteTimer = lv_timer_create(keyboardDeleteOldScreenTimerCb, delayMs, nullptr);
+}
+
+static void keyboardFinish(bool accepted) {
+    RogueKeyboardCallback cb = keyboardDoneCb;
+    String out = keyboardCurrentText;
+    lv_obj_t *oldKeyboardScreen = keyboardScreen;
+
+    if (keyboardFinishTimer) {
+        lv_timer_delete(keyboardFinishTimer);
+        keyboardFinishTimer = nullptr;
+    }
+
+    // Important: detach the encoder indev before deleting the keyboard group.
+    // Otherwise LVGL can keep an input-device pointer to a group that no
+    // longer exists, which can reboot when OK/Esc closes the keyboard.
+    if (lvIndev) {
+        lv_indev_set_group(lvIndev, nullptr);
+    }
+    deleteGroup(&keyboardGroup);
+
+    // Clear keyboard object pointers now. The old screen is deleted later,
+    // after the callback has loaded the next screen.
+    keyboardScreen = nullptr;
+    keyboardMatrix = nullptr;
+    keyboardTextLabel = nullptr;
+    keyboardCountLabel = nullptr;
+    keyboardCapsLabel = nullptr;
+    memset(keyboardKeyLabels, 0, sizeof(keyboardKeyLabels));
+    keyboardDoneCb = nullptr;
+    keyboardActive = false;
+    keyboardFinishPending = false;
+    keyboardFinishReadyAtMs = 0;
+    keyboardButtonReleasedAtMs = 0;
+
+    // GPIO0 is the encoder button. The old background long-hold shutdown
+    // watcher has been removed, so keyboard close only needs the normal
+    // deferred release flow below.
+
+    if (cb) {
+        cb(accepted ? out.c_str() : "", accepted);
+    }
+
+    // Delete the old keyboard screen only after the callback has had a chance
+    // to load the next tool/result page. This avoids deleting
+    // the active screen from inside the close flow.
+    keyboardQueueOldScreenDelete(oldKeyboardScreen, 450);
+}
+
+static void queueKeyboardClickFeedback() {
+    // Keyboard key clicks are delayed until after the encoder button is released.
+    // This keeps the I2S feedback sound away from the GPIO0 LOW period that caused
+    // earlier keyboard OK/Back instability on the T-Embed.
+    if (!menuFeedbackEnabled) return;
+    if (keyboardFinishPending) return;
+
+    keyboardClickFeedbackPending = true;
+    keyboardClickFeedbackReadyAtMs = millis() + 40;
+    keyboardClickFeedbackReleaseAtMs = 0;
+}
+
+static void processKeyboardClickFeedback() {
+    if (!keyboardClickFeedbackPending) return;
+
+    if ((int32_t)(millis() - keyboardClickFeedbackReadyAtMs) < 0) return;
+
+    // Wait for the encoder button to be released and stable briefly before
+    // starting/stopping the I2S driver for the click sound.
+    if (digitalRead(ENCODER_BTN) == LOW) {
+        keyboardClickFeedbackReleaseAtMs = 0;
+        return;
+    }
+
+    if (keyboardClickFeedbackReleaseAtMs == 0) {
+        keyboardClickFeedbackReleaseAtMs = millis();
+        return;
+    }
+
+    if ((millis() - keyboardClickFeedbackReleaseAtMs) < 80) return;
+
+    keyboardClickFeedbackPending = false;
+    keyboardClickFeedbackReadyAtMs = 0;
+    keyboardClickFeedbackReleaseAtMs = 0;
+    playMenuClickFeedback();
+}
+
+static void keyboardFinishTimerCb(lv_timer_t *timer) {
+    // Legacy safety stub: the keyboard no longer closes from an LVGL timer.
+    // OK/Back now queue the finish, then loop() closes the keyboard only after
+    // the encoder button has been released. That avoids deleting/loading screens
+    // while GPIO0 is still held LOW.
+    if (timer) {
+        lv_timer_delete(timer);
+    }
+    keyboardFinishTimer = nullptr;
+}
+
+static void keyboardRequestFinish(bool accepted) {
+    // Do NOT delete/load screens directly inside the button-matrix event.
+    // Also do NOT close immediately while the encoder button is still held.
+    // GPIO0 is the encoder button on T-Embed and is also boot/power sensitive.
+    // We queue the finish, disable the matrix, then loop() waits for button
+    // release before calling keyboardFinish().
+    if (keyboardFinishPending) return;
+
+    keyboardFinishPending = true;
+    keyboardFinishAccepted = accepted;
+
+    // Do not allow a queued keyboard click to fire during OK/Esc shutdown.
+    // The close path already has its own GPIO0 guard/debounce flow.
+    keyboardClickFeedbackPending = false;
+    keyboardClickFeedbackReadyAtMs = 0;
+    keyboardClickFeedbackReleaseAtMs = 0;
+    keyboardFinishReadyAtMs = millis() + 120;
+    keyboardButtonReleasedAtMs = 0;
+
+    if (keyboardMatrix) {
+        lv_obj_add_state(keyboardMatrix, LV_STATE_DISABLED);
+    }
+
+    Serial.printf("[Keyboard] Finish queued: %s\n", accepted ? "OK" : "Esc");
+}
+
+static void processKeyboardDeferredFinish() {
+    if (!keyboardFinishPending) return;
+
+    // Keep the keyboard finish flow deferred until the button is released.
+
+    if ((int32_t)(millis() - keyboardFinishReadyAtMs) < 0) return;
+
+    // Wait until the physical encoder button is released and stays released
+    // briefly before changing screens. GPIO0 can bounce on release, and on the
+    // T-Embed it is also boot/power-sensitive.
+    if (digitalRead(ENCODER_BTN) == LOW) {
+        keyboardButtonReleasedAtMs = 0;
+        return;
+    }
+
+    if (keyboardButtonReleasedAtMs == 0) {
+        keyboardButtonReleasedAtMs = millis();
+        return;
+    }
+
+    if ((millis() - keyboardButtonReleasedAtMs) < 300) {
+        return;
+    }
+
+    Serial.printf("[Keyboard] Finish running: %s\n", keyboardFinishAccepted ? "OK" : "Esc");
+    keyboardFinish(keyboardFinishAccepted);
+}
+
+static void cb_keyboardMatrix(lv_event_t *e) {
+    lv_obj_t *matrix = (lv_obj_t *)lv_event_get_target(e);
+    uint16_t selected = lv_btnmatrix_get_selected_btn(matrix);
+
+    if (selected == LV_BTNMATRIX_BTN_NONE) return;
+
+    const char *txt = lv_btnmatrix_get_button_text(matrix, selected);
+    if (!txt || !txt[0]) return;
+    if (keyboardFinishPending) return;
+
+    resetInactivityTimer();
+
+    if (strcmp(txt, "OK") == 0) {
+        keyboardRequestFinish(true);
+        return;
+    }
+
+    if (strcmp(txt, "Esc") == 0 || strcmp(txt, "Back") == 0) {
+        keyboardRequestFinish(false);
+        return;
+    }
+
+    // Normal keyboard keys get the same quiet menu/key click sound, but the
+    // click is queued and played only after GPIO0 is released for stability.
+    queueKeyboardClickFeedback();
+
+    if (strcmp(txt, "caps") == 0 || strcmp(txt, "CAPS") == 0) {
+        keyboardCaps = !keyboardCaps;
+        keyboardRefreshCaps();
+        return;
+    }
+
+    if (strcmp(txt, "Del") == 0) {
+        if (keyboardCurrentText.length() > 0) {
+            keyboardCurrentText.remove(keyboardCurrentText.length() - 1);
+            keyboardRefreshText();
+        }
+        return;
+    }
+
+    if (strcmp(txt, "Space") == 0) {
+        if ((int)keyboardCurrentText.length() < keyboardMaxLen) {
+            keyboardCurrentText += ' ';
+            keyboardRefreshText();
+        }
+        return;
+    }
+
+    // Normal key: each key label is a one-character string.
+    if ((int)keyboardCurrentText.length() < keyboardMaxLen) {
+        keyboardCurrentText += txt[0];
+        keyboardRefreshText();
+    }
+}
+
+void createKeyboardScreen(const char *title,
+                          const char *currentText,
+                          int maxLen,
+                          RogueKeyboardCallback cb) {
+    Serial.println("[Keyboard] Opening LVGL keyboard...");
+
+    if (keyboardScreen) {
+        lv_obj_delete(keyboardScreen);
+        keyboardScreen = nullptr;
+    }
+
+    keyboardActive = true;
+    keyboardFinishPending = false;
+    keyboardFinishAccepted = false;
+    keyboardFinishReadyAtMs = 0;
+    keyboardButtonReleasedAtMs = 0;
+    keyboardClickFeedbackPending = false;
+    keyboardClickFeedbackReadyAtMs = 0;
+    keyboardClickFeedbackReleaseAtMs = 0;
+
+    if (keyboardFinishTimer) {
+        lv_timer_delete(keyboardFinishTimer);
+        keyboardFinishTimer = nullptr;
+    }
+
+    keyboardCurrentText = currentText ? currentText : "";
+    keyboardMaxLen = maxLen > 0 ? maxLen : 64;
+    keyboardCaps = false;
+    keyboardDoneCb = cb;
+    keyboardMatrix = nullptr;
+    memset(keyboardKeyLabels, 0, sizeof(keyboardKeyLabels));
+
+    keyboardScreen = lv_obj_create(nullptr);
+    applyScreenStyle(keyboardScreen);
+    createHeader(keyboardScreen, title ? title : "Keyboard");
+
+    deleteGroup(&keyboardGroup);
+    keyboardGroup = lv_group_create();
+
+    // Text preview area
+    lv_obj_t *box = lv_obj_create(keyboardScreen);
+    lv_obj_set_size(box, SCREEN_W - 10, 28);
+    lv_obj_set_pos(box, 5, 30);
+    lv_obj_set_style_bg_color(box, TC(card), LV_PART_MAIN);
+    lv_obj_set_style_border_color(box, TC(border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(box, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(box, 5, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(box, 4, LV_PART_MAIN);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    keyboardTextLabel = lv_label_create(box);
+    lv_obj_set_width(keyboardTextLabel, SCREEN_W - 65);
+    lv_label_set_long_mode(keyboardTextLabel, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_color(keyboardTextLabel, TC(text), LV_PART_MAIN);
+    lv_obj_align(keyboardTextLabel, LV_ALIGN_LEFT_MID, 2, 0);
+
+    keyboardCountLabel = lv_label_create(box);
+    lv_obj_set_style_text_color(keyboardCountLabel, TC(textDim), LV_PART_MAIN);
+    lv_obj_align(keyboardCountLabel, LV_ALIGN_RIGHT_MID, -2, 0);
+
+    keyboardMatrix = lv_btnmatrix_create(keyboardScreen);
+    lv_btnmatrix_set_map(keyboardMatrix, RR_KB_MAP_LOWER);
+    lv_obj_set_size(keyboardMatrix, SCREEN_W - 8, SCREEN_H - 64);
+    lv_obj_set_pos(keyboardMatrix, 4, 62);
+
+    // Keyboard stability helpers:
+    // - no scrollbars/scroll-on-focus inside the matrix
+    // - no style animations during encoder movement
+    // These reduce flicker on the small T-Embed LVGL display.
+    lv_obj_clear_flag(keyboardMatrix, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(keyboardMatrix, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    lv_obj_set_scrollbar_mode(keyboardMatrix, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_anim_duration(keyboardMatrix, 0, LV_PART_MAIN);
+    lv_obj_set_style_anim_duration(keyboardMatrix, 0, LV_PART_ITEMS);
+
+    // Compact styling for the 320x170 T-Embed screen.
+    lv_obj_set_style_bg_color(keyboardMatrix, TC(bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(keyboardMatrix, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(keyboardMatrix, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(keyboardMatrix, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(keyboardMatrix, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(keyboardMatrix, 1, LV_PART_MAIN);
+
+    lv_obj_set_style_bg_color(keyboardMatrix, TC(cardAlt), LV_PART_ITEMS | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(keyboardMatrix, TC(btnFocus), LV_PART_ITEMS | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(keyboardMatrix, TC(btnPress), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(keyboardMatrix, TC(text), LV_PART_ITEMS | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(keyboardMatrix, TC(text), LV_PART_ITEMS | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(keyboardMatrix, TC(border), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(keyboardMatrix, 1, LV_PART_ITEMS);
+    lv_obj_set_style_radius(keyboardMatrix, 3, LV_PART_ITEMS);
+
+    lv_obj_add_event_cb(keyboardMatrix, cb_keyboardMatrix, LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_group_add_obj(keyboardGroup, keyboardMatrix);
+
+    keyboardRefreshText();
+    keyboardRefreshCaps();
+
+    setGroup(keyboardGroup);
+
+    // Button matrices need encoder edit mode so rotating the encoder moves
+    // between keys instead of trying to leave the matrix object.
+    lv_group_set_editing(keyboardGroup, true);
+
+    Serial.printf("[Keyboard] Created. Free heap: %u bytes\n", ESP.getFreeHeap());
+
+    // Use a direct load for the keyboard test screen.
+    // The slide animation looked nice, but on-device it added visible flicker
+    // around the large button matrix. Direct load is cleaner/stabler here.
+    lv_screen_load(keyboardScreen);
+}
+
 static void styleListBtn(lv_obj_t *btn) {
     // Do NOT use lv_obj_remove_style_all(btn) here.
     // It breaks the built-in list/button spacing and can stack text/icons.
@@ -1240,11 +2365,12 @@ static void deleteGroup(lv_group_t **g)   { if (*g) { lv_group_delete(*g); *g = 
 //  MAIN MENU
 // ════════════════════════════════════════════════════════════════
 struct MenuItem { const char *icon; const char *label; const char *subTitle; };
-static const MenuItem MENU_ITEMS[4] = {
-    { LV_SYMBOL_WIFI,      "WiFi Tools",  LV_SYMBOL_WIFI      "  WiFi Tools" },
-    { LV_SYMBOL_BLUETOOTH, "BLE Tools",   LV_SYMBOL_BLUETOOTH "  BLE Tools"  },
-    { LV_SYMBOL_GPS,       "GPS Tools",   LV_SYMBOL_GPS       "  GPS Tools"  },
-    { LV_SYMBOL_SETTINGS,  "Misc Tools",  LV_SYMBOL_SETTINGS  "  Misc Tools" },
+static const MenuItem MENU_ITEMS[5] = {
+    { LV_SYMBOL_WIFI,      "WiFi Tools",   LV_SYMBOL_WIFI      "  WiFi Tools"   },
+    { LV_SYMBOL_BLUETOOTH, "BLE Tools",    LV_SYMBOL_BLUETOOTH "  BLE Tools"    },
+    { LV_SYMBOL_GPS,       "GPS Tools",    LV_SYMBOL_GPS       "  GPS Tools"    },
+    { LV_SYMBOL_AUDIO,     "Audio Tools",  LV_SYMBOL_AUDIO     "  Audio Tools"  },
+    { LV_SYMBOL_SETTINGS,  "Misc Tools",   LV_SYMBOL_SETTINGS  "  Misc Tools"   },
 };
 
 static void cb_menuFocused(lv_event_t *e) {
@@ -1258,7 +2384,8 @@ static void cb_menuClicked(lv_event_t *e) {
     if      (idx == 0) createWiFiMenu();
     else if (idx == 1) createBLEMenu();
     else if (idx == 2) createGPSMenu();
-    else if (idx == 3) createMiscMenu();
+    else if (idx == 3) createAudioMenu();
+    else if (idx == 4) createMiscMenu();
     else               createSubScreen(idx);
 }
 
@@ -1284,7 +2411,7 @@ void createMainMenu() {
     navGroup = lv_group_create();
     setGroup(navGroup);
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         lv_obj_t *btn = lv_list_add_btn(list, MENU_ITEMS[i].icon, MENU_ITEMS[i].label);
         styleListBtn(btn);
         lv_obj_set_height(btn, 30);
@@ -1392,6 +2519,7 @@ static void toggleDisplayRotation() {
     resetInactivityTimer();
     applyDisplayRotation(true);
     updateRotationMenuLabel();
+    savePersistentRotationSetting();
 }
 
 static const char *getDimmingMenuLabel() {
@@ -1417,6 +2545,7 @@ static void toggleDimmingEnabled() {
     // this immediately restores the TFT backlight and APA102 LED brightness.
     resetInactivityTimer();
     updateDimmingMenuLabel();
+    savePersistentDimmingSetting();
 }
 
 static const char *getLedsMenuLabel() {
@@ -1443,6 +2572,7 @@ static void toggleLedsEnabled() {
     resetInactivityTimer();
     refreshCurrentLEDs(LED_BRIGHTNESS);
     updateLedsMenuLabel();
+    savePersistentLedsSetting();
 }
 
 static void cb_miscMenuBack(lv_event_t *e) {
@@ -1454,6 +2584,15 @@ static void cb_miscMenuBack(lv_event_t *e) {
 }
 
 static void cb_miscToolBack(lv_event_t *e) {
+    // If user backs out before the auto-set timer fires, keep the latest
+    // chosen volume value instead of losing it.
+    if (menuVolPendingAutoSet) {
+        savePersistentMenuVolumeSetting();
+    }
+    if (alertVolPendingAutoSet) {
+        savePersistentAlertVolumeSetting();
+    }
+
     if (menuVolAutoTimer) {
         lv_timer_delete(menuVolAutoTimer);
         menuVolAutoTimer = nullptr;
@@ -1471,6 +2610,150 @@ static void cb_miscToolBack(lv_event_t *e) {
     setAllLEDs(MENU_COLORS[2].r, MENU_COLORS[2].g, MENU_COLORS[2].b, 3);
 }
 
+
+// ── Misc Tool — Power Off ───────────────────────────────────────
+static void performSoftwarePowerOff() {
+    if (powerOffTriggered) return;
+    powerOffTriggered = true;
+
+    // Stop active WiFi promiscuous modes cleanly before pulling the latch low.
+    if (deauthActive) {
+        deauthActive = false;
+        esp_wifi_set_promiscuous(false);
+    }
+    if (deauthTimer) {
+        lv_timer_delete(deauthTimer);
+        deauthTimer = nullptr;
+    }
+
+    // Show a simple final screen so the user gets clear feedback.
+    lv_obj_t *offScr = lv_obj_create(nullptr);
+    lv_obj_set_style_bg_color(offScr, lv_color_hex(0x000000), LV_PART_MAIN);
+
+    lv_obj_t *msg = lv_label_create(offScr);
+    lv_label_set_text(msg, LV_SYMBOL_POWER "  Powering off...");
+    lv_obj_set_style_text_color(msg, lv_color_hex(0xff4444), LV_PART_MAIN);
+    lv_obj_center(msg);
+
+    lv_screen_load(offScr);
+    lv_timer_handler();
+
+    // Silence lights/sound before shutting down.
+    setAllLEDs(0, 0, 0, 0);
+    if (soundReady) {
+        stopSoundDriverAfterChirp();
+    }
+
+    delay(POWER_OFF_DELAY_MS);
+
+    // T-Embed power latch: pulling POWER_PIN low turns the board off.
+    digitalWrite(POWER_PIN, LOW);
+}
+
+static void cb_powerOffConfirm(lv_event_t *e) {
+    (void)e;
+    performSoftwarePowerOff();
+}
+
+void createPowerOffConfirm() {
+    if (miscToolScreen) { lv_obj_delete(miscToolScreen); miscToolScreen = nullptr; }
+    miscToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(miscToolScreen);
+    createHeader(miscToolScreen, LV_SYMBOL_POWER "  Power Off");
+
+    lv_obj_t *card = lv_obj_create(miscToolScreen);
+    lv_obj_set_size(card, SCREEN_W - 18, 82);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_set_style_bg_color(card, TC(card), LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, TC(border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 8, LV_PART_MAIN);
+
+    lv_obj_t *msg = lv_label_create(card);
+    lv_label_set_text(msg,
+                      "Power off Rogue Radar?\n"
+                      "This puts the T-Embed to sleep.\n (Not actual power off)");
+    lv_obj_set_style_text_color(msg, TC(text), LV_PART_MAIN);
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_width(msg, SCREEN_W - 42);
+    lv_obj_center(msg);
+
+    lv_obj_t *backBtn = createBackBtn(miscToolScreen, cb_miscToolBack);
+    lv_obj_t *powerBtn = createActionBtn(miscToolScreen, LV_SYMBOL_POWER "  Power Off", cb_powerOffConfirm);
+    lv_obj_set_style_bg_color(powerBtn, lv_color_hex(TH.stopRed), LV_PART_MAIN);
+    lv_obj_set_style_border_color(powerBtn, lv_color_hex(TH.alert), LV_PART_MAIN);
+
+    deleteGroup(&miscToolGroup);
+    miscToolGroup = lv_group_create();
+    lv_group_add_obj(miscToolGroup, backBtn);
+    lv_group_add_obj(miscToolGroup, powerBtn);
+    setGroup(miscToolGroup);
+
+    setAllLEDs(MENU_COLORS[2].r, MENU_COLORS[2].g, MENU_COLORS[2].b, 3);
+    lv_screen_load_anim(miscToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+
+// ── Misc Tool — Reset Settings ─────────────────────────────────
+static lv_obj_t *resetSettingsStatusLbl = nullptr;
+
+static void cb_restartAfterReset(lv_timer_t *timer) {
+    if (timer) lv_timer_delete(timer);
+    ESP.restart();
+}
+
+static void cb_resetSettingsConfirm(lv_event_t *e) {
+    (void)e;
+    resetPersistentSettings();
+
+    if (resetSettingsStatusLbl) {
+        lv_label_set_text(resetSettingsStatusLbl,
+                          "Saved settings cleared.\nRestarting with config.h defaults...");
+        lv_obj_set_style_text_color(resetSettingsStatusLbl, TC(success), LV_PART_MAIN);
+    }
+
+    lv_timer_create(cb_restartAfterReset, 1200, nullptr);
+}
+
+void createResetSettings() {
+    if (miscToolScreen) { lv_obj_delete(miscToolScreen); miscToolScreen = nullptr; }
+    miscToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(miscToolScreen);
+    createHeader(miscToolScreen, LV_SYMBOL_SETTINGS "  Reset Settings");
+
+    lv_obj_t *card = lv_obj_create(miscToolScreen);
+    lv_obj_set_size(card, SCREEN_W - 18, 92);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(card, TC(card), LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, TC(border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 8, LV_PART_MAIN);
+
+    resetSettingsStatusLbl = lv_label_create(card);
+    lv_label_set_text(resetSettingsStatusLbl,
+                      "Clear all saved NVS settings?\n"
+                      "Theme, brightness, rotation, LEDs, dimming,\n"
+                      "sound volumes, and scan defaults will reset.");
+    lv_obj_set_style_text_color(resetSettingsStatusLbl, TC(text), LV_PART_MAIN);
+    lv_obj_set_style_text_align(resetSettingsStatusLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_width(resetSettingsStatusLbl, SCREEN_W - 40);
+    lv_obj_center(resetSettingsStatusLbl);
+
+    lv_obj_t *backBtn = createBackBtn(miscToolScreen, cb_miscToolBack);
+    lv_obj_t *resetBtn = createActionBtn(miscToolScreen, "Clear & Restart", cb_resetSettingsConfirm);
+
+    deleteGroup(&miscToolGroup);
+    miscToolGroup = lv_group_create();
+    lv_group_add_obj(miscToolGroup, backBtn);
+    lv_group_add_obj(miscToolGroup, resetBtn);
+    setGroup(miscToolGroup);
+
+    setAllLEDs(MENU_COLORS[2].r, MENU_COLORS[2].g, MENU_COLORS[2].b, 3);
+    lv_screen_load_anim(miscToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
 static void cb_miscToolSelected(lv_event_t *e) {
     int t = (int)(intptr_t)lv_event_get_user_data(e);
     switch (t) {
@@ -1486,6 +2769,8 @@ static void cb_miscToolSelected(lv_event_t *e) {
         case 9: toggleMenuFeedbackEnabled(); break;
         case 10: createMenuFeedbackVolumeControl(); break;
         case 11: toggleDisplayRotation();  break;
+        case 12: createResetSettings();    break;
+        case 13: createPowerOffConfirm();  break;
     }
 }
 
@@ -1516,7 +2801,7 @@ void createMiscMenu() {
     miscAlertVolumeBtn = nullptr;
     miscRotationBtn = nullptr;
 
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 14; i++) {
         const char *label = nullptr;
         if (i < 5) {
             label = MISC_TOOL_LABELS[i];
@@ -1532,8 +2817,15 @@ void createMiscMenu() {
             label = getMenuSoundMenuLabel();
         } else if (i == 10) {
             label = getMenuVolumeMenuLabel();
-        } else {
+        } else if (i == 11) {
             label = getRotationMenuLabel();
+        } else if (i == 12) {
+            // Reset Settings icon: use LVGL new-line symbol as requested.
+            label = LV_SYMBOL_NEW_LINE "  Reset Settings";
+        } else if (i == 13) {
+            label = LV_SYMBOL_POWER "  Power Off";
+        } else {
+            label = "  Unknown";
         }
         lv_obj_t *btn = lv_list_add_btn(list, nullptr, label);
         styleListBtn(btn);
@@ -1564,6 +2856,7 @@ void createMiscMenu() {
     setAllLEDs(MENU_COLORS[2].r, MENU_COLORS[2].g, MENU_COLORS[2].b, 3);
     lv_screen_load_anim(miscMenuScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
+
 
 // ── Misc Tool 1 — Device Info ────────────────────────────────────
 void createDeviceInfo() {
@@ -1623,20 +2916,21 @@ void createDeviceInfo() {
 
     uint64_t efuseMac = ESP.getEfuseMac();
 
-    char info[900];
+    char info[1000];
 #if BATTERY_METER_ENABLED
     snprintf(info, sizeof(info),
-             "FW       : %s\n"
+             "HW       : %s\n"
+             "FW       : %s\n"             
              "Chip     : ESP32-S3  (%d cores)\n"
              "CPU      : %lu MHz\n"
              "Flash    : %lu KB @ %lu MHz\n"
              "Heap     : %lu B free\n"
              "Battery  : %.2fV  %d%%  raw:%d\n"
              "Device MAC: %s\n"
-             "WiFi STA : %s\n"
              "WiFi AP  : %s\n"
              "BLE MAC  : %s\n"
              "eFuse ID : %04X%08lX",
+             DEVICE_TYPE,
              firmwareVer,
              cores,
              (unsigned long)cpuMHz,
@@ -1647,30 +2941,29 @@ void createDeviceInfo() {
              battPct,
              battRaw,
              staMacStr,
-             staMacStr,
              apMacStr,
              btMacStr,
              (uint16_t)(efuseMac >> 32),
              (unsigned long)(efuseMac & 0xFFFFFFFF));
 #else
     snprintf(info, sizeof(info),
-             "FW       : %s\n"
+             "HW       : %s\n"
+             "FW       : %s\n" 
              "Chip     : ESP32-S3  (%d cores)\n"
              "CPU      : %lu MHz\n"
              "Flash    : %lu KB @ %lu MHz\n"
              "Heap     : %lu B free\n"
              "Device MAC: %s\n"
-             "WiFi STA : %s\n"
              "WiFi AP  : %s\n"
              "BLE MAC  : %s\n"
              "eFuse ID : %04X%08lX",
+             DEVICE_TYPE,
              firmwareVer,
              cores,
              (unsigned long)cpuMHz,
              (unsigned long)flash,
              (unsigned long)flashSpd,
              (unsigned long)heap,
-             staMacStr,
              staMacStr,
              apMacStr,
              btMacStr,
@@ -1852,8 +3145,8 @@ void createSDUpdate() {
 // ════════════════════════════════════════════════════════════════
 //  MISC TOOL – SCAN DEFAULTS
 //
-//  Session-only settings. Values start from config.h on boot and reset
-//  after reboot. No Preferences/NVS writes are used here.
+//  Persistent v1.0.4 Pass 3 settings. Values start from config.h when no
+//  saved NVS value exists, then save when changed from this page.
 // ════════════════════════════════════════════════════════════════
 static lv_obj_t *scanDefaultsBleBtn    = nullptr;
 static lv_obj_t *scanDefaultsWifiBtn   = nullptr;
@@ -1909,6 +3202,114 @@ static int nextOptionValue(const int *options, int count, int currentValue) {
     return options[0];
 }
 
+static bool isValidOptionValue(const int *options, int count, int value) {
+    for (int i = 0; i < count; i++) {
+        if (options[i] == value) return true;
+    }
+    return false;
+}
+
+static void loadPersistentScanSettings() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, true);
+
+    int savedBleSecs = settingsPrefs.getInt("bleSec", BLE_SCAN_SECS);
+    bleScanSeconds = isValidOptionValue(BLE_TIME_OPTIONS,
+                                        sizeof(BLE_TIME_OPTIONS) / sizeof(BLE_TIME_OPTIONS[0]),
+                                        savedBleSecs) ? savedBleSecs : BLE_SCAN_SECS;
+
+    int savedWifiSecs = settingsPrefs.getInt("wifiSec", WIFI_SCAN_SECS);
+    wifiScanSeconds = isValidOptionValue(WIFI_TIME_OPTIONS,
+                                         sizeof(WIFI_TIME_OPTIONS) / sizeof(WIFI_TIME_OPTIONS[0]),
+                                         savedWifiSecs) ? savedWifiSecs : WIFI_SCAN_SECS;
+
+    int savedWifiResults = settingsPrefs.getInt("wifiMax", MAX_WIFI_RESULTS);
+    wifiMaxResults = isValidOptionValue(WIFI_RESULT_OPTIONS,
+                                        sizeof(WIFI_RESULT_OPTIONS) / sizeof(WIFI_RESULT_OPTIONS[0]),
+                                        savedWifiResults) ? savedWifiResults : MAX_WIFI_RESULTS;
+    if (wifiMaxResults > MAX_WIFI_RESULTS) wifiMaxResults = MAX_WIFI_RESULTS;
+
+    int savedDeauthHop = settingsPrefs.getInt("deHop", DEAUTH_HOP_MS);
+    deauthHopMs = isValidOptionValue(DEAUTH_HOP_OPTIONS,
+                                     sizeof(DEAUTH_HOP_OPTIONS) / sizeof(DEAUTH_HOP_OPTIONS[0]),
+                                     savedDeauthHop) ? savedDeauthHop : DEAUTH_HOP_MS;
+
+    int savedFlockPreset = settingsPrefs.getUChar("flockPre", FLOCK_HYBRID_PRESET_DEFAULT);
+    flockHybridPresetIdx = (savedFlockPreset >= 0 && savedFlockPreset < FLOCK_HYBRID_PRESET_COUNT)
+                         ? savedFlockPreset
+                         : FLOCK_HYBRID_PRESET_DEFAULT;
+    applyFlockHybridPreset();
+
+    packetMonitorHopEnabled = settingsPrefs.getBool("pktHopOn", (PACKET_MONITOR_HOP_ENABLED_DEFAULT != 0));
+
+    int savedPacketHopMs = settingsPrefs.getInt("pktHopMs", PACKET_MONITOR_HOP_MS);
+    packetMonitorHopMs = isValidOptionValue(PACKET_HOP_OPTIONS,
+                                            sizeof(PACKET_HOP_OPTIONS) / sizeof(PACKET_HOP_OPTIONS[0]),
+                                            savedPacketHopMs) ? savedPacketHopMs : PACKET_MONITOR_HOP_MS;
+    packetMonitorLastHopMs = millis();
+
+    settingsPrefs.end();
+
+    Serial.println("[Rogue-Radar] NVS scan defaults loaded.");
+#endif
+}
+
+static void savePersistentBleScanSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putInt("bleSec", bleScanSeconds);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentWifiScanSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putInt("wifiSec", wifiScanSeconds);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentWifiResultsSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putInt("wifiMax", wifiMaxResults);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentDeauthHopSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putInt("deHop", deauthHopMs);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentFlockHybridSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putUChar("flockPre", (uint8_t)flockHybridPresetIdx);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentPacketHopEnabledSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putBool("pktHopOn", packetMonitorHopEnabled);
+    settingsPrefs.end();
+#endif
+}
+
+static void savePersistentPacketHopMsSetting() {
+#if PERSISTENT_SETTINGS_ENABLED
+    settingsPrefs.begin(PREFS_NAMESPACE, false);
+    settingsPrefs.putInt("pktHopMs", packetMonitorHopMs);
+    settingsPrefs.end();
+#endif
+}
+
 static void setBtnText(lv_obj_t *btn, const char *txt) {
     if (!btn) return;
     lv_obj_t *label = lv_obj_get_child(btn, 0);
@@ -1935,12 +3336,14 @@ static void updateScanDefaultsLabels() {
 
 static void cb_scanDefaultsBle(lv_event_t *e) {
     bleScanSeconds = nextOptionValue(BLE_TIME_OPTIONS, sizeof(BLE_TIME_OPTIONS) / sizeof(BLE_TIME_OPTIONS[0]), bleScanSeconds);
+    savePersistentBleScanSetting();
     resetInactivityTimer();
     updateScanDefaultsLabels();
 }
 
 static void cb_scanDefaultsWifiTime(lv_event_t *e) {
     wifiScanSeconds = nextOptionValue(WIFI_TIME_OPTIONS, sizeof(WIFI_TIME_OPTIONS) / sizeof(WIFI_TIME_OPTIONS[0]), wifiScanSeconds);
+    savePersistentWifiScanSetting();
     resetInactivityTimer();
     updateScanDefaultsLabels();
 }
@@ -1948,12 +3351,14 @@ static void cb_scanDefaultsWifiTime(lv_event_t *e) {
 static void cb_scanDefaultsWifiResults(lv_event_t *e) {
     wifiMaxResults = nextOptionValue(WIFI_RESULT_OPTIONS, sizeof(WIFI_RESULT_OPTIONS) / sizeof(WIFI_RESULT_OPTIONS[0]), wifiMaxResults);
     if (wifiMaxResults > MAX_WIFI_RESULTS) wifiMaxResults = MAX_WIFI_RESULTS;
+    savePersistentWifiResultsSetting();
     resetInactivityTimer();
     updateScanDefaultsLabels();
 }
 
 static void cb_scanDefaultsDeauthHop(lv_event_t *e) {
     deauthHopMs = nextOptionValue(DEAUTH_HOP_OPTIONS, sizeof(DEAUTH_HOP_OPTIONS) / sizeof(DEAUTH_HOP_OPTIONS[0]), deauthHopMs);
+    savePersistentDeauthHopSetting();
     resetInactivityTimer();
     updateScanDefaultsLabels();
 }
@@ -1961,6 +3366,7 @@ static void cb_scanDefaultsDeauthHop(lv_event_t *e) {
 static void cb_scanDefaultsFlockHybrid(lv_event_t *e) {
     flockHybridPresetIdx = (flockHybridPresetIdx + 1) % FLOCK_HYBRID_PRESET_COUNT;
     applyFlockHybridPreset();
+    savePersistentFlockHybridSetting();
     resetInactivityTimer();
     updateScanDefaultsLabels();
 }
@@ -1968,6 +3374,7 @@ static void cb_scanDefaultsFlockHybrid(lv_event_t *e) {
 static void cb_scanDefaultsPacketHopToggle(lv_event_t *e) {
     packetMonitorHopEnabled = !packetMonitorHopEnabled;
     packetMonitorLastHopMs = millis();
+    savePersistentPacketHopEnabledSetting();
     resetInactivityTimer();
     updateScanDefaultsLabels();
 }
@@ -1975,6 +3382,7 @@ static void cb_scanDefaultsPacketHopToggle(lv_event_t *e) {
 static void cb_scanDefaultsPacketHopMs(lv_event_t *e) {
     packetMonitorHopMs = nextOptionValue(PACKET_HOP_OPTIONS, sizeof(PACKET_HOP_OPTIONS) / sizeof(PACKET_HOP_OPTIONS[0]), packetMonitorHopMs);
     packetMonitorLastHopMs = millis();
+    savePersistentPacketHopMsSetting();
     resetInactivityTimer();
     updateScanDefaultsLabels();
 }
@@ -2081,12 +3489,14 @@ static void cb_brightDown(lv_event_t *e) {
     lcdBrightness -= 13;   // ~5% of 255
     if (lcdBrightness < 13) lcdBrightness = 13;  // min ~5% — keep display visible
     applyBrightness();
+    savePersistentBrightnessSetting();
 }
 
 static void cb_brightUp(lv_event_t *e) {
     lcdBrightness += 13;
     if (lcdBrightness > 255) lcdBrightness = 255;
     applyBrightness();
+    savePersistentBrightnessSetting();
 }
 
 void createBrightnessControl() {
@@ -2218,6 +3628,7 @@ static void alertVolumeAutoSetTimerCb(lv_timer_t *timer) {
     if (now - alertVolLastAdjustMs < SOUND_VOLUME_AUTO_SET_MS) return;
 
     alertVolPendingAutoSet = false;
+    savePersistentAlertVolumeSetting();
     updateAlertVolumeHint("Set. Back highlighted.");
 
     // Highlight/focus Back after the chosen value sits for a moment.
@@ -2382,6 +3793,7 @@ static void menuVolumeAutoSetTimerCb(lv_timer_t *timer) {
     if (now - menuVolLastAdjustMs < MENU_FEEDBACK_VOLUME_AUTO_SET_MS) return;
 
     menuVolPendingAutoSet = false;
+    savePersistentMenuVolumeSetting();
     updateMenuVolumeHint("Set. Back highlighted.");
 
     // Highlight/focus Back after the chosen value sits for a moment.
@@ -2534,6 +3946,7 @@ void createThemePicker() {
         lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
             int idx = (int)(intptr_t)lv_event_get_user_data(ev);
             currentTheme = idx;
+            savePersistentThemeSetting();
             miscToolScreen = nullptr;
             deleteGroup(&miscToolGroup);
             setAllLEDs(MENU_COLORS[2].r, MENU_COLORS[2].g, MENU_COLORS[2].b, 3);
@@ -2556,6 +3969,782 @@ void createThemePicker() {
     lv_screen_load_anim(miscToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
+
+// ════════════════════════════════════════════════════════════════
+//  AUDIO TOOLS MENU + SOUND RECORDER
+//
+//  First-pass recorder for the T-Embed ES7210 microphone path.
+//  This keeps audio work isolated from WiFi/BLE/LAN tools. The mic uses
+//  I2S_NUM_1 for input, while the existing speaker chirp path uses I2S_NUM_0
+//  for output.
+// ════════════════════════════════════════════════════════════════
+static const char *AUDIO_TOOL_LABELS[] = {
+    LV_SYMBOL_AUDIO "  Sound Recorder"
+};
+
+static lv_obj_t *soundRecorderStatusLbl = nullptr;
+static lv_obj_t *soundRecorderInfoLbl   = nullptr;
+static lv_obj_t *soundRecorderMeterLbl  = nullptr;
+static lv_obj_t *soundRecorderRecordBtn = nullptr;
+static lv_obj_t *soundRecorderPlayBtn   = nullptr;
+static lv_obj_t *soundRecorderRecordBtnLbl = nullptr;
+static lv_obj_t *soundRecorderPlayBtnLbl   = nullptr;
+
+static int16_t *soundRecorderBuffer = nullptr;
+static size_t   soundRecorderSamples = 0;
+static size_t   soundRecorderCapacitySamples = 0;
+static bool     soundRecorderInputReady = false;
+// When recording is active, pressing the same Record button again requests
+// a clean stop. The blocking I2S read loop checks this flag between chunks.
+static volatile bool soundRecorderRecording = false;
+static volatile bool soundRecorderStopRequested = false;
+
+// When Stop is detected by polling the physical encoder button inside the
+// blocking record loop, LVGL can still deliver one leftover click after the
+// button is released. This guard ignores that stale click so recording does
+// not immediately start again.
+static volatile bool soundRecorderIgnoreNextRecordClick = false;
+static volatile uint32_t soundRecorderIgnoreRecordClickUntilMs = 0;
+
+static void soundRecorderSetStatus(const char *text, uint32_t color) {
+    if (!soundRecorderStatusLbl) return;
+    lv_label_set_text(soundRecorderStatusLbl, text);
+    lv_obj_set_style_text_color(soundRecorderStatusLbl, lv_color_hex(color), LV_PART_MAIN);
+    lv_refr_now(lvDisp);
+}
+
+static void soundRecorderUpdateInfo(const char *extra = nullptr) {
+    if (!soundRecorderInfoLbl) return;
+    char buf[96];
+
+    // Keep the left panel simple and short.
+    // Status messages stay on the Status line above, while this area only
+    // shows timing/playback info so it does not clip inside the compact box.
+    uint32_t recordedMs = (AUDIO_RECORD_SAMPLE_RATE > 0)
+                        ? (uint32_t)((soundRecorderSamples * 1000ULL) / AUDIO_RECORD_SAMPLE_RATE)
+                        : 0;
+    uint32_t capacityMs = (AUDIO_RECORD_SAMPLE_RATE > 0)
+                        ? (uint32_t)((soundRecorderCapacitySamples * 1000ULL) / AUDIO_RECORD_SAMPLE_RATE)
+                        : 0;
+    if (capacityMs == 0) capacityMs = (uint32_t)AUDIO_RECORD_SECONDS * 1000UL;
+
+    (void)extra; // Extra text is intentionally not shown here to keep the panel clean.
+    snprintf(buf, sizeof(buf), "Time: %.1f / %.1fs\nPlay: %u%%",
+             recordedMs / 1000.0f,
+             capacityMs / 1000.0f,
+             (unsigned)AUDIO_RECORD_PLAYBACK_SPEED_PERCENT);
+    lv_label_set_text(soundRecorderInfoLbl, buf);
+}
+
+static void soundRecorderUpdateMeter(int32_t peak) {
+    if (!soundRecorderMeterLbl) return;
+    if (peak < 0) peak = -peak;
+    int bars = peak / 2200;
+    if (bars > 10) bars = 10;
+    char line[28];
+    int p = 0;
+    p += snprintf(line + p, sizeof(line) - p, "Lvl:[");
+    for (int i = 0; i < 10 && p < (int)sizeof(line)-2; i++) line[p++] = (i < bars) ? '#' : '-';
+    snprintf(line + p, sizeof(line) - p, "]");
+    lv_label_set_text(soundRecorderMeterLbl, line);
+}
+
+static void soundRecorderFreeBuffer() {
+    if (soundRecorderBuffer) {
+        free(soundRecorderBuffer);
+        soundRecorderBuffer = nullptr;
+    }
+    soundRecorderSamples = 0;
+    soundRecorderCapacitySamples = 0;
+}
+
+static bool soundRecorderAllocBuffer() {
+    soundRecorderFreeBuffer();
+
+    const size_t requestedSamples = (size_t)AUDIO_RECORD_SAMPLE_RATE * (size_t)AUDIO_RECORD_SECONDS;
+    if (requestedSamples == 0) return false;
+
+    const size_t requestedBytes = requestedSamples * sizeof(int16_t);
+    size_t bytesToAlloc = requestedBytes;
+
+    // Prefer PSRAM when available. The 5-second 16 kHz buffer is about 160 KB,
+    // which can fail from normal heap fragmentation after WiFi/BLE/LVGL use.
+    if (psramFound()) {
+        soundRecorderBuffer = (int16_t *)heap_caps_malloc(bytesToAlloc, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (soundRecorderBuffer) {
+            soundRecorderCapacitySamples = bytesToAlloc / sizeof(int16_t);
+            memset(soundRecorderBuffer, 0, bytesToAlloc);
+            return true;
+        }
+    }
+
+    // Try normal 8-bit heap for the full requested buffer.
+    soundRecorderBuffer = (int16_t *)heap_caps_malloc(bytesToAlloc, MALLOC_CAP_8BIT);
+    if (!soundRecorderBuffer) {
+#if AUDIO_RECORD_ALLOW_SHORT_BUFFER
+        // Last-resort fallback: make the recorder usable even when there is not
+        // enough contiguous RAM for the full requested clip length.
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        const size_t safetyBytes = AUDIO_RECORD_BUFFER_SAFETY_BYTES;  // Keep heap free for LVGL/buttons while recording.
+        const size_t minBytes = (size_t)AUDIO_RECORD_SAMPLE_RATE * sizeof(int16_t); // 1 second minimum
+
+        if (largest > (safetyBytes + minBytes)) {
+            bytesToAlloc = largest - safetyBytes;
+            if (bytesToAlloc > requestedBytes) bytesToAlloc = requestedBytes;
+            bytesToAlloc &= ~(sizeof(int16_t) - 1); // sample-align
+            soundRecorderBuffer = (int16_t *)heap_caps_malloc(bytesToAlloc, MALLOC_CAP_8BIT);
+        }
+#endif
+    }
+
+    if (!soundRecorderBuffer) {
+        soundRecorderCapacitySamples = 0;
+        return false;
+    }
+
+    soundRecorderCapacitySamples = bytesToAlloc / sizeof(int16_t);
+    memset(soundRecorderBuffer, 0, bytesToAlloc);
+    return true;
+}
+
+// ─── Minimal ES7210 ADC init for the T-Embed microphone ───────────────
+// Based on LilyGO's T-Embed mic example, but kept self-contained so the
+// Rogue Radar sketch does not need extra ES7210 library files in the folder.
+static bool soundRecorderEs7210Write(uint8_t reg, uint8_t value) {
+#if AUDIO_RECORDER_USE_ES7210_I2C
+    Wire.beginTransmission(AUDIO_RECORDER_ES7210_ADDR);
+    Wire.write(reg);
+    Wire.write(value);
+    return (Wire.endTransmission() == 0);
+#else
+    (void)reg; (void)value;
+    return true;
+#endif
+}
+
+static int soundRecorderEs7210Read(uint8_t reg) {
+#if AUDIO_RECORDER_USE_ES7210_I2C
+    Wire.beginTransmission(AUDIO_RECORDER_ES7210_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return -1;
+    if (Wire.requestFrom((uint8_t)AUDIO_RECORDER_ES7210_ADDR, (uint8_t)1) != 1) return -1;
+    return Wire.read();
+#else
+    (void)reg;
+    return 0;
+#endif
+}
+
+static bool soundRecorderEs7210Update(uint8_t reg, uint8_t mask, uint8_t value) {
+    int current = soundRecorderEs7210Read(reg);
+    if (current < 0) return false;
+    uint8_t next = ((uint8_t)current & ~mask) | (value & mask);
+    return soundRecorderEs7210Write(reg, next);
+}
+
+static bool soundRecorderEs7210Probe() {
+#if AUDIO_RECORDER_USE_ES7210_I2C
+    Wire.begin(AUDIO_RECORDER_I2C_SDA, AUDIO_RECORDER_I2C_SCL);
+    Wire.beginTransmission(AUDIO_RECORDER_ES7210_ADDR);
+    uint8_t err = Wire.endTransmission();
+    if (err != 0) {
+        Serial.printf("[Audio] ES7210 probe miss SDA=%d SCL=%d addr=0x%02X err=%u\n",
+                      AUDIO_RECORDER_I2C_SDA,
+                      AUDIO_RECORDER_I2C_SCL,
+                      AUDIO_RECORDER_ES7210_ADDR,
+                      err);
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+static bool soundRecorderEs7210SelectAllMics() {
+    bool ok = true;
+    // Clear mic enable bits, power both mic groups, then enable all four ADC paths.
+    for (uint8_t r = 0x43; r <= 0x46; r++) ok &= soundRecorderEs7210Update(r, 0x10, 0x00);
+    ok &= soundRecorderEs7210Write(0x4B, 0xFF);
+    ok &= soundRecorderEs7210Write(0x4C, 0xFF);
+
+    // MIC1 + MIC2 group
+    ok &= soundRecorderEs7210Update(0x01, 0x0B, 0x00);
+    ok &= soundRecorderEs7210Write(0x4B, 0x00);
+    ok &= soundRecorderEs7210Update(0x43, 0x10, 0x10);
+    ok &= soundRecorderEs7210Update(0x44, 0x10, 0x10);
+
+    // MIC3 + MIC4 group
+    ok &= soundRecorderEs7210Update(0x01, 0x15, 0x00);
+    ok &= soundRecorderEs7210Write(0x4C, 0x00);
+    ok &= soundRecorderEs7210Update(0x45, 0x10, 0x10);
+    ok &= soundRecorderEs7210Update(0x46, 0x10, 0x10);
+    return ok;
+}
+
+static bool soundRecorderEs7210SetGain(uint8_t reg, uint8_t gain) {
+    if (gain > 14) gain = 14;
+    return soundRecorderEs7210Update(reg, 0x0F, gain);
+}
+
+static bool soundRecorderInitEs7210() {
+#if AUDIO_RECORDER_USE_ES7210_I2C
+    if (!soundRecorderEs7210Probe()) return false;
+
+    bool ok = true;
+    Serial.printf("[Audio] ES7210 found at 0x%02X on SDA=%d SCL=%d\n",
+                  AUDIO_RECORDER_ES7210_ADDR,
+                  AUDIO_RECORDER_I2C_SDA,
+                  AUDIO_RECORDER_I2C_SCL);
+
+    // Reset and basic timing/power setup from LilyGO's official mic example.
+    ok &= soundRecorderEs7210Write(0x00, 0xFF); // reset
+    delay(2);
+    ok &= soundRecorderEs7210Write(0x00, 0x41);
+    ok &= soundRecorderEs7210Write(0x01, 0x1F); // clocks off during setup
+    ok &= soundRecorderEs7210Write(0x09, 0x30);
+    ok &= soundRecorderEs7210Write(0x0A, 0x30);
+
+    // Slave mode, analog power/bias, and 16 kHz / 16-bit normal I2S.
+    ok &= soundRecorderEs7210Write(0x40, 0xC3);
+    ok &= soundRecorderEs7210Write(0x41, 0x70);
+    ok &= soundRecorderEs7210Write(0x42, 0x70);
+    ok &= soundRecorderEs7210Write(0x02, 0xC1); // 16 kHz coefficient using 4.096 MHz MCLK
+    ok &= soundRecorderEs7210Write(0x07, 0x20);
+    ok &= soundRecorderEs7210Write(0x04, 0x01);
+    ok &= soundRecorderEs7210Write(0x05, 0x00);
+    ok &= soundRecorderEs7210Write(0x11, 0x60); // 16-bit, normal I2S
+    ok &= soundRecorderEs7210Write(0x12, 0x00); // ADC1/2 to SDOUT1, ADC3/4 to SDOUT2
+
+    ok &= soundRecorderEs7210SelectAllMics();
+
+    // LilyGO's example uses 0dB on MIC1/2 and 37.5dB on MIC3/4.
+    ok &= soundRecorderEs7210SetGain(0x43, AUDIO_RECORDER_ES7210_GAIN_MIC12);
+    ok &= soundRecorderEs7210SetGain(0x44, AUDIO_RECORDER_ES7210_GAIN_MIC12);
+    ok &= soundRecorderEs7210SetGain(0x45, AUDIO_RECORDER_ES7210_GAIN_MIC34);
+    ok &= soundRecorderEs7210SetGain(0x46, AUDIO_RECORDER_ES7210_GAIN_MIC34);
+
+    // Start ADC clocks and power up all mic inputs.
+    ok &= soundRecorderEs7210Write(0x01, 0x00);
+    ok &= soundRecorderEs7210Write(0x06, 0x00);
+    ok &= soundRecorderEs7210Write(0x47, 0x00);
+    ok &= soundRecorderEs7210Write(0x48, 0x00);
+    ok &= soundRecorderEs7210Write(0x49, 0x00);
+    ok &= soundRecorderEs7210Write(0x4A, 0x00);
+    ok &= soundRecorderEs7210SelectAllMics();
+
+    Serial.printf("[Audio] ES7210 init %s\n", ok ? "OK" : "had I2C write misses");
+    return ok;
+#else
+    return true;
+#endif
+}
+
+static void soundRecorderStopInput() {
+    if (!soundRecorderInputReady) return;
+    i2s_zero_dma_buffer(I2S_NUM_1);
+    i2s_driver_uninstall(I2S_NUM_1);
+    soundRecorderInputReady = false;
+}
+
+static bool soundRecorderInitInput() {
+    soundRecorderStopInput();
+
+    // The ES7210 must be configured over I2C before the I2S data line
+    // carries real microphone audio. LilyGO's official T-Embed mic example
+    // uses SDA=18/SCL=8, then starts I2S RX on the mic pins below.
+    bool es7210Ready = soundRecorderInitEs7210();
+    if (!es7210Ready) {
+#if AUDIO_RECORDER_REQUIRE_ES7210_I2C
+        Serial.println("[Audio] ES7210 init failed; recording stopped");
+        return false;
+#else
+        Serial.println("[Audio] ES7210 init failed; trying raw I2S RX anyway");
+#endif
+    }
+
+    Serial.printf("[Audio] I2S mic pins BCLK=%d LRCK=%d DIN=%d MCLK=%d\n",
+                  AUDIO_RECORDER_MIC_BCLK,
+                  AUDIO_RECORDER_MIC_LRCK,
+                  AUDIO_RECORDER_MIC_DIN,
+                  AUDIO_RECORDER_MIC_MCLK);
+
+    i2s_config_t i2sConfig = {};
+    i2sConfig.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+    i2sConfig.sample_rate = AUDIO_RECORD_SAMPLE_RATE;
+    i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+    i2sConfig.channel_format = I2S_CHANNEL_FMT_ALL_LEFT;
+    i2sConfig.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    i2sConfig.intr_alloc_flags = 0;
+    i2sConfig.dma_buf_count = 4;
+    i2sConfig.dma_buf_len = 256;
+    i2sConfig.use_apll = false;
+    i2sConfig.tx_desc_auto_clear = false;
+    i2sConfig.fixed_mclk = 0;
+#if defined(I2S_MCLK_MULTIPLE_256)
+    i2sConfig.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+#endif
+#if defined(I2S_BITS_PER_CHAN_16BIT)
+    i2sConfig.bits_per_chan = I2S_BITS_PER_CHAN_16BIT;
+#endif
+#if defined(I2S_TDM_ACTIVE_CH0) && defined(I2S_TDM_ACTIVE_CH1)
+    i2sConfig.chan_mask = (i2s_channel_t)(I2S_TDM_ACTIVE_CH0 | I2S_TDM_ACTIVE_CH1);
+#endif
+
+    if (i2s_driver_install(I2S_NUM_1, &i2sConfig, 0, nullptr) != ESP_OK) {
+        Serial.println("[Audio] I2S RX driver install failed");
+        return false;
+    }
+
+    i2s_pin_config_t pinConfig = {};
+#if defined(SOC_I2S_SUPPORTS_MCLK) || defined(CONFIG_IDF_TARGET_ESP32S3)
+    pinConfig.mck_io_num = AUDIO_RECORDER_MIC_MCLK;
+#endif
+    pinConfig.bck_io_num = AUDIO_RECORDER_MIC_BCLK;
+    pinConfig.ws_io_num = AUDIO_RECORDER_MIC_LRCK;
+    pinConfig.data_out_num = I2S_PIN_NO_CHANGE;
+    pinConfig.data_in_num = AUDIO_RECORDER_MIC_DIN;
+
+    if (i2s_set_pin(I2S_NUM_1, &pinConfig) != ESP_OK) {
+        Serial.println("[Audio] I2S RX pin setup failed");
+        i2s_driver_uninstall(I2S_NUM_1);
+        return false;
+    }
+
+    i2s_zero_dma_buffer(I2S_NUM_1);
+    soundRecorderInputReady = true;
+    return true;
+}
+
+static void cb_soundRecorderRecord(lv_event_t *) {
+    resetInactivityTimer();
+
+    // Debounce/restart guard after a manual Stop press.
+    // The recorder loop polls the physical encoder button while LVGL is busy.
+    // Without this guard, the same release/click can be delivered after the
+    // loop exits and instantly start a new recording.
+    uint32_t nowMs = millis();
+    if (soundRecorderIgnoreNextRecordClick) {
+        if (nowMs < soundRecorderIgnoreRecordClickUntilMs) {
+            if (digitalRead(ENCODER_BTN) == HIGH) {
+                // Keep ignoring until the guard window expires, but release
+                // detection confirms the button is no longer physically held.
+            }
+            return;
+        }
+        soundRecorderIgnoreNextRecordClick = false;
+        soundRecorderIgnoreRecordClickUntilMs = 0;
+    }
+
+    // If we are already recording, this button becomes Stop. Do not restart
+    // or reallocate the buffer; just ask the active recording loop to exit.
+    if (soundRecorderRecording) {
+        soundRecorderStopRequested = true;
+        if (soundRecorderRecordBtnLbl) lv_label_set_text(soundRecorderRecordBtnLbl, LV_SYMBOL_STOP "  Stopping");
+        soundRecorderSetStatus(LV_SYMBOL_STOP "  Stopping...", TH.warn);
+        return;
+    }
+
+    if (!soundRecorderAllocBuffer()) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  No buffer", TH.alert);
+        soundRecorderUpdateInfo("Try shorter seconds in config.h");
+        return;
+    }
+
+    const size_t requestedSamples = (size_t)AUDIO_RECORD_SAMPLE_RATE * (size_t)AUDIO_RECORD_SECONDS;
+    bool usingShortBuffer = (soundRecorderCapacitySamples < requestedSamples);
+
+    if (!soundRecorderInitInput()) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  Mic failed", TH.alert);
+        soundRecorderUpdateInfo("Check ES7210 I2C pins/config");
+        return;
+    }
+
+    soundRecorderStopRequested = false;
+    soundRecorderRecording = true;
+    if (soundRecorderRecordBtnLbl) lv_label_set_text(soundRecorderRecordBtnLbl, LV_SYMBOL_STOP "  Stop");
+    soundRecorderSetStatus(LV_SYMBOL_AUDIO "  Recording...", TH.warn);
+    soundRecorderUpdateMeter(0);
+
+    const size_t chunkSamples = 256;
+    int16_t chunk[chunkSamples];
+    soundRecorderSamples = 0;
+    uint32_t lastUiMs = millis();
+    int32_t peak = 0;
+
+    // This callback records in a tight loop, so LVGL cannot dispatch a second
+    // normal button-click event until recording finishes. To make the same
+    // Record/Stop button responsive during recording, we also watch the
+    // physical encoder button directly. The stop press is only armed after the
+    // original Record press has been released, so it will not instantly cancel.
+    bool stopButtonArmed = false;
+    uint32_t lastStopPollMs = 0;
+
+    while (soundRecorderSamples < soundRecorderCapacitySamples && !soundRecorderStopRequested) {
+        // Manual stop while the blocking recorder loop is active.
+        // LOW = pressed because ENCODER_BTN is configured with INPUT_PULLUP.
+        if (millis() - lastStopPollMs > AUDIO_RECORD_STOP_POLL_MS) {
+            lastStopPollMs = millis();
+            bool encoderPressed = (digitalRead(ENCODER_BTN) == LOW);
+            if (!stopButtonArmed) {
+                if (!encoderPressed) stopButtonArmed = true;
+            } else if (encoderPressed) {
+                soundRecorderStopRequested = true;
+                if (soundRecorderRecordBtnLbl) lv_label_set_text(soundRecorderRecordBtnLbl, LV_SYMBOL_STOP "  Stopping");
+                soundRecorderSetStatus(LV_SYMBOL_STOP "  Stopping...", TH.warn);
+                lv_timer_handler();
+                break;
+            }
+        }
+
+        size_t bytesRead = 0;
+        esp_err_t err = i2s_read(I2S_NUM_1, chunk, sizeof(chunk), &bytesRead, pdMS_TO_TICKS(35));
+        if (err != ESP_OK) break;
+        size_t got = bytesRead / sizeof(int16_t);
+        if (got == 0) {
+            lv_timer_handler();
+            continue;
+        }
+
+        size_t remain = soundRecorderCapacitySamples - soundRecorderSamples;
+        if (got > remain) got = remain;
+        memcpy(soundRecorderBuffer + soundRecorderSamples, chunk, got * sizeof(int16_t));
+        soundRecorderSamples += got;
+
+        for (size_t i = 0; i < got; i++) {
+            int32_t v = chunk[i];
+            if (v < 0) v = -v;
+            if (v > peak) peak = v;
+        }
+
+        if (millis() - lastUiMs > 250) {
+            soundRecorderUpdateMeter(peak);
+            soundRecorderUpdateInfo();
+            lv_timer_handler();
+            lastUiMs = millis();
+            peak = 0;
+        }
+    }
+
+    bool stoppedManually = soundRecorderStopRequested;
+    if (stoppedManually) {
+        // Ignore one stale Record/Stop click caused by button bounce or by the
+        // release event that LVGL receives after the blocking record loop ends.
+        soundRecorderIgnoreNextRecordClick = true;
+        soundRecorderIgnoreRecordClickUntilMs = millis() + AUDIO_RECORD_STOP_RESTART_GUARD_MS;
+    }
+    soundRecorderRecording = false;
+    soundRecorderStopRequested = false;
+    soundRecorderStopInput();
+    if (soundRecorderRecordBtnLbl) lv_label_set_text(soundRecorderRecordBtnLbl, LV_SYMBOL_AUDIO "  Record");
+    soundRecorderUpdateMeter(peak);
+
+    if (stoppedManually) {
+        soundRecorderUpdateInfo();
+        soundRecorderSetStatus(LV_SYMBOL_OK "  Stopped", TH.success);
+    } else {
+        soundRecorderUpdateInfo();
+        soundRecorderSetStatus(usingShortBuffer ? LV_SYMBOL_OK "  Short save" : LV_SYMBOL_OK "  Saved RAM", TH.success);
+    }
+    pinMode(ENCODER_BTN, INPUT_PULLUP);
+}
+
+static void cb_soundRecorderPlay(lv_event_t *) {
+    resetInactivityTimer();
+    if (!soundRecorderBuffer || soundRecorderSamples == 0) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  Nothing recorded yet", TH.warn);
+        return;
+    }
+
+    if (soundReady) stopSoundDriverAfterChirp();
+    if (!ensureSoundReady(false)) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  Speaker init failed", TH.alert);
+        return;
+    }
+
+    // Playback speed tuner:
+    // If ES7210/I2S RX provides duplicated/interleaved samples, playback can sound
+    // slow-motion. Raising the TX sample rate is the safest first correction
+    // because it does not rewrite the recording buffer.
+    uint32_t playbackRate = ((uint32_t)AUDIO_RECORD_SAMPLE_RATE * (uint32_t)AUDIO_RECORD_PLAYBACK_SPEED_PERCENT) / 100U;
+    if (playbackRate < 8000U) playbackRate = 8000U;
+    if (playbackRate > 48000U) playbackRate = 48000U;
+    esp_err_t clkErr = i2s_set_clk(I2S_NUM_0, playbackRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+    Serial.printf("[Audio] Playback rate=%u Hz speed=%u%% clk=%s\n",
+                  (unsigned)playbackRate,
+                  (unsigned)AUDIO_RECORD_PLAYBACK_SPEED_PERCENT,
+                  clkErr == ESP_OK ? "OK" : "ERR");
+
+    if (soundRecorderPlayBtnLbl) lv_label_set_text(soundRecorderPlayBtnLbl, LV_SYMBOL_STOP "  Playing");
+    char playStatus[64];
+    snprintf(playStatus, sizeof(playStatus), LV_SYMBOL_PLAY "  Playing at %u%%...", (unsigned)AUDIO_RECORD_PLAYBACK_SPEED_PERCENT);
+    soundRecorderSetStatus(playStatus, TH.warn);
+
+    const size_t framesPerChunk = 128;
+    int16_t stereo[framesPerChunk * 2];
+    size_t pos = 0;
+    uint8_t volumePct = AUDIO_RECORD_PLAYBACK_VOLUME_PERCENT;
+    if (volumePct > 100) volumePct = 100;
+
+    while (pos < soundRecorderSamples) {
+        size_t frames = soundRecorderSamples - pos;
+        if (frames > framesPerChunk) frames = framesPerChunk;
+        for (size_t i = 0; i < frames; i++) {
+            int32_t s = soundRecorderBuffer[pos + i];
+            s = (s * volumePct) / 100;
+            if (s > 32767) s = 32767;
+            if (s < -32768) s = -32768;
+            stereo[i * 2]     = (int16_t)s;
+            stereo[i * 2 + 1] = (int16_t)s;
+        }
+        size_t bytesWritten = 0;
+        i2s_write(I2S_NUM_0, stereo, frames * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
+        pos += frames;
+        if ((pos % (framesPerChunk * 8)) == 0) lv_timer_handler();
+    }
+
+    stopSoundDriverAfterChirp();
+    if (soundRecorderPlayBtnLbl) lv_label_set_text(soundRecorderPlayBtnLbl, LV_SYMBOL_PLAY "  Play");
+    soundRecorderSetStatus(LV_SYMBOL_OK "  Playback done", TH.success);
+    pinMode(ENCODER_BTN, INPUT_PULLUP);
+}
+
+static void cb_audioMenuBack(lv_event_t *) {
+    audioMenuScreen = nullptr;
+    deleteGroup(&audioMenuGroup);
+    setGroup(navGroup);
+    lv_screen_load_anim(mainScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, true);
+    setAllLEDs(MENU_COLORS[3].r, MENU_COLORS[3].g, MENU_COLORS[3].b);
+}
+
+static void cb_audioToolBack(lv_event_t *) {
+    // If Back is used while recording, request a clean stop before leaving.
+    soundRecorderStopRequested = true;
+    soundRecorderRecording = false;
+    soundRecorderStopInput();
+    audioToolScreen = nullptr;
+    deleteGroup(&audioToolGroup);
+    setGroup(audioMenuGroup);
+    lv_screen_load_anim(audioMenuScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, true);
+    setAllLEDs(MENU_COLORS[3].r, MENU_COLORS[3].g, MENU_COLORS[3].b, 3);
+}
+
+static void cb_audioToolSelected(lv_event_t *e) {
+    int t = (int)(intptr_t)lv_event_get_user_data(e);
+    switch (t) {
+        case 0: createSoundRecorder(); break;
+    }
+}
+
+void createAudioMenu() {
+    if (audioMenuScreen) { lv_obj_delete(audioMenuScreen); audioMenuScreen = nullptr; }
+    audioMenuScreen = lv_obj_create(nullptr);
+    applyScreenStyle(audioMenuScreen);
+    createHeader(audioMenuScreen, LV_SYMBOL_AUDIO "  Audio Tools");
+
+    lv_obj_t *list = lv_list_create(audioMenuScreen);
+    lv_obj_set_size(list, SCREEN_W, SCREEN_H - 28 - 34);
+    lv_obj_set_pos(list, 0, 28);
+    lv_obj_set_style_bg_color(list,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(list,       LV_OPA_COVER,           LV_PART_MAIN);
+    lv_obj_set_style_border_width(list, 0,                      LV_PART_MAIN);
+    lv_obj_set_style_pad_all(list,      6,                      LV_PART_MAIN);
+    lv_obj_set_style_pad_row(list,      4,                      LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
+
+    deleteGroup(&audioMenuGroup);
+    audioMenuGroup = lv_group_create();
+
+    for (int i = 0; i < 1; i++) {
+        lv_obj_t *btn = lv_list_add_btn(list, nullptr, AUDIO_TOOL_LABELS[i]);
+        styleListBtn(btn);
+        lv_obj_set_height(btn, 30);
+        lv_obj_add_event_cb(btn, cb_audioToolSelected, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+        lv_group_add_obj(audioMenuGroup, btn);
+    }
+
+    lv_obj_t *backBtn = createBackBtn(audioMenuScreen, cb_audioMenuBack);
+    lv_group_add_obj(audioMenuGroup, backBtn);
+    setGroup(audioMenuGroup);
+
+    setAllLEDs(MENU_COLORS[3].r, MENU_COLORS[3].g, MENU_COLORS[3].b, 3);
+    lv_screen_load_anim(audioMenuScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+void createSoundRecorder() {
+    soundRecorderStatusLbl = nullptr;
+    soundRecorderInfoLbl = nullptr;
+    soundRecorderMeterLbl = nullptr;
+    soundRecorderRecordBtn = nullptr;
+    soundRecorderPlayBtn = nullptr;
+    soundRecorderRecordBtnLbl = nullptr;
+    soundRecorderPlayBtnLbl = nullptr;
+
+    if (audioToolScreen) { lv_obj_delete(audioToolScreen); audioToolScreen = nullptr; }
+    audioToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(audioToolScreen);
+    createHeader(audioToolScreen, LV_SYMBOL_AUDIO "  Sound Recorder");
+
+    // Sound Recorder uses its own compact layout so the buttons do not
+    // overlap the shared Back/Action buttons used by other pages.
+    const int panelY = 28;
+    const int panelH = 105;  // Taller panels so the recorder info fits cleanly.
+    const int panelGap = 6;
+    const int panelW = (SCREEN_W - 18) / 2;  // two even side-by-side boxes
+    const int leftX  = 6;
+    const int rightX = leftX + panelW + panelGap;
+
+    lv_obj_t *recordPanel = lv_obj_create(audioToolScreen);
+    lv_obj_set_size(recordPanel, panelW, panelH);
+    lv_obj_set_pos(recordPanel, leftX, panelY);
+    lv_obj_set_style_bg_color(recordPanel,     lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(recordPanel,       LV_OPA_COVER,           LV_PART_MAIN);
+    lv_obj_set_style_border_color(recordPanel, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(recordPanel, 1,                      LV_PART_MAIN);
+    lv_obj_set_style_radius(recordPanel,       6,                      LV_PART_MAIN);
+    lv_obj_set_style_pad_all(recordPanel,      6,                      LV_PART_MAIN);
+    // Allow vertical scroll as a safety net if future recorder details grow.
+    lv_obj_add_flag(recordPanel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(recordPanel, LV_OBJ_FLAG_CLICKABLE);  // lets the encoder focus this scroll area
+    lv_obj_set_scroll_dir(recordPanel, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(recordPanel, LV_SCROLLBAR_MODE_AUTO);
+    // Focus styling makes it obvious when the left scroll panel is selected.
+    lv_obj_set_style_border_color(recordPanel, TC(accent), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(recordPanel, 2, LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(recordPanel, TC(accent), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_width(recordPanel, 2, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+
+    lv_obj_t *recordTitle = lv_label_create(recordPanel);
+    lv_label_set_text(recordTitle, LV_SYMBOL_AUDIO "  Recorder");
+    lv_obj_set_style_text_color(recordTitle, lv_color_hex(TH.accent), LV_PART_MAIN);
+    lv_obj_set_pos(recordTitle, 0, 0);
+
+    soundRecorderStatusLbl = lv_label_create(recordPanel);
+    lv_label_set_text(soundRecorderStatusLbl, LV_SYMBOL_AUDIO "  Ready");
+    lv_label_set_long_mode(soundRecorderStatusLbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(soundRecorderStatusLbl, panelW - 14);
+    lv_obj_set_style_text_color(soundRecorderStatusLbl, lv_color_hex(TH.success), LV_PART_MAIN);
+    lv_obj_set_pos(soundRecorderStatusLbl, 0, 19);
+
+    soundRecorderMeterLbl = lv_label_create(recordPanel);
+    lv_label_set_text(soundRecorderMeterLbl, "Lvl:[----------]");
+    lv_label_set_long_mode(soundRecorderMeterLbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(soundRecorderMeterLbl, panelW - 14);
+    lv_obj_set_style_text_color(soundRecorderMeterLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
+    lv_obj_set_pos(soundRecorderMeterLbl, 0, 39);
+
+    soundRecorderInfoLbl = lv_label_create(recordPanel);
+    lv_label_set_text(soundRecorderInfoLbl, "Time: 0.0 / 0.0s\nPlay: 200%");
+    lv_label_set_long_mode(soundRecorderInfoLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(soundRecorderInfoLbl, panelW - 14);
+    lv_obj_set_style_text_color(soundRecorderInfoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_set_pos(soundRecorderInfoLbl, 0, 59);
+
+    lv_obj_t *filesPanel = lv_obj_create(audioToolScreen);
+    lv_obj_set_size(filesPanel, panelW, panelH);
+    lv_obj_set_pos(filesPanel, rightX, panelY);
+    lv_obj_set_style_bg_color(filesPanel,     lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(filesPanel,       LV_OPA_COVER,           LV_PART_MAIN);
+    lv_obj_set_style_border_color(filesPanel, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(filesPanel, 1,                      LV_PART_MAIN);
+    lv_obj_set_style_radius(filesPanel,       6,                      LV_PART_MAIN);
+    lv_obj_set_style_pad_all(filesPanel,      6,                      LV_PART_MAIN);
+    // Keep this panel scroll-ready now so the future recordings/file browser
+    // can grow vertically without cutting off filenames or details.
+    lv_obj_add_flag(filesPanel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(filesPanel, LV_OBJ_FLAG_CLICKABLE);  // lets the encoder focus this future file browser
+    lv_obj_set_scroll_dir(filesPanel, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(filesPanel, LV_SCROLLBAR_MODE_AUTO);
+    // Focus styling makes it obvious when the right scroll panel is selected.
+    lv_obj_set_style_border_color(filesPanel, TC(accent), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(filesPanel, 2, LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(filesPanel, TC(accent), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_width(filesPanel, 2, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+
+    lv_obj_t *filesTitle = lv_label_create(filesPanel);
+    lv_label_set_text(filesTitle, LV_SYMBOL_DIRECTORY "  Recordings");
+    lv_obj_set_style_text_color(filesTitle, lv_color_hex(TH.accent), LV_PART_MAIN);
+    lv_obj_set_pos(filesTitle, 0, 0);
+
+    lv_obj_t *filesInfo = lv_label_create(filesPanel);
+    lv_label_set_text(filesInfo, "File browser\ncoming soon.");
+    lv_label_set_long_mode(filesInfo, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(filesInfo, panelW - 14);
+    lv_obj_set_style_text_color(filesInfo, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(filesInfo, 0, 24);
+
+    // Page-specific button row. These do not use createBackBtn() or
+    // createActionBtn(), so their size and placement can be tuned here only.
+    const int btnY = SCREEN_H - 30;
+    const int btnW = 94;
+    const int btnH = 27;
+
+    lv_obj_t *backBtn = lv_btn_create(audioToolScreen);
+    lv_obj_set_size(backBtn, btnW, btnH);
+    lv_obj_set_pos(backBtn, 6, btnY);
+    lv_obj_set_style_bg_color(backBtn, TC(btnDefault), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(backBtn, TC(btnFocus),   LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(backBtn, TC(btnPress),   LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(backBtn, TC(border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(backBtn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(backBtn, 6, LV_PART_MAIN);
+    lv_obj_add_event_cb(backBtn, cb_audioToolBack, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *backLbl = lv_label_create(backBtn);
+    lv_label_set_text(backLbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_color(backLbl, TC(text), LV_PART_MAIN);
+    lv_obj_center(backLbl);
+
+    soundRecorderRecordBtn = lv_btn_create(audioToolScreen);
+    lv_obj_set_size(soundRecorderRecordBtn, btnW, btnH);
+    lv_obj_set_pos(soundRecorderRecordBtn, 113, btnY);
+    lv_obj_set_style_bg_color(soundRecorderRecordBtn, TC(actionBg),  LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(soundRecorderRecordBtn, TC(actionFoc), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(soundRecorderRecordBtn, TC(stopRed),   LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(soundRecorderRecordBtn, TC(actionBdr), LV_PART_MAIN);
+    lv_obj_set_style_border_width(soundRecorderRecordBtn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(soundRecorderRecordBtn, 6, LV_PART_MAIN);
+    lv_obj_add_event_cb(soundRecorderRecordBtn, cb_soundRecorderRecord, LV_EVENT_CLICKED, nullptr);
+    soundRecorderRecordBtnLbl = lv_label_create(soundRecorderRecordBtn);
+    lv_label_set_text(soundRecorderRecordBtnLbl, LV_SYMBOL_AUDIO "  Record");
+    lv_obj_set_style_text_color(soundRecorderRecordBtnLbl, TC(text), LV_PART_MAIN);
+    lv_obj_center(soundRecorderRecordBtnLbl);
+
+    soundRecorderPlayBtn = lv_btn_create(audioToolScreen);
+    lv_obj_set_size(soundRecorderPlayBtn, btnW, btnH);
+    lv_obj_set_pos(soundRecorderPlayBtn, 220, btnY);
+    lv_obj_set_style_bg_color(soundRecorderPlayBtn, TC(actionBg),  LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(soundRecorderPlayBtn, TC(actionFoc), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(soundRecorderPlayBtn, TC(btnPress),  LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(soundRecorderPlayBtn, TC(actionBdr), LV_PART_MAIN);
+    lv_obj_set_style_border_width(soundRecorderPlayBtn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(soundRecorderPlayBtn, 6, LV_PART_MAIN);
+    lv_obj_add_event_cb(soundRecorderPlayBtn, cb_soundRecorderPlay, LV_EVENT_CLICKED, nullptr);
+    soundRecorderPlayBtnLbl = lv_label_create(soundRecorderPlayBtn);
+    lv_label_set_text(soundRecorderPlayBtnLbl, LV_SYMBOL_PLAY "  Play");
+    lv_obj_set_style_text_color(soundRecorderPlayBtnLbl, TC(text), LV_PART_MAIN);
+    lv_obj_center(soundRecorderPlayBtnLbl);
+
+    deleteGroup(&audioToolGroup);
+    audioToolGroup = lv_group_create();
+
+    // Encoder focus order for this page:
+    // Recorder panel -> Recordings panel -> Back -> Record -> Play.
+    // Adding the two scroll panels to the group lets you move up to them
+    // with the encoder instead of being trapped on the bottom buttons.
+    lv_group_add_obj(audioToolGroup, recordPanel);
+    lv_group_add_obj(audioToolGroup, filesPanel);
+    lv_group_add_obj(audioToolGroup, backBtn);
+    lv_group_add_obj(audioToolGroup, soundRecorderRecordBtn);
+    lv_group_add_obj(audioToolGroup, soundRecorderPlayBtn);
+    setGroup(audioToolGroup);
+
+    soundRecorderUpdateInfo();
+    setAllLEDs(MENU_COLORS[3].r, MENU_COLORS[3].g, MENU_COLORS[3].b, LED_BRIGHTNESS);
+    lv_screen_load_anim(audioToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
 // ════════════════════════════════════════════════════════════════
 //  GPS TOOLS
 //
@@ -3087,16 +5276,103 @@ void createWiggleWars() {
 // ════════════════════════════════════════════════════════════════
 //  WIFI MENU
 // ════════════════════════════════════════════════════════════════
-static const char *WIFI_TOOL_LABELS[8] = {
+static const char *WIFI_TOOL_LABELS[13] = {
     LV_SYMBOL_WIFI     "  Network Scanner",
+    LV_SYMBOL_WIFI     "  Connect to AP",
+    LV_SYMBOL_EYE_OPEN "  LAN Host Discovery",
+    LV_SYMBOL_HOME     "  Gateway Info",
+    LV_SYMBOL_EYE_OPEN "  Station Scanner",
     LV_SYMBOL_WARNING  "  Deauth Detector",
     LV_SYMBOL_LOOP     "  Channel Analyzer",
     LV_SYMBOL_EYE_OPEN "  Packet Monitor",
+    LV_SYMBOL_EYE_OPEN "  WiFi Mapper",
     LV_SYMBOL_EYE_OPEN "  PineAP Hunter",
     LV_SYMBOL_EYE_OPEN "  Pwnagotchi Watch",
     LV_SYMBOL_WARNING  "  Flock Detector",
     LV_SYMBOL_BLUETOOTH "  Flock Hybrid"
 };
+
+static const int WIFI_TOOL_LAN_DISCOVERY_INDEX = 2;
+static const int WIFI_TOOL_GATEWAY_INFO_INDEX  = 3;
+
+static void cb_wifiToolSelected(lv_event_t *e);
+
+// Connected-only WiFi Tools row state.
+// LAN Host Discovery starts dimmed when there is no AP connection, but after
+// Connect to AP succeeds we update this row in place instead of rebuilding the
+// whole WiFi Tools screen. Rebuilding from inside a Back/event path was causing
+// LVGL object invalidation and LoadProhibited reboots.
+static lv_obj_t *wifiLanDiscoveryBtn = nullptr;
+static bool wifiLanDiscoveryBtnHasEvent = false;
+static bool wifiLanDiscoveryBtnEnabled = false;
+static lv_obj_t *wifiGatewayInfoBtn = nullptr;
+static bool wifiGatewayInfoBtnHasEvent = false;
+static bool wifiGatewayInfoBtnEnabled = false;
+
+static void setListBtnText(lv_obj_t *btn, const char *txt) {
+    if (!btn || !txt) return;
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (label) {
+        lv_label_set_text(label, txt);
+    }
+}
+
+static void refreshWiFiMenuLanDiscoveryItem() {
+#if LAN_DISCOVERY_ENABLED
+    bool connected = (WiFi.status() == WL_CONNECTED);
+
+    if (wifiLanDiscoveryBtn) {
+        // Keep the LAN Host Discovery row in the encoder group at all times.
+        // The click handler still checks connection state, so the row can safely
+        // stay selectable while showing "connect first" when no AP is active.
+        lv_obj_clear_state(wifiLanDiscoveryBtn, LV_STATE_DISABLED);
+        lv_obj_add_flag(wifiLanDiscoveryBtn, LV_OBJ_FLAG_CLICKABLE);
+
+        if (!wifiLanDiscoveryBtnHasEvent) {
+            lv_obj_add_event_cb(wifiLanDiscoveryBtn, cb_wifiToolSelected, LV_EVENT_CLICKED,
+                                (void *)(intptr_t)WIFI_TOOL_LAN_DISCOVERY_INDEX);
+            wifiLanDiscoveryBtnHasEvent = true;
+        }
+
+        if (connected) {
+            setListBtnText(wifiLanDiscoveryBtn, WIFI_TOOL_LABELS[WIFI_TOOL_LAN_DISCOVERY_INDEX]);
+            lv_obj_set_style_text_color(wifiLanDiscoveryBtn, TC(text), LV_PART_MAIN);
+            lv_obj_set_style_bg_color(wifiLanDiscoveryBtn, TC(card), LV_PART_MAIN);
+        } else {
+            setListBtnText(wifiLanDiscoveryBtn, LV_SYMBOL_EYE_OPEN "  LAN Host Discovery (connect first)");
+            lv_obj_set_style_text_color(wifiLanDiscoveryBtn, TC(textDim), LV_PART_MAIN);
+            lv_obj_set_style_bg_color(wifiLanDiscoveryBtn, TC(card), LV_PART_MAIN);
+        }
+        wifiLanDiscoveryBtnEnabled = true;
+    }
+#endif
+
+#if GATEWAY_INFO_ENABLED
+    if (wifiGatewayInfoBtn) {
+        // Gateway Info follows the same connected-only UX as LAN Host Discovery:
+        // visible in WiFi Tools, dimmed before Connect to AP, and usable once connected.
+        lv_obj_clear_state(wifiGatewayInfoBtn, LV_STATE_DISABLED);
+        lv_obj_add_flag(wifiGatewayInfoBtn, LV_OBJ_FLAG_CLICKABLE);
+
+        if (!wifiGatewayInfoBtnHasEvent) {
+            lv_obj_add_event_cb(wifiGatewayInfoBtn, cb_wifiToolSelected, LV_EVENT_CLICKED,
+                                (void *)(intptr_t)WIFI_TOOL_GATEWAY_INFO_INDEX);
+            wifiGatewayInfoBtnHasEvent = true;
+        }
+
+        if (connected) {
+            setListBtnText(wifiGatewayInfoBtn, WIFI_TOOL_LABELS[WIFI_TOOL_GATEWAY_INFO_INDEX]);
+            lv_obj_set_style_text_color(wifiGatewayInfoBtn, TC(text), LV_PART_MAIN);
+            lv_obj_set_style_bg_color(wifiGatewayInfoBtn, TC(card), LV_PART_MAIN);
+        } else {
+            setListBtnText(wifiGatewayInfoBtn, LV_SYMBOL_HOME "  Gateway Info (connect first)");
+            lv_obj_set_style_text_color(wifiGatewayInfoBtn, TC(textDim), LV_PART_MAIN);
+            lv_obj_set_style_bg_color(wifiGatewayInfoBtn, TC(card), LV_PART_MAIN);
+        }
+        wifiGatewayInfoBtnEnabled = true;
+    }
+#endif
+}
 
 static void cb_wifiMenuBack(lv_event_t *e) {
     lv_screen_load_anim(mainScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
@@ -3109,13 +5385,18 @@ static void cb_wifiToolSelected(lv_event_t *e) {
     int t = (int)(intptr_t)lv_event_get_user_data(e);
     switch (t) {
         case 0: createNetworkScanner();      break;
-        case 1: createDeauthDetector();      break;
-        case 2: createChannelAnalyzer();     break;
-        case 3: createPacketMonitor();      break;
-        case 4: createPineAPHunter();       break;
-        case 5: createPwnagotchiDetector(); break;
-        case 6: createFlockDetector();      break;
-        case 7: createFlockHybridScanner(); break;
+        case 1: createConnectAPTool();       break;
+        case 2: createLANHostDiscovery();    break;
+        case 3: createGatewayInfo();         break;
+        case 4: createStationScanner();      break;
+        case 5: createDeauthDetector();      break;
+        case 6: createChannelAnalyzer();     break;
+        case 7: createPacketMonitor();       break;
+        case 8: createWiFiMapper();          break;
+        case 9: createPineAPHunter();        break;
+        case 10: createPwnagotchiDetector(); break;
+        case 11: createFlockDetector();      break;
+        case 12: createFlockHybridScanner(); break;
     }
 }
 
@@ -3140,13 +5421,53 @@ void createWiFiMenu() {
     deleteGroup(&wifiMenuGroup);
     wifiMenuGroup = lv_group_create();
 
-    for (int i = 0; i < 8; i++) {
-        lv_obj_t *btn = lv_list_add_btn(list, nullptr, WIFI_TOOL_LABELS[i]);
+    wifiLanDiscoveryBtn = nullptr;
+    wifiLanDiscoveryBtnHasEvent = false;
+    wifiLanDiscoveryBtnEnabled = false;
+    wifiGatewayInfoBtn = nullptr;
+    wifiGatewayInfoBtnHasEvent = false;
+    wifiGatewayInfoBtnEnabled = false;
+
+    bool lanToolsReady = (WiFi.status() == WL_CONNECTED);
+
+    for (int i = 0; i < (int)(sizeof(WIFI_TOOL_LABELS) / sizeof(WIFI_TOOL_LABELS[0])); i++) {
+        bool isLanDiscovery = (i == WIFI_TOOL_LAN_DISCOVERY_INDEX);
+        bool isGatewayInfo  = (i == WIFI_TOOL_GATEWAY_INFO_INDEX);
+        bool connectedToolWaiting = (isLanDiscovery || isGatewayInfo) && !lanToolsReady;
+
+        const char *rowText = WIFI_TOOL_LABELS[i];
+        if (connectedToolWaiting) {
+            rowText = isLanDiscovery
+                          ? LV_SYMBOL_EYE_OPEN "  LAN Host Discovery (connect first)"
+                          : LV_SYMBOL_HOME "  Gateway Info (connect first)";
+        }
+
+        lv_obj_t *btn = lv_list_add_btn(list, nullptr, rowText);
         styleListBtn(btn);
         lv_obj_set_height(btn, 30);
+
         lv_obj_add_event_cb(btn, cb_wifiToolSelected, LV_EVENT_CLICKED,
                             (void *)(intptr_t)i);
         lv_group_add_obj(wifiMenuGroup, btn);
+
+        if (isLanDiscovery) {
+            wifiLanDiscoveryBtn = btn;
+            wifiLanDiscoveryBtnHasEvent = true;
+            wifiLanDiscoveryBtnEnabled = true;
+        }
+        if (isGatewayInfo) {
+            wifiGatewayInfoBtn = btn;
+            wifiGatewayInfoBtnHasEvent = true;
+            wifiGatewayInfoBtnEnabled = true;
+        }
+
+        // Visual-only dim state. Connected-only rows stay in the encoder group
+        // so they can become usable immediately after Connect to AP without
+        // rebuilding the whole WiFi Tools menu or re-adding LVGL group objects.
+        if (connectedToolWaiting) {
+            lv_obj_set_style_text_color(btn, TC(textDim), LV_PART_MAIN);
+            lv_obj_set_style_bg_color(btn, TC(card), LV_PART_MAIN);
+        }
     }
 
     lv_obj_t *backBtn = createBackBtn(wifiMenuScreen, cb_wifiMenuBack);
@@ -3261,6 +5582,40 @@ static lv_obj_t *deauthStatsBar  = nullptr;
 // ════════════════════════════════════════════════════════════════
 //  SHARED BACK CALLBACKS
 // ════════════════════════════════════════════════════════════════
+// WiFi Tools can change while a tool is open; for example, Connect to AP can
+// make LAN Host Discovery become available. Rebuild the WiFi Tools menu after
+// the current LVGL event finishes so we do not delete/rebuild screens while
+// the Back button event is still unwinding.
+static lv_timer_t *wifiMenuRefreshTimer = nullptr;
+static lv_obj_t  *wifiToolScreenPendingDelete = nullptr;
+
+static void wifiMenuRefreshTimerCb(lv_timer_t *timer) {
+    lv_timer_delete(timer);
+    wifiMenuRefreshTimer = nullptr;
+
+    lv_obj_t *oldToolScreen = wifiToolScreenPendingDelete;
+    wifiToolScreenPendingDelete = nullptr;
+
+    createWiFiMenu();
+
+    if (oldToolScreen) {
+        lv_obj_delete(oldToolScreen);
+    }
+
+    setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 3);
+}
+
+static void scheduleWiFiMenuRefresh(lv_obj_t *oldToolScreen) {
+    wifiToolScreenPendingDelete = oldToolScreen;
+
+    if (wifiMenuRefreshTimer) {
+        lv_timer_delete(wifiMenuRefreshTimer);
+        wifiMenuRefreshTimer = nullptr;
+    }
+
+    wifiMenuRefreshTimer = lv_timer_create(wifiMenuRefreshTimerCb, 75, nullptr);
+}
+
 static void cb_wifiToolBack(lv_event_t *e) {
     if (deauthActive) {
         deauthActive = false;
@@ -3287,6 +5642,16 @@ static void cb_wifiToolBack(lv_event_t *e) {
         esp_wifi_set_promiscuous(false);
         esp_wifi_set_promiscuous_rx_cb(nullptr);
     }
+    if (stationScanActive) {
+        stationScanActive = false;
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(nullptr);
+    }
+    if (wifiMapperActive) {
+        wifiMapperActive = false;
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(nullptr);
+    }
     if (spinnerRunning) {
         stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
     }
@@ -3298,12 +5663,46 @@ static void cb_wifiToolBack(lv_event_t *e) {
     if (pwnTimer)    { lv_timer_delete(pwnTimer);    pwnTimer    = nullptr; }
     if (flockTimer)  { lv_timer_delete(flockTimer);  flockTimer  = nullptr; }
     if (hybridStartTimer) { lv_timer_delete(hybridStartTimer); hybridStartTimer = nullptr; }
+    hybridStatusLbl = nullptr;
+    hybridList = nullptr;
+    hybridBackBtn = nullptr;
+    hybridScanBtn = nullptr;
     if (packetMonitorTimer) { lv_timer_delete(packetMonitorTimer); packetMonitorTimer = nullptr; }
-    // Do NOT lv_obj_delete the outgoing screen — auto_del=true lets LVGL free it
-    // after the animation completes.  Deleting before load_anim = use-after-free crash.
-    wifiToolScreen = nullptr;
+    if (wifiMapperTimer) { lv_timer_delete(wifiMapperTimer); wifiMapperTimer = nullptr; }
+    if (stationScanTimer) { lv_timer_delete(stationScanTimer); stationScanTimer = nullptr; }
+    stationStatusLbl = nullptr;
+    stationList = nullptr;
+    stationStartBtn = nullptr;
+    stationStartLbl = nullptr;
+    stationBackBtn = nullptr;
+    wifiMapperStatusLbl = nullptr;
+    wifiMapperDetailLbl = nullptr;
+    wifiMapperGridArea = nullptr;
+    wifiMapperPauseBtn = nullptr;
+    wifiMapperPauseLbl = nullptr;
+    wifiMapperSpeedBtn = nullptr;
+    wifiMapperSpeedLbl = nullptr;
+    connectApStatusLbl = nullptr;
+    connectApList = nullptr;
+    connectApBackBtn = nullptr;
+    connectApScanBtn = nullptr;
+    connectApDiscBtn = nullptr;
+    lanDiscoveryStatusLbl = nullptr;
+    lanDiscoveryList = nullptr;
+    lanDiscoveryBackBtn = nullptr;
+    lanDiscoveryScanBtn = nullptr;
+    gatewayInfoStatusLbl = nullptr;
+    gatewayInfoList = nullptr;
+    gatewayInfoBackBtn = nullptr;
+    gatewayInfoRefreshBtn = nullptr;
+    // Return to the existing WiFi Tools menu, then update only the connected-only
+    // LAN Host Discovery / Gateway Info rows in place. Do not rebuild/delete the whole WiFi menu
+    // from this Back path; that previously invalidated LVGL objects and caused
+    // LoadProhibited reboots after Connect to AP.
     deleteGroup(&wifiToolGroup);
     setGroup(wifiMenuGroup);
+    refreshWiFiMenuLanDiscoveryItem();
+
     lv_screen_load_anim(wifiMenuScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, true);
     setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 3);
 }
@@ -3468,8 +5867,1813 @@ void createNetworkDetail(int idx) {
 
     deleteGroup(&wifiDetailGroup);
     wifiDetailGroup = lv_group_create();
+    lv_group_add_obj(wifiDetailGroup, card);     // Focus card first so encoder can scroll Station Detail.
     lv_group_add_obj(wifiDetailGroup, backBtn);
     setGroup(wifiDetailGroup);
+
+    lv_screen_load_anim(wifiDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+
+// ════════════════════════════════════════════════════════════════
+//  TOOL 2 – CONNECT TO AP
+//
+//  Scans nearby access points, lets you pick one with the encoder,
+//  opens the reusable LVGL keyboard for the password, then connects
+//  the ESP32-S3 in STA mode. The connection is intentionally left
+//  active for future safe LAN tools such as ping/gateway checks,
+//  simple port checks, or SSH banner checks.
+// ════════════════════════════════════════════════════════════════
+static void connectApSetStatus(const char *msg, uint32_t colorHex) {
+    if (!connectApStatusLbl) return;
+    lv_label_set_text(connectApStatusLbl, msg);
+    lv_obj_set_style_text_color(connectApStatusLbl, lv_color_hex(colorHex), LV_PART_MAIN);
+}
+
+static void connectApCaptureTarget(int idx) {
+    if (idx < 0 || idx >= wifiEntryCount) return;
+    connectApSelectedIdx = idx;
+    strncpy(connectApTargetSsid, wifiEntries[idx].ssid, sizeof(connectApTargetSsid) - 1);
+    connectApTargetSsid[sizeof(connectApTargetSsid) - 1] = '\0';
+    strncpy(connectApTargetBssid, wifiEntries[idx].bssid, sizeof(connectApTargetBssid) - 1);
+    connectApTargetBssid[sizeof(connectApTargetBssid) - 1] = '\0';
+    strncpy(connectApTargetAuth, wifiEntries[idx].authStr, sizeof(connectApTargetAuth) - 1);
+    connectApTargetAuth[sizeof(connectApTargetAuth) - 1] = '\0';
+    connectApTargetOpen = wifiEntries[idx].open;
+    connectApTargetRssi = wifiEntries[idx].rssi;
+    connectApTargetChannel = wifiEntries[idx].channel;
+}
+
+// Saved AP credentials are stored in a few simple NVS slots instead of
+// using the SSID as a raw NVS key. NVS keys are short, and SSIDs may contain
+// characters that are not ideal for key names.
+static bool connectApLoadSavedPassword(const char *ssid, char *out, size_t outLen) {
+    if (!ssid || !ssid[0] || !out || outLen == 0) return false;
+    out[0] = '\0';
+
+#if PERSISTENT_SETTINGS_ENABLED && CONNECT_AP_SAVE_PASSWORDS
+    // Use a short-lived local Preferences handle for AP credentials.
+    // This avoids sharing the main settingsPrefs handle during WiFi/LVGL flows.
+    Preferences apPrefs;
+    if (apPrefs.begin(PREFS_NAMESPACE, true)) {
+        for (int i = 0; i < CONNECT_AP_SAVED_SLOT_COUNT; i++) {
+            char ssidKey[8];
+            char passKey[8];
+            snprintf(ssidKey, sizeof(ssidKey), "apS%d", i);
+            snprintf(passKey, sizeof(passKey), "apP%d", i);
+
+            String savedSsid = apPrefs.getString(ssidKey, "");
+            if (savedSsid == ssid) {
+                String savedPass = apPrefs.getString(passKey, "");
+                apPrefs.end();
+
+                if (savedPass.length() > 0) {
+                    savedPass.toCharArray(out, outLen);
+                    Serial.printf("[Connect AP] Loaded saved password slot %d for SSID: %s\n", i, ssid);
+                    return true;
+                }
+                return false;
+            }
+        }
+        apPrefs.end();
+    }
+#endif
+
+#if CONNECT_AP_USE_CONFIG_CREDENTIALS
+    for (int i = 0; i < CONNECT_AP_CONFIG_CRED_COUNT; i++) {
+        const char *cfgSsid = CONNECT_AP_CONFIG_SSIDS[i];
+        const char *cfgPass = CONNECT_AP_CONFIG_PASSWORDS[i];
+        if (cfgSsid && cfgPass && cfgSsid[0] && cfgPass[0] && strcmp(cfgSsid, ssid) == 0) {
+            strncpy(out, cfgPass, outLen - 1);
+            out[outLen - 1] = '\0';
+            Serial.printf("[Connect AP] Loaded config password slot %d for SSID: %s\n", i, ssid);
+            return true;
+        }
+    }
+#endif
+
+    return false;
+}
+
+static void connectApSavePassword(const char *ssid, const char *password) {
+    if (!ssid || !ssid[0] || !password || !password[0]) return;
+
+#if PERSISTENT_SETTINGS_ENABLED && CONNECT_AP_SAVE_PASSWORDS
+    // Use a local Preferences object instead of the shared settingsPrefs handle.
+    // This keeps AP credential writes isolated from the normal settings system.
+    Preferences apPrefs;
+    if (!apPrefs.begin(PREFS_NAMESPACE, false)) {
+        Serial.println("[Connect AP] Password save skipped: NVS open failed.");
+        return;
+    }
+
+    int targetSlot = -1;
+    int emptySlot = -1;
+    for (int i = 0; i < CONNECT_AP_SAVED_SLOT_COUNT; i++) {
+        char ssidKey[8];
+        snprintf(ssidKey, sizeof(ssidKey), "apS%d", i);
+
+        String savedSsid = apPrefs.getString(ssidKey, "");
+        if (savedSsid == ssid) {
+            targetSlot = i;
+            break;
+        }
+        if (emptySlot < 0 && savedSsid.length() == 0) {
+            emptySlot = i;
+        }
+    }
+
+    if (targetSlot < 0) {
+        targetSlot = (emptySlot >= 0) ? emptySlot : 0;  // overwrite oldest/basic slot 0 if full
+    }
+
+    char ssidKey[8];
+    char passKey[8];
+    snprintf(ssidKey, sizeof(ssidKey), "apS%d", targetSlot);
+    snprintf(passKey, sizeof(passKey), "apP%d", targetSlot);
+
+    bool ssidOk = apPrefs.putString(ssidKey, ssid) > 0;
+    bool passOk = apPrefs.putString(passKey, password) > 0;
+    apPrefs.end();
+
+    Serial.printf("[Connect AP] Saved password slot %d for SSID: %s (%s/%s)\n",
+                  targetSlot,
+                  ssid,
+                  ssidOk ? "ssid ok" : "ssid fail",
+                  passOk ? "pass ok" : "pass fail");
+#endif
+}
+
+
+static const char* connectApInternetStatusText(bool *reachableOut) {
+#if CONNECT_AP_INTERNET_CHECK_ENABLED
+    if (reachableOut) *reachableOut = false;
+    if (WiFi.status() != WL_CONNECTED) return "No";
+
+    WiFiClient client;
+    client.setTimeout(CONNECT_AP_INTERNET_CHECK_TIMEOUT_MS);
+
+    bool reachable = client.connect(CONNECT_AP_INTERNET_CHECK_HOST,
+                                    CONNECT_AP_INTERNET_CHECK_PORT);
+    if (reachable) {
+        client.stop();
+        if (reachableOut) *reachableOut = true;
+        return "Yes";
+    }
+
+    client.stop();
+    return "No";
+#else
+    if (reachableOut) *reachableOut = false;
+    return "Skipped";
+#endif
+}
+
+static void connectApDisconnectNow() {
+    // Manual disconnect should play from the button handler only, not again from
+    // the background connection watchdog.
+    connectApSuppressDropTone(1500);
+    WiFi.disconnect(false, false);
+    delay(60);
+    connectApMarkConnectedState(false);
+}
+
+static void connectApShowStatusPage(const char *titleText, const char *bodyText, bool connected) {
+    // Do not delete the currently active WiFi tool screen before the new
+    // status page is loaded. This mirrors the keyboard close fix and avoids
+    // LVGL deleting an active screen during an event/callback chain.
+    lv_obj_t *oldWifiScreen = wifiToolScreen;
+    wifiToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiToolScreen);
+    createHeader(wifiToolScreen, titleText);
+
+    lv_obj_t *card = lv_obj_create(wifiToolScreen);
+    lv_obj_set_size(card, SCREEN_W - 14, SCREEN_H - 28 - 38);
+    lv_obj_set_pos(card, 7, 31);
+    lv_obj_set_style_bg_color(card, TC(card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, connected ? TC(success) : TC(border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 7, LV_PART_MAIN);
+
+    // The connected router/status page has more details than the older result page,
+    // so keep the card scrollable on the compact 320x170 T-Embed screen.
+    if (connected) {
+        lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(card, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
+    } else {
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    lv_obj_t *info = lv_label_create(card);
+    lv_label_set_text(info, bodyText);
+    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(info, SCREEN_W - 36);
+    lv_obj_set_style_text_color(info, connected ? TC(success) : TC(text), LV_PART_MAIN);
+    lv_obj_align(info, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    // Result hint removed: future WiFi-connected tools will live in their own pages.
+    // This also keeps the status/details text from overlapping on the compact T-Embed screen.
+
+    lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
+    lv_obj_set_size(backBtn, 86, 26);
+    lv_obj_align(backBtn, LV_ALIGN_BOTTOM_LEFT, 6, -4);
+
+    lv_obj_t *scanBtn = createActionBtn(wifiToolScreen, LV_SYMBOL_REFRESH " Scan", [](lv_event_t *e) {
+        createConnectAPTool();
+    });
+    lv_obj_set_size(scanBtn, 86, 26);
+    lv_obj_align(scanBtn, LV_ALIGN_BOTTOM_RIGHT, -6, -4);
+
+    // Add a center Disconnect button only when connected. Width/positions are
+    // tuned for the 320x170 T-Embed screen so Back/Disconnect/Scan do not overlap.
+    lv_obj_t *discBtn = nullptr;
+    if (connected) {
+        discBtn = lv_btn_create(wifiToolScreen);
+        lv_obj_set_size(discBtn, 108, 26);
+        lv_obj_align(discBtn, LV_ALIGN_BOTTOM_MID, 0, -4);
+        lv_obj_set_style_bg_color(discBtn, TC(btnDefault), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(discBtn, TC(btnFocus), LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_bg_color(discBtn, TC(alert), LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(discBtn, TC(border), LV_PART_MAIN);
+        lv_obj_set_style_border_width(discBtn, 1, LV_PART_MAIN);
+        lv_obj_set_style_radius(discBtn, 5, LV_PART_MAIN);
+        lv_obj_add_event_cb(discBtn, [](lv_event_t *e) {
+            connectApDisconnectNow();
+            char body[180];
+            snprintf(body, sizeof(body),
+                     "Disconnected from:\n%s\n\nWiFi status: %d",
+                     connectApTargetSsid[0] ? connectApTargetSsid : "AP",
+                     (int)WiFi.status());
+            connectApShowStatusPage(LV_SYMBOL_WIFI "  Disconnected", body, false);
+            playConnectApDisconnectedTone();
+        }, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *lbl = lv_label_create(discBtn);
+        lv_label_set_text(lbl, "Disconnect");
+        lv_obj_set_style_text_color(lbl, TC(text), LV_PART_MAIN);
+        lv_obj_center(lbl);
+    }
+
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    if (connected) lv_group_add_obj(wifiToolGroup, card);  // Focus card first so encoder can scroll status details.
+    lv_group_add_obj(wifiToolGroup, backBtn);
+    if (discBtn) lv_group_add_obj(wifiToolGroup, discBtn);
+    lv_group_add_obj(wifiToolGroup, scanBtn);
+    setGroup(wifiToolGroup);
+
+    setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 3);
+    lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+
+    if (oldWifiScreen && oldWifiScreen != wifiToolScreen) {
+        keyboardQueueOldScreenDelete(oldWifiScreen, 500);
+    }
+}
+
+static void connectApAttempt(const char *password) {
+    char heading[52];
+    snprintf(heading, sizeof(heading), LV_SYMBOL_WIFI "  %.26s", connectApTargetSsid[0] ? connectApTargetSsid : "Connect");
+
+    // Load the temporary Connecting page before deleting the old AP list/status page.
+    lv_obj_t *oldWifiScreen = wifiToolScreen;
+    wifiToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiToolScreen);
+    createHeader(wifiToolScreen, heading);
+
+    lv_obj_t *status = lv_label_create(wifiToolScreen);
+    lv_label_set_text_fmt(status, LV_SYMBOL_REFRESH "  Connecting to:\n%s", connectApTargetSsid);
+    lv_label_set_long_mode(status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(status, SCREEN_W - 24);
+    lv_obj_set_style_text_color(status, TC(warn), LV_PART_MAIN);
+    lv_obj_align(status, LV_ALIGN_CENTER, 0, -10);
+    lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 120, 0, false);
+    if (oldWifiScreen && oldWifiScreen != wifiToolScreen) {
+        keyboardQueueOldScreenDelete(oldWifiScreen, 500);
+    }
+    lv_timer_handler();
+
+    startLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+    WiFi.mode(WIFI_STA);
+
+    // If we were already connected and are changing/retrying APs, suppress only the
+    // temporary disconnect/drop tone caused by WiFi.disconnect() below.
+    // The successful connection/reconnect tone still plays when WL_CONNECTED is reached.
+    connectApSuppressDropTone(CONNECT_AP_TIMEOUT_MS + 2500);
+    WiFi.disconnect(false, false);
+    delay(120);
+    connectApMarkConnectedState(false);
+
+    if (connectApTargetOpen) {
+        WiFi.begin(connectApTargetSsid);
+    } else {
+        WiFi.begin(connectApTargetSsid, password ? password : "");
+    }
+
+    uint32_t startMs = millis();
+    wl_status_t st = WiFi.status();
+    while ((millis() - startMs) < CONNECT_AP_TIMEOUT_MS) {
+        st = WiFi.status();
+        if (st == WL_CONNECTED) break;
+        lv_timer_handler();
+        delay(80);
+    }
+    stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+
+    if (WiFi.status() == WL_CONNECTED) {
+        bool savedPassword = false;
+        if (!connectApTargetOpen && password && password[0]) {
+            if (connectApUsingCachedPassword) {
+                // This password already came from NVS/config, so do not write it again.
+                savedPassword = true;
+            } else {
+                connectApSavePassword(connectApTargetSsid, password);
+                savedPassword = true;
+            }
+        }
+
+        String ssid = WiFi.SSID();
+        String bssid = WiFi.BSSIDstr();
+        String ip = WiFi.localIP().toString();
+        String gw = WiFi.gatewayIP().toString();
+        String dns = WiFi.dnsIP(0).toString();
+        String mac = WiFi.macAddress();
+        int rssi = WiFi.RSSI();
+        int channel = WiFi.channel();
+
+        bool internetReachable = false;
+        const char *internetText = connectApInternetStatusText(&internetReachable);
+
+        char body[560];
+        snprintf(body, sizeof(body),
+                 LV_SYMBOL_OK "  Connected Status\n\n"
+                 "SSID    : %s\n"
+                 "BSSID   : %s\n"
+                 "RSSI    : %d dBm\n"
+                 "Channel : %d\n"
+                 "Local  %s\n"
+                 "Gateway : %s\n"
+                 "DNS     : %s\n"
+                 "MAC     : %s\n"
+                 "Net    %s",
+                 ssid.c_str(),
+                 bssid.c_str(),
+                 rssi,
+                 channel,
+                 ip.c_str(),
+                 gw.c_str(),
+                 dns.c_str(),
+                 mac.c_str(),
+                 internetText);
+        connectApShowStatusPage(LV_SYMBOL_WIFI "  Connected Status", body, true);
+
+        // Re-enable the drop watchdog as soon as the new connection is complete.
+        // This keeps the intentional switch/reconnect quiet, but still plays the
+        // connected tone every time a connection succeeds.
+        connectApSuppressDropToneUntilMs = 0;
+        connectApMarkConnectedState(true);
+        playConnectApConnectedTone();
+        connectApUsingCachedPassword = false;
+    } else {
+        char body[260];
+        snprintf(body, sizeof(body),
+                 LV_SYMBOL_CLOSE "  Connection failed\n\n"
+                 "SSID   : %s\n"
+                 "Security: %s\n"
+                 "Status : %d\n\n"
+                 "Check the password or signal strength.",
+                 connectApTargetSsid,
+                 connectApTargetAuth[0] ? connectApTargetAuth : "Secured",
+                 (int)WiFi.status());
+        connectApShowStatusPage(LV_SYMBOL_WIFI "  Connect Failed", body, false);
+        connectApMarkConnectedState(false);
+        connectApUsingCachedPassword = false;
+    }
+}
+
+static void cb_connectApPasswordDone(const char *text, bool accepted) {
+    if (!accepted) {
+        connectApUsingCachedPassword = false;
+        createConnectAPTool();
+        return;
+    }
+    connectApUsingCachedPassword = false;
+    connectApAttempt(text ? text : "");
+}
+
+static void connectApSelect(int idx) {
+    if (idx < 0 || idx >= wifiEntryCount) return;
+    connectApCaptureTarget(idx);
+    connectApUsingCachedPassword = false;
+
+    if (connectApTargetOpen) {
+        connectApAttempt("");
+    } else {
+        char savedPass[65];
+        if (connectApLoadSavedPassword(connectApTargetSsid, savedPass, sizeof(savedPass))) {
+            connectApUsingCachedPassword = true;
+            connectApSetStatus(LV_SYMBOL_OK "  Saved password found. Connecting...", TH.success);
+            lv_timer_handler();
+            connectApAttempt(savedPass);
+            return;
+        }
+
+        char title[48];
+        snprintf(title, sizeof(title), "Password: %.27s", connectApTargetSsid);
+        createKeyboardScreen(title, "", 64, cb_connectApPasswordDone);
+    }
+}
+
+static void rebuildConnectApList() {
+    if (!connectApList) return;
+
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    if (connectApBackBtn) lv_group_add_obj(wifiToolGroup, connectApBackBtn);
+    if (connectApDiscBtn) lv_group_add_obj(wifiToolGroup, connectApDiscBtn);
+    if (connectApScanBtn) lv_group_add_obj(wifiToolGroup, connectApScanBtn);
+    setGroup(wifiToolGroup);
+
+    lv_obj_clean(connectApList);
+
+    if (wifiEntryCount <= 0) {
+        lv_obj_t *empty = lv_label_create(connectApList);
+        lv_label_set_text(empty, "No APs listed yet. Press Scan.");
+        lv_obj_set_style_text_color(empty, TC(textDim), LV_PART_MAIN);
+        return;
+    }
+
+    for (int i = 0; i < wifiEntryCount; i++) {
+        char ssidTrunc[17];
+        strncpy(ssidTrunc, wifiEntries[i].ssid, 16);
+        ssidTrunc[16] = '\0';
+
+        char row[76];
+        const char *lock = wifiEntries[i].open ? "Open" : wifiEntries[i].authStr;
+        snprintf(row, sizeof(row), "%-16s %4d %s", ssidTrunc, wifiEntries[i].rssi, lock);
+
+        lv_obj_t *btn = lv_list_add_btn(connectApList, nullptr, row);
+        styleListBtn(btn);
+        lv_obj_set_style_text_color(btn, rssiColor(wifiEntries[i].rssi),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            connectApSelect((int)(intptr_t)lv_event_get_user_data(ev));
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_group_add_obj(wifiToolGroup, btn);
+    }
+}
+
+static void cb_connectApScan(lv_event_t *e) {
+    connectApSetStatus(LV_SYMBOL_REFRESH "  Scanning APs...", TH.warn);
+    lv_timer_handler();
+
+    startLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+    int found = doWiFiScan();
+    stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+
+    char status[72];
+    snprintf(status, sizeof(status), LV_SYMBOL_WIFI "  %d AP%s found. Select one.",
+             found, found == 1 ? "" : "s");
+    connectApSetStatus(status, found > 0 ? TH.success : TH.textDim);
+    rebuildConnectApList();
+}
+
+static void cb_connectApDisconnect(lv_event_t *e) {
+    connectApDisconnectNow();
+    connectApSetStatus(LV_SYMBOL_CLOSE "  Disconnected", TH.warn);
+    rebuildConnectApList();
+    playConnectApDisconnectedTone();
+}
+
+
+// ════════════════════════════════════════════════════════════════
+//  WIFI TOOL — GATEWAY INFO / ROUTER CHECK
+// ════════════════════════════════════════════════════════════════
+static bool gatewayInfoConnected() {
+    return (WiFi.status() == WL_CONNECTED);
+}
+
+static const char *gatewayInfoPortName(uint16_t port) {
+    switch (port) {
+        case 53:  return "DNS";
+        case 80:  return "HTTP";
+        case 443: return "HTTPS";
+        default:  return "TCP";
+    }
+}
+
+static void gatewayInfoSetStatus(const char *msg, uint32_t colorHex) {
+    if (!gatewayInfoStatusLbl) return;
+    lv_label_set_text(gatewayInfoStatusLbl, msg);
+    lv_obj_set_style_text_color(gatewayInfoStatusLbl, lv_color_hex(colorHex), LV_PART_MAIN);
+}
+
+static bool gatewayInfoProbeGateway(uint16_t *openPortOut) {
+#if GATEWAY_INFO_ENABLED
+    if (!gatewayInfoConnected()) return false;
+
+    IPAddress gateway = WiFi.gatewayIP();
+    if (gateway == IPAddress(0, 0, 0, 0)) return false;
+
+    WiFiClient client;
+    client.setTimeout(GATEWAY_INFO_TCP_TIMEOUT_MS);
+
+    for (int p = 0; p < GATEWAY_INFO_PORT_COUNT; p++) {
+        uint16_t port = GATEWAY_INFO_PORTS[p];
+        if (client.connect(gateway, port, GATEWAY_INFO_TCP_TIMEOUT_MS)) {
+            client.stop();
+            if (openPortOut) *openPortOut = port;
+            return true;
+        }
+        client.stop();
+        lv_timer_handler();
+        delay(1);
+    }
+#endif
+    return false;
+}
+
+static void gatewayInfoAddRow(const char *text, uint32_t colorHex = 0) {
+    if (!gatewayInfoList || !text) return;
+    lv_obj_t *row = lv_list_add_btn(gatewayInfoList, nullptr, text);
+    styleListBtn(row);
+
+    // Gateway Info uses a compact list because the T-Embed display is short.
+    // Keep each row tight so the Back/Refresh buttons never cover the content.
+    lv_obj_set_height(row, 20);
+    lv_obj_set_style_pad_top(row, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(row, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(row, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(row, 6, LV_PART_MAIN);
+
+    if (colorHex) {
+        lv_obj_set_style_text_color(row, lv_color_hex(colorHex), LV_PART_MAIN);
+    }
+}
+
+static void gatewayInfoRefresh() {
+#if !GATEWAY_INFO_ENABLED
+    gatewayInfoSetStatus("Gateway Info disabled in config.", TH.warn);
+    return;
+#else
+    resetInactivityTimer();
+
+    if (!gatewayInfoList) return;
+    lv_obj_clean(gatewayInfoList);
+
+    if (!gatewayInfoConnected()) {
+        gatewayInfoSetStatus("Connect to an AP first. Gateway Info uses the active WiFi connection.", TH.warn);
+        gatewayInfoAddRow("Connect to an AP first.", TH.textDim);
+        if (gatewayInfoRefreshBtn) lv_obj_add_state(gatewayInfoRefreshBtn, LV_STATE_DISABLED);
+        return;
+    }
+
+    if (gatewayInfoRefreshBtn) lv_obj_clear_state(gatewayInfoRefreshBtn, LV_STATE_DISABLED);
+
+    gatewayInfoSetStatus(LV_SYMBOL_REFRESH "  Checking gateway/router...", TH.warn);
+    lv_timer_handler();
+
+    String ssid = WiFi.SSID();
+    String bssid = WiFi.BSSIDstr();
+    IPAddress local = WiFi.localIP();
+    IPAddress gateway = WiFi.gatewayIP();
+    IPAddress subnet = WiFi.subnetMask();
+    IPAddress dns1 = WiFi.dnsIP(0);
+    IPAddress dns2 = WiFi.dnsIP(1);
+    int32_t rssi = WiFi.RSSI();
+    int32_t channel = WiFi.channel();
+
+    uint16_t gatewayPort = 0;
+    bool gatewayReachable = gatewayInfoProbeGateway(&gatewayPort);
+    bool internetReachable = false;
+    const char *internetText = connectApInternetStatusText(&internetReachable);
+
+    char status[192];
+    // One-line horizontal marquee. Avoid newlines here so the status scrolls
+    // sideways instead of vertically on the short T-Embed display.
+    // Clearer one-line marquee format:
+    //   TCP: OK Port 80 HTTP
+    // instead of the shorter "TCP: OK HTTP" wording.
+    if (gatewayReachable) {
+        snprintf(status, sizeof(status),
+                 LV_SYMBOL_HOME " Gateway %s  |  TCP: OK Port %u %s  |  Net: %s",
+                 gateway.toString().c_str(),
+                 gatewayPort,
+                 gatewayInfoPortName(gatewayPort),
+                 internetText);
+    } else {
+        snprintf(status, sizeof(status),
+                 LV_SYMBOL_HOME " Gateway %s  |  TCP: No Response  |  Net: %s",
+                 gateway.toString().c_str(),
+                 internetText);
+    }
+    gatewayInfoSetStatus(status, gatewayReachable ? TH.success : TH.warn);
+
+    char row[128];
+
+    snprintf(row, sizeof(row), "SSID   %.24s", ssid.length() ? ssid.c_str() : "<none>");
+    gatewayInfoAddRow(row, TH.text);
+
+    snprintf(row, sizeof(row), "BSSID  %s", bssid.length() ? bssid.c_str() : "--");
+    gatewayInfoAddRow(row, TH.textDim);
+
+    snprintf(row, sizeof(row), "Signal %ld dBm %s", (long)rssi, rssiQuality((int8_t)rssi));
+    gatewayInfoAddRow(row, TH.text);
+
+    snprintf(row, sizeof(row), "Ch     %ld", (long)channel);
+    gatewayInfoAddRow(row, TH.textDim);
+
+    snprintf(row, sizeof(row), "Local  %s", local.toString().c_str());
+    gatewayInfoAddRow(row, TH.text);
+
+    snprintf(row, sizeof(row), "Gateway %s", gateway.toString().c_str());
+    gatewayInfoAddRow(row, gatewayReachable ? TH.success : TH.warn);
+
+    snprintf(row, sizeof(row), "Subnet %s", subnet.toString().c_str());
+    gatewayInfoAddRow(row, TH.textDim);
+
+    // Highlight DNS rows in yellow so router/DNS details stand out.
+    snprintf(row, sizeof(row), "DNS1   %s", dns1.toString().c_str());
+    gatewayInfoAddRow(row, TH.warn);
+
+    snprintf(row, sizeof(row), "DNS2   %s", dns2.toString().c_str());
+    gatewayInfoAddRow(row, TH.warn);
+
+    if (gatewayReachable) {
+        snprintf(row, sizeof(row), "Router TCP Port %u %s", gatewayPort, gatewayInfoPortName(gatewayPort));
+        gatewayInfoAddRow(row, TH.success);
+    } else {
+        gatewayInfoAddRow("Router TCP no response", TH.warn);
+    }
+
+    snprintf(row, sizeof(row), "Net    %s", internetText);
+    gatewayInfoAddRow(row, internetReachable ? TH.success : TH.warn);
+
+    snprintf(row, sizeof(row), "STA MAC %s", WiFi.macAddress().c_str());
+    gatewayInfoAddRow(row, TH.textDim);
+
+    lv_timer_handler();
+#endif
+}
+
+static void cb_gatewayInfoRefresh(lv_event_t *e) {
+    playMenuClickFeedback();
+    gatewayInfoRefresh();
+}
+
+void createGatewayInfo() {
+#if !GATEWAY_INFO_ENABLED
+    createSubScreen(0);
+    return;
+#else
+    lv_obj_t *oldWifiScreen = wifiToolScreen;
+    wifiToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiToolScreen);
+    createHeader(wifiToolScreen, LV_SYMBOL_HOME "  Gateway Info");
+
+    gatewayInfoStatusLbl = lv_label_create(wifiToolScreen);
+    lv_label_set_long_mode(gatewayInfoStatusLbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(gatewayInfoStatusLbl, SCREEN_W - 14);
+    lv_obj_set_height(gatewayInfoStatusLbl, 18);
+    // LVGL on this build supports animation time, not animation speed.
+    // Keep the config value acting like a speed: higher = faster scroll.
+    uint32_t gwScrollReduceMs = (uint32_t)GATEWAY_INFO_STATUS_SCROLL_SPEED * 120UL;
+    if (gwScrollReduceMs > 8200UL) gwScrollReduceMs = 8200UL;
+    uint32_t gwScrollTimeMs = 9000UL - gwScrollReduceMs;
+    lv_obj_set_style_anim_time(gatewayInfoStatusLbl, gwScrollTimeMs, LV_PART_MAIN);
+    lv_obj_set_pos(gatewayInfoStatusLbl, 7, 30);
+
+    gatewayInfoList = lv_list_create(wifiToolScreen);
+    lv_obj_set_size(gatewayInfoList, SCREEN_W - 8, SCREEN_H - 88);
+    lv_obj_set_pos(gatewayInfoList, 4, 50);
+    lv_obj_set_style_bg_color(gatewayInfoList,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(gatewayInfoList,       LV_OPA_COVER,        LV_PART_MAIN);
+    lv_obj_set_style_border_width(gatewayInfoList, 0,                   LV_PART_MAIN);
+    lv_obj_set_style_pad_all(gatewayInfoList,      2,                   LV_PART_MAIN);
+    lv_obj_set_style_pad_row(gatewayInfoList,      2,                   LV_PART_MAIN);
+    lv_obj_set_style_bg_color(gatewayInfoList, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(gatewayInfoList, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(gatewayInfoList, 4, LV_PART_SCROLLBAR);
+
+    gatewayInfoBackBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
+    lv_obj_set_size(gatewayInfoBackBtn, 100, 26);
+    lv_obj_align(gatewayInfoBackBtn, LV_ALIGN_BOTTOM_LEFT, 6, -4);
+
+    gatewayInfoRefreshBtn = createActionBtn(wifiToolScreen, LV_SYMBOL_REFRESH " Refresh", cb_gatewayInfoRefresh);
+    lv_obj_set_size(gatewayInfoRefreshBtn, 112, 26);
+    lv_obj_align(gatewayInfoRefreshBtn, LV_ALIGN_BOTTOM_RIGHT, -6, -4);
+
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    lv_group_add_obj(wifiToolGroup, gatewayInfoBackBtn);
+    lv_group_add_obj(wifiToolGroup, gatewayInfoRefreshBtn);
+    lv_group_add_obj(wifiToolGroup, gatewayInfoList);
+    setGroup(wifiToolGroup);
+
+    if (!gatewayInfoConnected()) {
+        lv_obj_add_state(gatewayInfoRefreshBtn, LV_STATE_DISABLED);
+    }
+
+    setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 3);
+    lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+
+    gatewayInfoRefresh();
+
+    if (oldWifiScreen && oldWifiScreen != wifiToolScreen) {
+        keyboardQueueOldScreenDelete(oldWifiScreen, 500);
+    }
+
+    lv_timer_handler();
+#endif
+}
+
+
+// ════════════════════════════════════════════════════════════════
+//  WIFI TOOL — LAN HOST DISCOVERY
+// ════════════════════════════════════════════════════════════════
+static bool lanDiscoveryConnected() {
+    return (WiFi.status() == WL_CONNECTED);
+}
+
+static uint32_t lanDiscoveryIpToU32(IPAddress ip) {
+    return ((uint32_t)ip[0] << 24) |
+           ((uint32_t)ip[1] << 16) |
+           ((uint32_t)ip[2] << 8)  |
+           (uint32_t)ip[3];
+}
+
+static IPAddress lanDiscoveryU32ToIp(uint32_t value) {
+    return IPAddress((uint8_t)((value >> 24) & 0xFF),
+                     (uint8_t)((value >> 16) & 0xFF),
+                     (uint8_t)((value >> 8) & 0xFF),
+                     (uint8_t)(value & 0xFF));
+}
+
+static IPAddress lanDiscoveryNetworkBase(IPAddress ip, IPAddress mask) {
+    return lanDiscoveryU32ToIp(lanDiscoveryIpToU32(ip) & lanDiscoveryIpToU32(mask));
+}
+
+static bool lanDiscoveryBuildRange(IPAddress local,
+                                   IPAddress mask,
+                                   uint32_t *firstOut,
+                                   uint32_t *lastOut,
+                                   uint32_t *networkOut,
+                                   uint32_t *broadcastOut) {
+    uint32_t ipNum = lanDiscoveryIpToU32(local);
+    uint32_t maskNum = lanDiscoveryIpToU32(mask);
+
+    // If DHCP did not give us a useful subnet mask, fall back to a /24
+    // around the connected local IP instead of assuming the last octet only.
+    if (maskNum == 0 || maskNum == 0xFFFFFFFFUL) {
+        maskNum = 0xFFFFFF00UL;
+    }
+
+    uint32_t networkNum = ipNum & maskNum;
+    uint32_t broadcastNum = networkNum | (~maskNum);
+
+    // Need at least one usable host between network and broadcast.
+    if (broadcastNum <= (networkNum + 1)) {
+        return false;
+    }
+
+    uint32_t usableFirst = networkNum + 1;
+    uint32_t usableLast = broadcastNum - 1;
+
+    int startHost = LAN_DISCOVERY_START_HOST;
+    if (startHost < 1) startHost = 1;
+
+    // Keep the existing config meaning, but apply it relative to the actual
+    // network base calculated from WiFi.localIP() and WiFi.subnetMask().
+    uint32_t configuredFirst = networkNum + (uint32_t)startHost;
+    if (configuredFirst > usableFirst && configuredFirst <= usableLast) {
+        usableFirst = configuredFirst;
+    }
+
+    int maxHosts = LAN_DISCOVERY_MAX_HOSTS;
+    if (maxHosts < 1) maxHosts = 1;
+
+    uint32_t configuredLast = usableFirst + (uint32_t)maxHosts - 1;
+    if (configuredLast < usableFirst || configuredLast > usableLast) {
+        configuredLast = usableLast;
+    }
+
+    if (usableFirst > configuredLast) {
+        return false;
+    }
+
+    if (firstOut) *firstOut = usableFirst;
+    if (lastOut) *lastOut = configuredLast;
+    if (networkOut) *networkOut = networkNum;
+    if (broadcastOut) *broadcastOut = broadcastNum;
+    return true;
+}
+
+static const char *lanDiscoveryPortName(uint16_t port) {
+    switch (port) {
+        case 22:  return "SSH";
+        case 53:  return "DNS";
+        case 80:  return "HTTP";
+        case 443: return "HTTPS";
+        case 8080:return "HTTP-Alt";
+        default:  return "TCP";
+    }
+}
+
+static bool lanDiscoveryProbe(IPAddress ip, uint16_t *openPortOut) {
+    WiFiClient client;
+
+    for (int p = 0; p < LAN_DISCOVERY_PORT_COUNT; p++) {
+        uint16_t port = LAN_DISCOVERY_PORTS[p];
+
+        if (client.connect(ip, port, LAN_DISCOVERY_TCP_TIMEOUT_MS)) {
+            client.stop();
+            if (openPortOut) *openPortOut = port;
+            return true;
+        }
+
+        client.stop();
+        lv_timer_handler();
+        delay(1);
+    }
+
+    return false;
+}
+
+static void lanDiscoverySetStatus(const char *msg, uint32_t colorHex) {
+    if (!lanDiscoveryStatusLbl) return;
+    lv_label_set_text(lanDiscoveryStatusLbl, msg);
+    lv_obj_set_style_text_color(lanDiscoveryStatusLbl, lv_color_hex(colorHex), LV_PART_MAIN);
+}
+
+static void lanDiscoveryRunScan() {
+#if !LAN_DISCOVERY_ENABLED
+    lanDiscoverySetStatus("LAN Host Discovery disabled in config.", TH.warn);
+    return;
+#else
+    if (!lanDiscoveryConnected()) {
+        lanDiscoverySetStatus("Connect to an AP first, then run LAN Host Discovery.", TH.warn);
+        return;
+    }
+
+    if (!lanDiscoveryList) return;
+
+    resetInactivityTimer();
+
+    // Make the page feel alive while the TCP probes are running. The scan is
+    // still a blocking loop, but the LED task runs on core 0 and the UI gets
+    // periodic lv_timer_handler() calls below.
+#if LAN_DISCOVERY_RAINBOW_LED_ENABLED
+    startLEDRainbowSpinner(LAN_DISCOVERY_RAINBOW_LED_DELAY_MS);
+#else
+    startLEDSpinner(0, 200, 0, 80);
+#endif
+
+    if (lanDiscoveryScanBtn) lv_obj_add_state(lanDiscoveryScanBtn, LV_STATE_DISABLED);
+    if (lanDiscoveryBackBtn) lv_obj_add_state(lanDiscoveryBackBtn, LV_STATE_DISABLED);
+
+    lv_obj_clean(lanDiscoveryList);
+
+    IPAddress local = WiFi.localIP();
+    IPAddress gateway = WiFi.gatewayIP();
+    IPAddress mask = WiFi.subnetMask();
+
+    uint32_t firstHostNum = 0;
+    uint32_t lastHostNum = 0;
+    uint32_t networkNum = 0;
+    uint32_t broadcastNum = 0;
+
+    if (!lanDiscoveryBuildRange(local, mask, &firstHostNum, &lastHostNum, &networkNum, &broadcastNum)) {
+        lanDiscoverySetStatus("Could not build LAN range from IP/subnet.", TH.alert);
+#if LAN_DISCOVERY_RAINBOW_LED_ENABLED
+        stopLEDRainbowSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 3);
+#else
+        stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+#endif
+        if (lanDiscoveryBackBtn) lv_obj_clear_state(lanDiscoveryBackBtn, LV_STATE_DISABLED);
+        if (lanDiscoveryScanBtn) lv_obj_clear_state(lanDiscoveryScanBtn, LV_STATE_DISABLED);
+        return;
+    }
+
+    IPAddress firstIp = lanDiscoveryU32ToIp(firstHostNum);
+    IPAddress lastIp = lanDiscoveryU32ToIp(lastHostNum);
+    IPAddress networkIp = lanDiscoveryU32ToIp(networkNum);
+
+    char status[192];
+    snprintf(status, sizeof(status),
+             "Scanning LAN...\nLocal: %s\nRange: %s-%s",
+             local.toString().c_str(),
+             firstIp.toString().c_str(),
+             lastIp.toString().c_str());
+    lanDiscoverySetStatus(status, TH.warn);
+    lv_timer_handler();
+
+    int found = 0;
+    int scanned = 0;
+
+    // Probe gateway first because it is the most useful/likely live target.
+    bool gatewayWasProbed = false;
+    if (gateway != IPAddress(0, 0, 0, 0) && gateway != local) {
+        uint32_t gatewayNum = lanDiscoveryIpToU32(gateway);
+        if (gatewayNum >= networkNum && gatewayNum <= broadcastNum) {
+            gatewayWasProbed = true;
+            uint16_t openPort = 0;
+            if (lanDiscoveryProbe(gateway, &openPort)) {
+                char row[96];
+                snprintf(row, sizeof(row), "%s   gateway   %u/%s",
+                         gateway.toString().c_str(),
+                         openPort,
+                         lanDiscoveryPortName(openPort));
+                lv_obj_t *btn = lv_list_add_btn(lanDiscoveryList, nullptr, row);
+                styleListBtn(btn);
+                lv_obj_set_height(btn, 28);
+                lv_obj_set_style_text_color(btn, TC(success), LV_PART_MAIN);
+                found++;
+            }
+        }
+    }
+
+    for (uint32_t ipNum = firstHostNum; ipNum <= lastHostNum && found < LAN_DISCOVERY_MAX_RESULTS; ipNum++) {
+        IPAddress target = lanDiscoveryU32ToIp(ipNum);
+
+        if (target == local ||
+            target == IPAddress(0, 0, 0, 0) ||
+            target == IPAddress(255, 255, 255, 255) ||
+            (gatewayWasProbed && target == gateway)) {
+            continue;
+        }
+
+        scanned++;
+
+        uint16_t openPort = 0;
+        if (lanDiscoveryProbe(target, &openPort)) {
+            char row[96];
+            snprintf(row, sizeof(row), "%s   %u/%s",
+                     target.toString().c_str(),
+                     openPort,
+                     lanDiscoveryPortName(openPort));
+            lv_obj_t *btn = lv_list_add_btn(lanDiscoveryList, nullptr, row);
+            styleListBtn(btn);
+            lv_obj_set_height(btn, 28);
+            lv_obj_set_style_text_color(btn, TC(text), LV_PART_MAIN);
+            found++;
+        }
+
+        if ((scanned % 8) == 0) {
+            snprintf(status, sizeof(status),
+                     "Scanning LAN... %d checked\nFound: %d\nNetwork: %s/%s",
+                     scanned,
+                     found,
+                     networkIp.toString().c_str(),
+                     mask.toString().c_str());
+            lanDiscoverySetStatus(status, TH.warn);
+            lv_timer_handler();
+        }
+    }
+
+    if (found == 0) {
+        lv_obj_t *row = lv_list_add_btn(lanDiscoveryList, nullptr,
+                                        "No hosts found by TCP probe.");
+        styleListBtn(row);
+        lv_obj_set_height(row, 28);
+        lv_obj_set_style_text_color(row, TC(textDim), LV_PART_MAIN);
+    }
+
+    snprintf(status, sizeof(status),
+             LV_SYMBOL_OK "  LAN scan complete\nChecked: %d hosts\nFound: %d",
+             scanned,
+             found);
+    lanDiscoverySetStatus(status, found > 0 ? TH.success : TH.textDim);
+
+#if LAN_DISCOVERY_RAINBOW_LED_ENABLED
+    stopLEDRainbowSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 3);
+#else
+    stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+#endif
+
+    playLanDiscoveryDoneTone();
+
+    if (lanDiscoveryBackBtn) lv_obj_clear_state(lanDiscoveryBackBtn, LV_STATE_DISABLED);
+    if (lanDiscoveryScanBtn) lv_obj_clear_state(lanDiscoveryScanBtn, LV_STATE_DISABLED);
+    lv_timer_handler();
+#endif
+}
+
+static void cb_lanDiscoveryRescan(lv_event_t *e) {
+    resetInactivityTimer();
+    playMenuClickFeedback();
+    lanDiscoveryRunScan();
+}
+
+void createLANHostDiscovery() {
+#if !LAN_DISCOVERY_ENABLED
+    createSubScreen(0);
+    return;
+#else
+    lv_obj_t *oldWifiScreen = wifiToolScreen;
+    wifiToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiToolScreen);
+    createHeader(wifiToolScreen, LV_SYMBOL_EYE_OPEN "  LAN Host Discovery");
+
+    lanDiscoveryStatusLbl = lv_label_create(wifiToolScreen);
+    lv_label_set_long_mode(lanDiscoveryStatusLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lanDiscoveryStatusLbl, SCREEN_W - 14);
+    lv_obj_set_pos(lanDiscoveryStatusLbl, 7, 30);
+
+    if (lanDiscoveryConnected()) {
+        char msg[150];
+        snprintf(msg, sizeof(msg),
+                 "Ready. Local: %s\nGateway %s",
+                 WiFi.localIP().toString().c_str(),
+                 WiFi.gatewayIP().toString().c_str());
+        lanDiscoverySetStatus(msg, TH.text);
+    } else {
+        lanDiscoverySetStatus("Connect to an AP first. This tool uses the active LAN connection.", TH.warn);
+    }
+
+    lanDiscoveryList = lv_list_create(wifiToolScreen);
+    lv_obj_set_size(lanDiscoveryList, SCREEN_W, SCREEN_H - 98);
+    lv_obj_set_pos(lanDiscoveryList, 0, 64);
+    lv_obj_set_style_bg_color(lanDiscoveryList,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(lanDiscoveryList,       LV_OPA_COVER,        LV_PART_MAIN);
+    lv_obj_set_style_border_width(lanDiscoveryList, 0,                   LV_PART_MAIN);
+    lv_obj_set_style_pad_all(lanDiscoveryList,      3,                   LV_PART_MAIN);
+    lv_obj_set_style_pad_row(lanDiscoveryList,      3,                   LV_PART_MAIN);
+    lv_obj_set_style_bg_color(lanDiscoveryList, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(lanDiscoveryList, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(lanDiscoveryList, 4, LV_PART_SCROLLBAR);
+
+    lv_obj_t *hintRow = lv_list_add_btn(lanDiscoveryList, nullptr,
+                                        lanDiscoveryConnected()
+                                            ? "Press Scan to start LAN discovery."
+                                            : "Connect to an AP first.");
+    styleListBtn(hintRow);
+    lv_obj_set_height(hintRow, 28);
+    lv_obj_set_style_text_color(hintRow, TC(textDim), LV_PART_MAIN);
+
+    lanDiscoveryBackBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
+    lv_obj_set_size(lanDiscoveryBackBtn, 100, 26);
+    lv_obj_align(lanDiscoveryBackBtn, LV_ALIGN_BOTTOM_LEFT, 6, -4);
+
+    lanDiscoveryScanBtn = createActionBtn(wifiToolScreen, LV_SYMBOL_REFRESH " Scan", cb_lanDiscoveryRescan);
+    lv_obj_set_size(lanDiscoveryScanBtn, 100, 26);
+    lv_obj_align(lanDiscoveryScanBtn, LV_ALIGN_BOTTOM_RIGHT, -6, -4);
+
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    lv_group_add_obj(wifiToolGroup, lanDiscoveryBackBtn);
+    lv_group_add_obj(wifiToolGroup, lanDiscoveryScanBtn);
+    lv_group_add_obj(wifiToolGroup, lanDiscoveryList);
+    setGroup(wifiToolGroup);
+
+    if (!lanDiscoveryConnected()) {
+        lv_obj_add_state(lanDiscoveryScanBtn, LV_STATE_DISABLED);
+    }
+
+    setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 3);
+    lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+
+    if (oldWifiScreen && oldWifiScreen != wifiToolScreen) {
+        keyboardQueueOldScreenDelete(oldWifiScreen, 500);
+    }
+
+    lv_timer_handler();
+#endif
+}
+
+
+void createConnectAPTool() {
+    lv_obj_t *oldWifiScreen = wifiToolScreen;
+    wifiToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiToolScreen);
+    createHeader(wifiToolScreen, LV_SYMBOL_WIFI "  Connect to AP");
+
+    connectApStatusLbl = lv_label_create(wifiToolScreen);
+    if (WiFi.status() == WL_CONNECTED) {
+        String ip = WiFi.localIP().toString();
+        char status[96];
+        snprintf(status, sizeof(status), LV_SYMBOL_OK "  Connected: %.20s  %s",
+                 WiFi.SSID().c_str(), ip.c_str());
+        lv_label_set_text(connectApStatusLbl, status);
+        lv_obj_set_style_text_color(connectApStatusLbl, TC(success), LV_PART_MAIN);
+    } else {
+        lv_label_set_text(connectApStatusLbl, "Press Scan, select AP, then enter password.");
+        lv_obj_set_style_text_color(connectApStatusLbl, TC(textDim), LV_PART_MAIN);
+    }
+    lv_label_set_long_mode(connectApStatusLbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(connectApStatusLbl, SCREEN_W - 14);
+    lv_obj_set_pos(connectApStatusLbl, 7, 30);
+
+    connectApList = lv_list_create(wifiToolScreen);
+    lv_obj_set_size(connectApList, SCREEN_W, SCREEN_H - 80);
+    lv_obj_set_pos(connectApList, 0, 48);
+    lv_obj_set_style_bg_color(connectApList,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(connectApList,       LV_OPA_COVER,        LV_PART_MAIN);
+    lv_obj_set_style_border_width(connectApList, 0,                   LV_PART_MAIN);
+    lv_obj_set_style_pad_all(connectApList,      2,                   LV_PART_MAIN);
+    lv_obj_set_style_pad_row(connectApList,      2,                   LV_PART_MAIN);
+    lv_obj_set_style_bg_color(connectApList, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(connectApList, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(connectApList, 4, LV_PART_SCROLLBAR);
+
+    connectApBackBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
+    lv_obj_set_size(connectApBackBtn, 86, 26);
+    lv_obj_align(connectApBackBtn, LV_ALIGN_BOTTOM_LEFT, 6, -4);
+
+    connectApScanBtn = createActionBtn(wifiToolScreen, LV_SYMBOL_REFRESH " Scan", cb_connectApScan);
+    lv_obj_set_size(connectApScanBtn, 86, 26);
+    lv_obj_align(connectApScanBtn, LV_ALIGN_BOTTOM_RIGHT, -6, -4);
+
+    connectApDiscBtn = lv_btn_create(wifiToolScreen);
+    lv_obj_set_size(connectApDiscBtn, 108, 26);
+    lv_obj_align(connectApDiscBtn, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(connectApDiscBtn, TC(btnDefault), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(connectApDiscBtn, TC(btnFocus), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(connectApDiscBtn, TC(alert), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(connectApDiscBtn, TC(border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(connectApDiscBtn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(connectApDiscBtn, 5, LV_PART_MAIN);
+    lv_obj_add_event_cb(connectApDiscBtn, cb_connectApDisconnect, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *discLbl = lv_label_create(connectApDiscBtn);
+    lv_label_set_text(discLbl, "Disconnect");
+    lv_obj_set_style_text_color(discLbl, TC(text), LV_PART_MAIN);
+    lv_obj_center(discLbl);
+
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    lv_group_add_obj(wifiToolGroup, connectApBackBtn);
+    lv_group_add_obj(wifiToolGroup, connectApDiscBtn);
+    lv_group_add_obj(wifiToolGroup, connectApScanBtn);
+    setGroup(wifiToolGroup);
+
+    rebuildConnectApList();
+
+    setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 3);
+    lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+
+    if (oldWifiScreen && oldWifiScreen != wifiToolScreen) {
+        keyboardQueueOldScreenDelete(oldWifiScreen, 500);
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════
+//  TOOL 3 – STATION SCANNER
+//
+//  Passive client/station scanner inspired by GhostESP station scan logic.
+//  It watches management + data frames, deduplicates station/AP pairs,
+//  and displays station MAC, RSSI, channel, age, frame type, AP/BSSID,
+//  and packet count. No deauth/injection; monitor-only.
+// ════════════════════════════════════════════════════════════════
+static bool stationIsBroadcastOrMulticast(const uint8_t *mac) {
+    if (!mac) return true;
+    if (mac[0] & 0x01) return true;
+    static const uint8_t ff[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+    return memcmp(mac, ff, 6) == 0;
+}
+
+static void stationMacToStr(const uint8_t *mac, char *out) {
+    snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static const char *stationMgmtSubtypeName(uint8_t subtype) {
+    switch (subtype) {
+        case 0x0: return "Assoc Req";
+        case 0x1: return "Assoc Resp";
+        case 0x2: return "Reassoc Req";
+        case 0x3: return "Reassoc Resp";
+        case 0xA: return "Disassoc";
+        case 0xB: return "Auth";
+        case 0xC: return "Deauth";
+        case 0xD: return "Action";
+        default:  return "Mgmt";
+    }
+}
+
+static bool stationRelevantMgmtSubtype(uint8_t subtype) {
+    switch (subtype) {
+        case 0x0: // Assoc Request
+        case 0x1: // Assoc Response
+        case 0x2: // Reassoc Request
+        case 0x3: // Reassoc Response
+        case 0xA: // Disassociation
+        case 0xB: // Authentication
+        case 0xC: // Deauthentication
+        case 0xD: // Action
+            return true;
+        default:
+            return false;
+    }
+}
+
+
+static int stationFindApByBssid(const char *bssid) {
+    if (!bssid || strcmp(bssid, "--") == 0) return -1;
+    int count = stationApCount;
+    if (count < 0) count = 0;
+    if (count > MAX_STATION_APS) count = MAX_STATION_APS;
+    for (int i = 0; i < count; i++) {
+        if (strncmp(stationAps[i].bssid, bssid, 18) == 0) return i;
+    }
+    return -1;
+}
+
+static void stationAddOrUpdateAp(const uint8_t *bssid, const char *ssid,
+                                 const char *auth, int8_t rssi, uint8_t channel) {
+    if (!bssid || stationIsBroadcastOrMulticast(bssid)) return;
+
+    char bssidStr[18];
+    stationMacToStr(bssid, bssidStr);
+
+    int idx = stationFindApByBssid(bssidStr);
+    if (idx < 0) {
+        int count = stationApCount;
+        if (count >= MAX_STATION_APS) return;
+        idx = count;
+        strncpy(stationAps[idx].bssid, bssidStr, sizeof(stationAps[idx].bssid) - 1);
+        stationAps[idx].bssid[sizeof(stationAps[idx].bssid) - 1] = '\0';
+        stationAps[idx].clientCount = 0;
+        stationAps[idx].eapolPackets = 0;
+        stationApCount = count + 1;
+    }
+
+    if (ssid && ssid[0]) {
+        strncpy(stationAps[idx].ssid, ssid, sizeof(stationAps[idx].ssid) - 1);
+        stationAps[idx].ssid[sizeof(stationAps[idx].ssid) - 1] = '\0';
+    } else if (stationAps[idx].ssid[0] == '\0') {
+        strncpy(stationAps[idx].ssid, "<hidden>", sizeof(stationAps[idx].ssid) - 1);
+        stationAps[idx].ssid[sizeof(stationAps[idx].ssid) - 1] = '\0';
+    }
+
+    if (auth && auth[0]) {
+        strncpy(stationAps[idx].authStr, auth, sizeof(stationAps[idx].authStr) - 1);
+        stationAps[idx].authStr[sizeof(stationAps[idx].authStr) - 1] = '\0';
+    } else if (stationAps[idx].authStr[0] == '\0') {
+        strncpy(stationAps[idx].authStr, "Unknown", sizeof(stationAps[idx].authStr) - 1);
+        stationAps[idx].authStr[sizeof(stationAps[idx].authStr) - 1] = '\0';
+    }
+
+    stationAps[idx].rssi = rssi;
+    stationAps[idx].channel = channel;
+    stationAps[idx].lastSeenMs = millis();
+}
+
+static void stationParseApFrame(const uint8_t *d, uint16_t len, int8_t rssi, uint8_t channel) {
+    // Beacon / probe response layout: 24-byte MAC header, 12-byte fixed params, then tagged params.
+    if (!d || len < 36) return;
+
+    const uint8_t *bssid = d + 16;  // addr3 is the BSSID for beacon/probe response.
+    if (stationIsBroadcastOrMulticast(bssid)) return;
+
+    uint16_t cap = (uint16_t)d[34] | ((uint16_t)d[35] << 8);
+    bool privacy = (cap & 0x0010) != 0;
+    bool sawRsn = false;
+    bool sawWpa = false;
+    bool sawSae = false;
+    char ssid[33];
+    ssid[0] = '\0';
+
+    uint16_t pos = 36;
+    while ((pos + 2) <= len) {
+        uint8_t tag = d[pos++];
+        uint8_t tlvLen = d[pos++];
+        if ((pos + tlvLen) > len) break;
+
+        if (tag == 0) { // SSID
+            uint8_t copyLen = tlvLen;
+            if (copyLen > 32) copyLen = 32;
+            if (copyLen > 0) {
+                memcpy(ssid, d + pos, copyLen);
+                ssid[copyLen] = '\0';
+                for (uint8_t i = 0; i < copyLen; i++) {
+                    if ((uint8_t)ssid[i] < 32 || (uint8_t)ssid[i] > 126) ssid[i] = '?';
+                }
+            }
+        } else if (tag == 48) { // RSN
+            sawRsn = true;
+            // Look for SAE auth suite selector 00-0F-AC:08 as a WPA3 hint.
+            for (uint8_t i = 0; (i + 3) < tlvLen; i++) {
+                if (d[pos + i] == 0x00 && d[pos + i + 1] == 0x0F &&
+                    d[pos + i + 2] == 0xAC && d[pos + i + 3] == 0x08) {
+                    sawSae = true;
+                    break;
+                }
+            }
+        } else if (tag == 221 && tlvLen >= 4) { // Vendor specific
+            // WPA vendor OUI: 00:50:F2:01
+            if (d[pos] == 0x00 && d[pos + 1] == 0x50 &&
+                d[pos + 2] == 0xF2 && d[pos + 3] == 0x01) {
+                sawWpa = true;
+            }
+        }
+
+        pos += tlvLen;
+    }
+
+    const char *auth = "Open";
+    if (sawSae) auth = "WPA3";
+    else if (sawRsn && sawWpa) auth = "WPA/2";
+    else if (sawRsn) auth = "WPA2";
+    else if (sawWpa) auth = "WPA";
+    else if (privacy) auth = "WEP/Sec";
+
+    if (ssid[0] == '\0') strncpy(ssid, "<hidden>", sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+
+    stationAddOrUpdateAp(bssid, ssid, auth, rssi, channel);
+}
+
+static bool stationIsEapolFrame(const uint8_t *d, uint16_t len, uint8_t subtype,
+                                bool toDS, bool fromDS) {
+    if (!d || len < 32) return false;
+
+    uint16_t hdrLen = 24;
+    if (toDS && fromDS) hdrLen = 30;          // Four-address WDS frame.
+    if (subtype & 0x08) hdrLen += 2;          // QoS data adds control field.
+
+    if ((hdrLen + 8) > len) return false;
+
+    const uint8_t *llc = d + hdrLen;
+    return (llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03 &&
+            llc[6] == 0x88 && llc[7] == 0x8E);
+}
+
+static void stationRefreshApStats() {
+    int apCount = stationApCount;
+    if (apCount < 0) apCount = 0;
+    if (apCount > MAX_STATION_APS) apCount = MAX_STATION_APS;
+
+    for (int i = 0; i < apCount; i++) {
+        stationAps[i].clientCount = 0;
+        stationAps[i].eapolPackets = 0;
+    }
+
+    int stCount = stationEntryCount;
+    if (stCount < 0) stCount = 0;
+    if (stCount > MAX_STATION_RESULTS) stCount = MAX_STATION_RESULTS;
+
+    for (int i = 0; i < stCount; i++) {
+        int apIdx = stationFindApByBssid(stationEntries[i].apBssid);
+        if (apIdx >= 0) {
+            if (stationAps[apIdx].clientCount < 65535) stationAps[apIdx].clientCount++;
+            if (stationAps[apIdx].eapolPackets < 65535 - stationEntries[i].eapolPackets) {
+                stationAps[apIdx].eapolPackets += stationEntries[i].eapolPackets;
+            } else {
+                stationAps[apIdx].eapolPackets = 65535;
+            }
+        }
+    }
+}
+
+static const char *stationApSsidForBssid(const char *bssid) {
+    int idx = stationFindApByBssid(bssid);
+    if (idx < 0 || stationAps[idx].ssid[0] == '\0') return "Unknown";
+    return stationAps[idx].ssid;
+}
+
+static const char *stationApAuthForBssid(const char *bssid) {
+    int idx = stationFindApByBssid(bssid);
+    if (idx < 0 || stationAps[idx].authStr[0] == '\0') return "Unknown";
+    return stationAps[idx].authStr;
+}
+
+
+static void stationAddOrUpdate(const uint8_t *sta, const uint8_t *ap,
+                               const char *frameName, int8_t rssi, uint8_t channel,
+                               bool eapolSeen) {
+    if (!sta || stationIsBroadcastOrMulticast(sta)) return;
+
+    char staStr[18];
+    char apStr[18];
+    stationMacToStr(sta, staStr);
+
+    bool apKnown = (ap && !stationIsBroadcastOrMulticast(ap) && memcmp(sta, ap, 6) != 0);
+    if (apKnown) stationMacToStr(ap, apStr);
+    else strncpy(apStr, "--", sizeof(apStr));
+    apStr[sizeof(apStr)-1] = '\0';
+
+    int count = stationEntryCount;
+    for (int i = 0; i < count; i++) {
+        if (strncmp(stationEntries[i].stationMac, staStr, 18) == 0 &&
+            strncmp(stationEntries[i].apBssid, apStr, 18) == 0) {
+            stationEntries[i].rssi = rssi;
+            stationEntries[i].channel = channel;
+            stationEntries[i].lastSeenMs = millis();
+            if (stationEntries[i].packets < 65535) stationEntries[i].packets++;
+            if (eapolSeen) {
+                stationEntries[i].eapolSeen = true;
+                if (stationEntries[i].eapolPackets < 65535) stationEntries[i].eapolPackets++;
+                if (stationEapolTotal < 65535) stationEapolTotal++;
+            }
+            strncpy(stationEntries[i].frameType, frameName, sizeof(stationEntries[i].frameType) - 1);
+            stationEntries[i].frameType[sizeof(stationEntries[i].frameType) - 1] = '\0';
+            return;
+        }
+    }
+
+    if (count >= MAX_STATION_RESULTS) return;
+    int idx = count;
+    strncpy(stationEntries[idx].stationMac, staStr, sizeof(stationEntries[idx].stationMac) - 1);
+    stationEntries[idx].stationMac[sizeof(stationEntries[idx].stationMac) - 1] = '\0';
+    strncpy(stationEntries[idx].apBssid, apStr, sizeof(stationEntries[idx].apBssid) - 1);
+    stationEntries[idx].apBssid[sizeof(stationEntries[idx].apBssid) - 1] = '\0';
+    strncpy(stationEntries[idx].frameType, frameName, sizeof(stationEntries[idx].frameType) - 1);
+    stationEntries[idx].frameType[sizeof(stationEntries[idx].frameType) - 1] = '\0';
+    stationEntries[idx].rssi = rssi;
+    stationEntries[idx].channel = channel;
+    stationEntries[idx].packets = 1;
+    stationEntries[idx].eapolPackets = eapolSeen ? 1 : 0;
+    stationEntries[idx].eapolSeen = eapolSeen;
+    if (eapolSeen && stationEapolTotal < 65535) stationEapolTotal++;
+    stationEntries[idx].lastSeenMs = millis();
+    stationEntryCount = count + 1;
+}
+
+static void station_scan_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!stationScanActive) return;
+    if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
+    if (!buf) return;
+
+    const wifi_promiscuous_pkt_t *pkt = reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
+    uint16_t len = pkt->rx_ctrl.sig_len;
+    if (len < 24) return;
+
+    const uint8_t *d = pkt->payload;
+    uint16_t fc = (uint16_t)d[0] | ((uint16_t)d[1] << 8);
+    uint8_t frameType = (fc >> 2) & 0x03;
+    uint8_t subtype   = (fc >> 4) & 0x0F;
+    bool toDS         = (fc & 0x0100) != 0;
+    bool fromDS       = (fc & 0x0200) != 0;
+
+    const uint8_t *addr1 = d + 4;
+    const uint8_t *addr2 = d + 10;
+    const uint8_t *addr3 = d + 16;
+    const uint8_t *sta = nullptr;
+    const uint8_t *ap  = nullptr;
+    const char *frameName = "Other";
+    bool eapolSeen = false;
+
+    if (frameType == 2) { // Data frame
+        eapolSeen = stationIsEapolFrame(d, len, subtype, toDS, fromDS);
+
+        if (toDS && !fromDS) {
+            sta = addr2; ap = addr1; frameName = eapolSeen ? "EAPOL STA>AP" : "Data STA>AP";
+        } else if (!toDS && fromDS) {
+            sta = addr1; ap = addr2; frameName = eapolSeen ? "EAPOL AP>STA" : "Data AP>STA";
+        } else if (!toDS && !fromDS) {
+            sta = addr2; ap = addr3; frameName = eapolSeen ? "EAPOL" : "Data";
+        } else {
+            return; // WDS / four-address data path; skip for first pass
+        }
+    } else if (frameType == 0) { // Management frame
+        // Track APs from beacon/probe response frames so Station Detail can show SSID/security.
+        if (subtype == 0x8 || subtype == 0x5) {
+            stationParseApFrame(d, len, pkt->rx_ctrl.rssi, pkt->rx_ctrl.channel);
+            return;
+        }
+
+        if (!stationRelevantMgmtSubtype(subtype)) return;
+        frameName = stationMgmtSubtypeName(subtype);
+
+        // AP -> Station management responses often have addr2 == addr3.
+        // Station -> AP requests often have addr2 as station and addr3 as BSSID.
+        if (!stationIsBroadcastOrMulticast(addr1) && memcmp(addr2, addr3, 6) == 0) {
+            sta = addr1; ap = addr2;
+        } else {
+            sta = addr2; ap = addr3;
+        }
+    } else {
+        return;
+    }
+
+    if (!sta || stationIsBroadcastOrMulticast(sta)) return;
+    if (ap && memcmp(sta, ap, 6) == 0) ap = nullptr;
+
+    stationAddOrUpdate(sta, ap, frameName, pkt->rx_ctrl.rssi, pkt->rx_ctrl.channel, eapolSeen);
+}
+
+static int stationFocusedRowIndex() {
+    if (!wifiToolGroup) return -1;
+    lv_obj_t *focused = lv_group_get_focused(wifiToolGroup);
+    if (!focused) return -1;
+    for (int i = 0; i < stationRowCount; i++) {
+        if (stationRowBtns[i] == focused) return i;
+    }
+    return -1;
+}
+
+static void stationClearRows() {
+    for (int i = 0; i < MAX_STATION_RESULTS; i++) {
+        if (stationRowBtns[i]) {
+            lv_obj_delete(stationRowBtns[i]);
+            stationRowBtns[i] = nullptr;
+            stationRowLabels[i] = nullptr;
+        }
+    }
+    stationRowCount = 0;
+    if (stationEmptyLbl) {
+        lv_obj_delete(stationEmptyLbl);
+        stationEmptyLbl = nullptr;
+    }
+}
+
+static void stationSetEmptyMessage(bool show) {
+    if (!stationList) return;
+    if (show) {
+        if (!stationEmptyLbl) {
+            stationEmptyLbl = lv_list_add_text(stationList, "No stations yet...");
+            if (stationEmptyLbl) {
+                lv_obj_set_style_text_color(stationEmptyLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+            }
+        }
+    } else if (stationEmptyLbl) {
+        lv_obj_delete(stationEmptyLbl);
+        stationEmptyLbl = nullptr;
+    }
+}
+
+static void stationRefreshList() {
+    if (!stationList) return;
+    stationRefreshApStats();
+
+    // Preserve station-row focus while updating the visible text in-place.
+    int focusedRow = stationFocusedRowIndex();
+    int count = stationEntryCount;
+    if (count < 0) count = 0;
+    if (count > MAX_STATION_RESULTS) count = MAX_STATION_RESULTS;
+
+    if (count <= 0) {
+        if (stationRowCount > 0) stationClearRows();
+        stationSetEmptyMessage(true);
+        return;
+    }
+
+    stationSetEmptyMessage(false);
+
+    // Shrink only when needed. Deleting rows can disturb focus, so do it only
+    // when the result count actually drops, such as when a new scan starts.
+    while (stationRowCount > count) {
+        int i = stationRowCount - 1;
+        if (stationRowBtns[i]) lv_obj_delete(stationRowBtns[i]);
+        stationRowBtns[i] = nullptr;
+        stationRowLabels[i] = nullptr;
+        stationRowCount--;
+    }
+
+    // Grow only when new stations appear. Existing buttons stay alive so the
+    // encoder can remain focused on the same result across refresh ticks.
+    while (stationRowCount < count) {
+        int i = stationRowCount;
+        lv_obj_t *btn = lv_list_add_btn(stationList, nullptr, "");
+        styleListBtn(btn);
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            createStationDetail((int)(intptr_t)lv_event_get_user_data(ev));
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        stationRowBtns[i] = btn;
+        stationRowLabels[i] = lv_obj_get_child(btn, 0);
+        if (wifiToolGroup) lv_group_add_obj(wifiToolGroup, btn);
+        stationRowCount++;
+    }
+
+    for (int i = 0; i < count; i++) {
+        char row[96];
+        uint32_t age = (millis() - stationEntries[i].lastSeenMs) / 1000UL;
+        snprintf(row, sizeof(row), "%s Ch%-2u %ddBm %us #%u",
+                 stationEntries[i].stationMac,
+                 stationEntries[i].channel,
+                 stationEntries[i].rssi,
+                 (unsigned)age,
+                 stationEntries[i].packets);
+
+        if (stationRowLabels[i]) lv_label_set_text(stationRowLabels[i], row);
+        if (stationRowBtns[i]) {
+            lv_obj_set_style_text_color(stationRowBtns[i], rssiColor(stationEntries[i].rssi),
+                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+    }
+
+    if (focusedRow >= 0 && focusedRow < stationRowCount && stationRowBtns[focusedRow]) {
+        lv_group_focus_obj(stationRowBtns[focusedRow]);
+    }
+}
+
+static void stationScanStop() {
+    if (!stationScanActive) return;
+    stationScanActive = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+    if (stationStartLbl) lv_label_set_text(stationStartLbl, LV_SYMBOL_PLAY "  Start");
+}
+
+static void stationScanStart() {
+    stationEntryCount = 0;
+    stationApCount = 0;
+    stationEapolTotal = 0;
+    memset(stationEntries, 0, sizeof(stationEntries));
+    memset(stationAps, 0, sizeof(stationAps));
+    stationClearRows();
+    stationScanChannel = 1;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(50);
+
+    wifi_promiscuous_filter_t filt;
+    filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_channel(stationScanChannel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous_rx_cb(station_scan_cb);
+    esp_wifi_set_promiscuous(true);
+    stationScanActive = true;
+
+    startLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 150);
+    if (stationStartLbl) lv_label_set_text(stationStartLbl, LV_SYMBOL_STOP "  Stop");
+}
+
+static void stationScanTimerCb(lv_timer_t *t) {
+    stationRefreshApStats();
+    if (stationScanActive) {
+        static uint32_t lastHop = 0;
+        uint32_t now = millis();
+        if (now - lastHop >= (uint32_t)STATION_SCAN_HOP_MS) {
+            stationScanChannel++;
+            if (stationScanChannel > STATION_SCAN_MAX_CHANNEL) stationScanChannel = 1;
+            esp_wifi_set_channel(stationScanChannel, WIFI_SECOND_CHAN_NONE);
+            lastHop = now;
+        }
+
+        if (stationStatusLbl) {
+            char s[72];
+            snprintf(s, sizeof(s), LV_SYMBOL_PLAY "  CH:%u  STA:%d AP:%d EAPOL:%u",
+                     stationScanChannel, stationEntryCount, stationApCount, stationEapolTotal);
+            lv_label_set_text(stationStatusLbl, s);
+            lv_obj_set_style_text_color(stationStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+        }
+    } else if (stationStatusLbl) {
+        char s[72];
+        snprintf(s, sizeof(s), LV_SYMBOL_STOP "  Ready  STA:%d AP:%d EAPOL:%u",
+                 stationEntryCount, stationApCount, stationEapolTotal);
+        lv_label_set_text(stationStatusLbl, s);
+        lv_obj_set_style_text_color(stationStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    }
+
+    stationRefreshList();
+}
+
+static void cb_stationScanToggle(lv_event_t *e) {
+    if (stationScanActive) stationScanStop();
+    else stationScanStart();
+    stationScanTimerCb(nullptr);
+}
+
+void createStationScanner() {
+    if (wifiToolScreen) { lv_obj_delete(wifiToolScreen); wifiToolScreen = nullptr; }
+    wifiToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiToolScreen);
+    createHeader(wifiToolScreen, LV_SYMBOL_EYE_OPEN "  Station Scanner");
+
+    stationStatusLbl = lv_label_create(wifiToolScreen);
+    lv_label_set_text(stationStatusLbl, "Ready. Press Start to scan stations.");
+    lv_obj_set_style_text_color(stationStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(stationStatusLbl, 8, 30);
+
+    lv_obj_t *hint = lv_label_create(wifiToolScreen);
+    lv_label_set_text(hint, "MAC  Ch  RSSI  Age  #Packets  AP/EAPOL in detail");
+    lv_obj_set_style_text_color(hint, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(hint, 8, 48);
+
+    stationList = lv_list_create(wifiToolScreen);
+    lv_obj_set_size(stationList, SCREEN_W, SCREEN_H - 104);
+    lv_obj_set_pos(stationList, 0, 66);
+    lv_obj_set_style_bg_color(stationList, lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(stationList, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(stationList, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(stationList, 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(stationList, 2, LV_PART_MAIN);
+
+    // New screen instance: any previous row objects were deleted with the old screen.
+    memset(stationRowBtns, 0, sizeof(stationRowBtns));
+    memset(stationRowLabels, 0, sizeof(stationRowLabels));
+    stationRowCount = 0;
+    stationEmptyLbl = nullptr;
+
+    stationBackBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
+    stationStartBtn = createActionBtn(wifiToolScreen, LV_SYMBOL_PLAY "  Start", cb_stationScanToggle);
+    stationStartLbl = lv_obj_get_child(stationStartBtn, 0);
+
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+
+    // Start/Stop is the primary control on this page, so focus it first.
+    // Back remains available as the next encoder step.
+    lv_group_add_obj(wifiToolGroup, stationStartBtn);
+    lv_group_add_obj(wifiToolGroup, stationBackBtn);
+    setGroup(wifiToolGroup);
+    lv_group_focus_obj(stationStartBtn);
+
+    if (stationScanTimer) { lv_timer_delete(stationScanTimer); stationScanTimer = nullptr; }
+    stationScanTimer = lv_timer_create(stationScanTimerCb, 1000, nullptr);
+    stationRefreshList();
+
+    lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+void createStationDetail(int idx) {
+    if (idx < 0 || idx >= stationEntryCount) return;
+    if (wifiDetailScreen) { lv_obj_delete(wifiDetailScreen); wifiDetailScreen = nullptr; }
+    wifiDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiDetailScreen);
+    createHeader(wifiDetailScreen, LV_SYMBOL_EYE_OPEN "  Station Detail");
+
+    StationEntry e = stationEntries[idx];
+    stationRefreshApStats();
+    uint32_t age = (millis() - e.lastSeenMs) / 1000UL;
+    int apIdx = stationFindApByBssid(e.apBssid);
+    const char *apSsid = (apIdx >= 0 && stationAps[apIdx].ssid[0]) ? stationAps[apIdx].ssid : "Unknown";
+    const char *apAuth = (apIdx >= 0 && stationAps[apIdx].authStr[0]) ? stationAps[apIdx].authStr : "Unknown";
+    uint16_t apClients = (apIdx >= 0) ? stationAps[apIdx].clientCount : 0;
+    uint16_t apEapol = (apIdx >= 0) ? stationAps[apIdx].eapolPackets : 0;
+
+    lv_obj_t *card = lv_obj_create(wifiDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card, lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 6, LV_PART_MAIN);
+
+    // Station details can run taller than the visible card area,
+    // so keep the card scrollable and add it to the encoder group below.
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
+
+    char info[720];
+    snprintf(info, sizeof(info),
+             "Station MAC : %s\n"
+             "RSSI        : %d dBm (%s)\n"
+             "Channel     : %u\n"
+             "Last Seen   : %lus ago\n"
+             "Frame Type  : %s\n"
+             "Packets     : %u\n"
+             "\n"
+             "AP / BSSID  : %s\n"
+             "AP SSID     : %s\n"
+             "AP Security : %s\n"
+             "AP Clients  : %u\n"
+             "\n"
+             "EAPOL Seen  : %s\n"
+             "EAPOL Count : %u\n"
+             "AP EAPOL    : %u",
+             e.stationMac,
+             e.rssi, rssiQuality(e.rssi),
+             e.channel,
+             (unsigned long)age,
+             e.frameType,
+             e.packets,
+             e.apBssid,
+             apSsid,
+             apAuth,
+             apClients,
+             e.eapolSeen ? "Yes" : "No",
+             e.eapolPackets,
+             apEapol);
+
+    lv_obj_t *lbl = lv_label_create(card);
+    lv_label_set_text(lbl, info);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *bar = lv_bar_create(wifiDetailScreen);
+    lv_obj_set_size(bar, SCREEN_W - 12, 5);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
+    lv_bar_set_range(bar, -100, -30);
+    lv_bar_set_value(bar, e.rssi, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, rssiColor(e.rssi), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
+
+    lv_obj_t *backBtn = createBackBtn(wifiDetailScreen, cb_wifiDetailBack);
+    deleteGroup(&wifiDetailGroup);
+    wifiDetailGroup = lv_group_create();
+
+    // Focus the scrollable info card first so the encoder can scroll Station Detail.
+    // Back remains the next encoder item.
+    lv_group_add_obj(wifiDetailGroup, card);
+    lv_group_add_obj(wifiDetailGroup, backBtn);
+    setGroup(wifiDetailGroup);
+    lv_group_focus_obj(card);
 
     lv_screen_load_anim(wifiDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
@@ -4193,6 +8397,9 @@ static lv_obj_t *createSmallPacketBtn(lv_obj_t *parent, const char *text, int x,
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, text);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(lbl, 42);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(lbl, TC(text), LV_PART_MAIN);
     lv_obj_center(lbl);
     return btn;
@@ -4268,6 +8475,12 @@ void createPacketMonitor() {
     setGroup(wifiToolGroup);
 
     if (packetMonitorTimer) { lv_timer_delete(packetMonitorTimer); packetMonitorTimer = nullptr; }
+    if (stationScanTimer) { lv_timer_delete(stationScanTimer); stationScanTimer = nullptr; }
+    stationStatusLbl = nullptr;
+    stationList = nullptr;
+    stationStartBtn = nullptr;
+    stationStartLbl = nullptr;
+    stationBackBtn = nullptr;
     packetMonitorTimer = lv_timer_create(packetMonTimerCb, PACKET_MONITOR_UPDATE_MS, nullptr);
 
     packetMonUpdateUI();
@@ -4275,8 +8488,371 @@ void createPacketMonitor() {
     lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
+
 // ════════════════════════════════════════════════════════════════
-//  TOOL 5 – PINEAP HUNTER
+//  TOOL 5 – WIFI MAPPER
+//
+//  Safe first pass inspired by Raymond-exe/wifi-mapper.
+//  X-axis = WiFi channel 1-13. Y-axis = packet RSSI.
+//  This stays display-only: no SD writes and no packet injection.
+// ════════════════════════════════════════════════════════════════
+
+static const char *wifiMapperSpeedName() {
+    if (wifiMapperSpeedIdx == 0) return "Slow";
+    if (wifiMapperSpeedIdx == 2) return "Fast";
+    return "Normal";
+}
+
+static uint16_t wifiMapperHopMs() {
+    if (wifiMapperSpeedIdx == 0) return WIFI_MAPPER_HOP_SLOW_MS;
+    if (wifiMapperSpeedIdx == 2) return WIFI_MAPPER_HOP_FAST_MS;
+    return WIFI_MAPPER_HOP_NORMAL_MS;
+}
+
+static uint16_t wifiMapperFreqMHz(uint8_t ch) {
+    if (ch == 14) return 2484;
+    return (uint16_t)(2407 + (ch * 5));
+}
+
+static int wifiMapperClampInt(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void wifiMapperResetPoints() {
+    wifiMapperHead = 0;
+    wifiMapperCount = 0;
+    wifiMapperTotalPackets = 0;
+    wifiMapperLastRSSI = -127;
+    wifiMapperLastType = 3;
+    memset(wifiMapperPoints, 0, sizeof(wifiMapperPoints));
+}
+
+static void IRAM_ATTR wifi_mapper_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!wifiMapperActive || !buf) return;
+
+    const wifi_promiscuous_pkt_t *pkt = reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
+    int8_t rssi = pkt->rx_ctrl.rssi;
+
+    uint8_t t = 3;
+    if      (type == WIFI_PKT_MGMT) t = 0;
+    else if (type == WIFI_PKT_DATA) t = 1;
+    else if (type == WIFI_PKT_CTRL) t = 2;
+
+    uint16_t idx = wifiMapperHead;
+    wifiMapperPoints[idx].channel = wifiMapperChannel;
+    wifiMapperPoints[idx].rssi = rssi;
+    wifiMapperPoints[idx].pktType = t;
+    wifiMapperPoints[idx].ms = millis();
+
+    wifiMapperHead = (uint16_t)((wifiMapperHead + 1) % WIFI_MAPPER_MAX_POINTS);
+    if (wifiMapperCount < WIFI_MAPPER_MAX_POINTS) wifiMapperCount++;
+
+    wifiMapperTotalPackets++;
+    wifiMapperLastRSSI = rssi;
+    wifiMapperLastType = t;
+}
+
+static lv_color_t wifiMapperPointColor(uint8_t pktType, int8_t rssi) {
+    if (rssi >= -50) return lv_color_hex(TH.alert);
+    if (rssi >= -65) return lv_color_hex(TH.warn);
+    if (pktType == 1) return lv_color_hex(TH.success);  // data
+    if (pktType == 2) return lv_color_hex(TH.accent);   // control
+    return lv_color_hex(TH.text);                       // management/other
+}
+
+static void wifiMapperDrawGrid() {
+    if (!wifiMapperGridArea) return;
+    lv_obj_clean(wifiMapperGridArea);
+
+    const int areaW = SCREEN_W - 12;
+    const int areaH = 82;
+    const int leftPad = 20;
+    const int topPad = 5;
+    const int plotW = areaW - 30;
+    const int plotH = areaH - 18;
+
+    // Highlight current hopping channel.
+    int chX = leftPad + ((int)(wifiMapperChannel - 1) * plotW) / 12;
+    lv_obj_t *hilite = lv_obj_create(wifiMapperGridArea);
+    lv_obj_set_size(hilite, 3, plotH);
+    lv_obj_set_pos(hilite, chX - 1, topPad);
+    lv_obj_set_style_bg_color(hilite, lv_color_hex(TH.accent), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(hilite, LV_OPA_50, LV_PART_MAIN);
+    lv_obj_set_style_border_width(hilite, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(hilite, 1, LV_PART_MAIN);
+    lv_obj_clear_flag(hilite, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Vertical channel grid.
+    for (int ch = 1; ch <= 13; ch++) {
+        int x = leftPad + ((ch - 1) * plotW) / 12;
+        lv_obj_t *line = lv_obj_create(wifiMapperGridArea);
+        lv_obj_set_size(line, 1, plotH);
+        lv_obj_set_pos(line, x, topPad);
+        lv_obj_set_style_bg_color(line, lv_color_hex((ch == wifiMapperChannel) ? TH.accent : TH.border), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(line, (ch == wifiMapperChannel) ? LV_OPA_70 : LV_OPA_40, LV_PART_MAIN);
+        lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+
+        if (ch == 1 || ch == 6 || ch == 11 || ch == 13) {
+            lv_obj_t *lbl = lv_label_create(wifiMapperGridArea);
+            char s[4];
+            snprintf(s, sizeof(s), "%d", ch);
+            lv_label_set_text(lbl, s);
+            lv_obj_set_style_text_color(lbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, LV_PART_MAIN);
+            lv_obj_set_pos(lbl, x - 3, topPad + plotH + 1);
+        }
+    }
+
+    // Horizontal RSSI grid: -90, -70, -50, -30, -10.
+    for (int r = WIFI_MAPPER_RSSI_MIN; r <= WIFI_MAPPER_RSSI_MAX; r += 20) {
+        int y = topPad + ((WIFI_MAPPER_RSSI_MAX - r) * plotH) /
+                (WIFI_MAPPER_RSSI_MAX - WIFI_MAPPER_RSSI_MIN);
+
+        lv_obj_t *line = lv_obj_create(wifiMapperGridArea);
+        lv_obj_set_size(line, plotW, 1);
+        lv_obj_set_pos(line, leftPad, y);
+        lv_obj_set_style_bg_color(line, lv_color_hex(TH.border), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(line, LV_OPA_40, LV_PART_MAIN);
+        lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+
+        if (r == -90 || r == -50 || r == -10) {
+            lv_obj_t *lbl = lv_label_create(wifiMapperGridArea);
+            char s[8];
+            snprintf(s, sizeof(s), "%d", r);
+            lv_label_set_text(lbl, s);
+            lv_obj_set_style_text_color(lbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, LV_PART_MAIN);
+            lv_obj_set_pos(lbl, 1, y - 6);
+        }
+    }
+
+    // Snapshot the ring indexes. It is fine if a packet arrives while drawing;
+    // the next timer tick will catch it.
+    uint16_t count = wifiMapperCount;
+    uint16_t head = wifiMapperHead;
+
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t idx = (head + WIFI_MAPPER_MAX_POINTS - count + i) % WIFI_MAPPER_MAX_POINTS;
+        WiFiMapperPoint p = wifiMapperPoints[idx];
+        if (p.channel < 1 || p.channel > 13) continue;
+
+        int rssi = wifiMapperClampInt(p.rssi, WIFI_MAPPER_RSSI_MIN, WIFI_MAPPER_RSSI_MAX);
+        int x = leftPad + ((int)(p.channel - 1) * plotW) / 12;
+        int y = topPad + ((WIFI_MAPPER_RSSI_MAX - rssi) * plotH) /
+                (WIFI_MAPPER_RSSI_MAX - WIFI_MAPPER_RSSI_MIN);
+
+        lv_obj_t *dot = lv_obj_create(wifiMapperGridArea);
+        lv_obj_set_size(dot, 4, 4);
+        lv_obj_set_pos(dot, x - 2, y - 2);
+        lv_obj_set_style_bg_color(dot, wifiMapperPointColor(p.pktType, p.rssi), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    }
+}
+
+static void wifiMapperUpdateUI() {
+    if (!wifiMapperStatusLbl || !wifiMapperDetailLbl) return;
+
+    uint32_t now = millis();
+
+    if (wifiMapperActive && (now - wifiMapperLastHopMs >= wifiMapperHopMs())) {
+        wifiMapperChannel++;
+        if (wifiMapperChannel > 13) wifiMapperChannel = 1;
+        esp_wifi_set_channel(wifiMapperChannel, WIFI_SECOND_CHAN_NONE);
+        wifiMapperLastHopMs = now;
+    }
+
+    char status[72];
+    // Compact status line so it stays inside the 320px T-Embed width.
+    snprintf(status, sizeof(status), "%s  CH:%u  %s  Pts:%u",
+             wifiMapperActive ? "Map" : "Pause",
+             wifiMapperChannel,
+             wifiMapperSpeedName(),
+             (unsigned)wifiMapperCount);
+    lv_label_set_text(wifiMapperStatusLbl, status);
+    lv_obj_set_style_text_color(wifiMapperStatusLbl,
+                                lv_color_hex(wifiMapperActive ? TH.accent : TH.textDim),
+                                LV_PART_MAIN);
+
+    const char *typeName = "Other";
+    if (wifiMapperLastType == 0) typeName = "Mgmt";
+    else if (wifiMapperLastType == 1) typeName = "Data";
+    else if (wifiMapperLastType == 2) typeName = "Ctrl";
+
+    char detail[80];
+    if (wifiMapperLastRSSI <= -126) {
+        snprintf(detail, sizeof(detail), "Waiting for packets...");
+    } else {
+        // Compact detail line: channel, RSSI, frequency, bandwidth, packet type.
+        snprintf(detail, sizeof(detail), "Ch:%u  %ddBm  %uMHz  20M  %s",
+                 wifiMapperChannel,
+                 (int)wifiMapperLastRSSI,
+                 wifiMapperFreqMHz(wifiMapperChannel),
+                 typeName);
+    }
+    lv_label_set_text(wifiMapperDetailLbl, detail);
+
+    wifiMapperDrawGrid();
+}
+
+static void wifiMapperTimerCb(lv_timer_t *t) {
+    wifiMapperUpdateUI();
+}
+
+static void wifiMapperStop() {
+    if (!wifiMapperActive) return;
+    wifiMapperActive = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
+    if (wifiMapperPauseLbl) lv_label_set_text(wifiMapperPauseLbl, "Resume");
+    wifiMapperUpdateUI();
+}
+
+static void wifiMapperStart() {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(50);
+
+    wifi_promiscuous_filter_t filt;
+    filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_CTRL;
+
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_channel(wifiMapperChannel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous_rx_cb(wifi_mapper_cb);
+    esp_wifi_set_promiscuous(true);
+
+    wifiMapperActive = true;
+    wifiMapperLastHopMs = millis();
+
+    startLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, 140);
+    if (wifiMapperPauseLbl) lv_label_set_text(wifiMapperPauseLbl, "Pause");
+    wifiMapperUpdateUI();
+}
+
+static void cb_wifiMapperPauseResume(lv_event_t *e) {
+    if (wifiMapperActive) wifiMapperStop();
+    else wifiMapperStart();
+}
+
+static void cb_wifiMapperClear(lv_event_t *e) {
+    wifiMapperResetPoints();
+    wifiMapperUpdateUI();
+}
+
+static void cb_wifiMapperSpeed(lv_event_t *e) {
+    wifiMapperSpeedIdx++;
+    if (wifiMapperSpeedIdx > 2) wifiMapperSpeedIdx = 0;
+    wifiMapperLastHopMs = millis();
+    if (wifiMapperSpeedLbl) {
+        char s[20];
+        snprintf(s, sizeof(s), "Speed:%s", wifiMapperSpeedName());
+        lv_label_set_text(wifiMapperSpeedLbl, s);
+    }
+    wifiMapperUpdateUI();
+}
+
+static lv_obj_t *createMapperBtn(lv_obj_t *parent, const char *text, int x, int w, lv_event_cb_t cb) {
+    lv_obj_t *btn = lv_btn_create(parent);
+    // Compact WiFi Mapper button bar. Keeps all controls inside 320x170.
+    lv_obj_set_size(btn, w, 20);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, x, -2);
+    lv_obj_set_style_bg_color(btn, TC(actionBg),  LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn, TC(actionFoc), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(btn, TC(success),   LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(btn, TC(actionBdr), LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 5, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_color(lbl, TC(text), LV_PART_MAIN);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+void createWiFiMapper() {
+    wifiMapperActive = false;
+    wifiMapperChannel = 1;
+    wifiMapperLastHopMs = millis();
+    wifiMapperStatusLbl = nullptr;
+    wifiMapperDetailLbl = nullptr;
+    wifiMapperGridArea = nullptr;
+    wifiMapperPauseBtn = nullptr;
+    wifiMapperPauseLbl = nullptr;
+    wifiMapperSpeedBtn = nullptr;
+    wifiMapperSpeedLbl = nullptr;
+    wifiMapperResetPoints();
+
+    if (wifiToolScreen) { lv_obj_delete(wifiToolScreen); wifiToolScreen = nullptr; }
+    wifiToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiToolScreen);
+    createHeader(wifiToolScreen, LV_SYMBOL_EYE_OPEN "  WiFi Mapper");
+
+    wifiMapperStatusLbl = lv_label_create(wifiToolScreen);
+    lv_label_set_text(wifiMapperStatusLbl, "Map  CH:1  Normal  Pts:0");
+    lv_obj_set_style_text_color(wifiMapperStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(wifiMapperStatusLbl, 8, 27);
+
+    wifiMapperGridArea = lv_obj_create(wifiToolScreen);
+    lv_obj_set_size(wifiMapperGridArea, SCREEN_W - 12, 82);
+    lv_obj_set_pos(wifiMapperGridArea, 6, 42);
+    lv_obj_set_style_bg_color(wifiMapperGridArea, lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(wifiMapperGridArea, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(wifiMapperGridArea, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(wifiMapperGridArea, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(wifiMapperGridArea, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(wifiMapperGridArea, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(wifiMapperGridArea, LV_OBJ_FLAG_SCROLLABLE);
+
+    wifiMapperDetailLbl = lv_label_create(wifiToolScreen);
+    lv_label_set_text(wifiMapperDetailLbl, "Waiting for packets...");
+    lv_obj_set_style_text_color(wifiMapperDetailLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_label_set_long_mode(wifiMapperDetailLbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(wifiMapperDetailLbl, SCREEN_W - 16);
+    lv_obj_set_pos(wifiMapperDetailLbl, 8, 126);
+
+    // Single compact control bar: no overlap with Back button.
+    wifiMapperPauseBtn = createMapperBtn(wifiToolScreen, "Pause", 6, 58, cb_wifiMapperPauseResume);
+    wifiMapperPauseLbl = lv_obj_get_child(wifiMapperPauseBtn, 0);
+    lv_obj_t *clearBtn = createMapperBtn(wifiToolScreen, "Clear", 68, 54, cb_wifiMapperClear);
+
+    wifiMapperSpeedBtn = createMapperBtn(wifiToolScreen, "Speed:Normal", 126, 104, cb_wifiMapperSpeed);
+    wifiMapperSpeedLbl = lv_obj_get_child(wifiMapperSpeedBtn, 0);
+
+    lv_obj_t *backBtn = createMapperBtn(wifiToolScreen, "Back", 234, 80, cb_wifiToolBack);
+
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    lv_group_add_obj(wifiToolGroup, wifiMapperPauseBtn);
+    lv_group_add_obj(wifiToolGroup, clearBtn);
+    lv_group_add_obj(wifiToolGroup, wifiMapperSpeedBtn);
+    lv_group_add_obj(wifiToolGroup, backBtn);
+    setGroup(wifiToolGroup);
+
+    if (packetMonitorTimer) { lv_timer_delete(packetMonitorTimer); packetMonitorTimer = nullptr; }
+    if (stationScanTimer) { lv_timer_delete(stationScanTimer); stationScanTimer = nullptr; }
+    if (wifiMapperTimer) { lv_timer_delete(wifiMapperTimer); wifiMapperTimer = nullptr; }
+    wifiMapperTimer = lv_timer_create(wifiMapperTimerCb, 500, nullptr);
+
+    wifiMapperDrawGrid();
+    wifiMapperStart();
+
+    setAllLEDs(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b, LED_BRIGHTNESS);
+    lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  TOOL 6 – PINEAP HUNTER
+
 //
 //  Detects rogue WiFi Pineapple / KARMA attacks by tracking how many
 //  unique SSIDs each BSSID advertises across repeated scans.
@@ -5137,6 +9713,92 @@ static bool detectTeslaName(BLEAdvertisedDevice &dev) {
             nm.charAt(TESLA_NAME_END_INDEX) == TESLA_NAME_END_CHAR);
 }
 
+
+// Raven / SoundThinking-style BLE service UUID detection.
+// Reference: 0xXyc/flock-you-wifi-recon Raven UUID patterns.
+static const char *RAVEN_UUID_MATCHES[] = {
+    RAVEN_DEVICE_INFO_SERVICE,
+    RAVEN_GPS_SERVICE,
+    RAVEN_POWER_SERVICE,
+    RAVEN_NETWORK_SERVICE,
+    RAVEN_UPLOAD_SERVICE,
+    RAVEN_ERROR_SERVICE,
+    RAVEN_OLD_HEALTH_SERVICE,
+    RAVEN_OLD_LOCATION_SERVICE
+};
+
+static const char *ravenUuidLabel(const char *uuid) {
+    if (!uuid) return "Unknown";
+    if (strcasecmp(uuid, RAVEN_DEVICE_INFO_SERVICE) == 0) return "Device Info";
+    if (strcasecmp(uuid, RAVEN_GPS_SERVICE) == 0) return "GPS";
+    if (strcasecmp(uuid, RAVEN_POWER_SERVICE) == 0) return "Power";
+    if (strcasecmp(uuid, RAVEN_NETWORK_SERVICE) == 0) return "Network";
+    if (strcasecmp(uuid, RAVEN_UPLOAD_SERVICE) == 0) return "Upload";
+    if (strcasecmp(uuid, RAVEN_ERROR_SERVICE) == 0) return "Error";
+    if (strcasecmp(uuid, RAVEN_OLD_HEALTH_SERVICE) == 0) return "Old Health";
+    if (strcasecmp(uuid, RAVEN_OLD_LOCATION_SERVICE) == 0) return "Old Location";
+    return "Raven UUID";
+}
+
+static bool ravenUuidIsMatch(const String &uuidStr) {
+    for (size_t i = 0; i < sizeof(RAVEN_UUID_MATCHES) / sizeof(RAVEN_UUID_MATCHES[0]); i++) {
+        if (uuidStr.equalsIgnoreCase(RAVEN_UUID_MATCHES[i])) return true;
+    }
+    return false;
+}
+
+static uint8_t ravenCountUuidHits(BLEAdvertisedDevice &dev, char *firstUuid, size_t firstUuidLen) {
+    if (firstUuid && firstUuidLen) firstUuid[0] = '\0';
+    if (!dev.haveServiceUUID()) return 0;
+
+    uint8_t hits = 0;
+    int uuidCount = dev.getServiceUUIDCount();
+
+    for (int i = 0; i < uuidCount; i++) {
+        String uuidStr = String(dev.getServiceUUID(i).toString().c_str());
+        uuidStr.toLowerCase();
+
+        if (ravenUuidIsMatch(uuidStr)) {
+            hits++;
+            if (firstUuid && firstUuidLen && firstUuid[0] == '\0') {
+                strncpy(firstUuid, uuidStr.c_str(), firstUuidLen - 1);
+                firstUuid[firstUuidLen - 1] = '\0';
+            }
+        }
+    }
+
+    return hits;
+}
+
+static bool detectRaven(BLEAdvertisedDevice &dev) {
+    char firstUuid[41];
+    return ravenCountUuidHits(dev, firstUuid, sizeof(firstUuid)) > 0;
+}
+
+static const char *estimateRavenFW(BLEAdvertisedDevice &dev) {
+    if (!dev.haveServiceUUID()) return "?";
+
+    bool hasNewGps = false;
+    bool hasOldLoc = false;
+    bool hasPower  = false;
+
+    int uuidCount = dev.getServiceUUIDCount();
+    for (int i = 0; i < uuidCount; i++) {
+        String uuidStr = String(dev.getServiceUUID(i).toString().c_str());
+        uuidStr.toLowerCase();
+
+        if (uuidStr.equalsIgnoreCase(RAVEN_GPS_SERVICE)) hasNewGps = true;
+        if (uuidStr.equalsIgnoreCase(RAVEN_OLD_LOCATION_SERVICE)) hasOldLoc = true;
+        if (uuidStr.equalsIgnoreCase(RAVEN_POWER_SERVICE)) hasPower = true;
+    }
+
+    if (hasOldLoc && !hasNewGps) return "1.1.x";
+    if (hasNewGps && !hasPower)  return "1.2.x";
+    if (hasNewGps && hasPower)   return "1.3.x";
+    return "?";
+}
+
+
 static void parseNyanBoxManufacturer(BLEAdvertisedDevice &dev, uint16_t &level, char *version, size_t versionLen) {
     level = 0;
     if (version && versionLen) {
@@ -5831,11 +10493,142 @@ static bool IRAM_ATTR flockContainsKeyword(const char *ssid, const char *keyword
     return false;
 }
 
+static bool IRAM_ATTR flockStartsWithNoCase(const char *text, const char *prefix) {
+    if (!text || !prefix) return false;
+    for (int i = 0; prefix[i]; i++) {
+        if (!text[i]) return false;
+        if (flockToLower(text[i]) != flockToLower(prefix[i])) return false;
+    }
+    return true;
+}
+
+static bool IRAM_ATTR flockIsHexChar(char c) {
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+// Strong Flock SSID/name pattern: Flock-XXXX where XXXX are hex-style ID chars.
+// Kept intentionally simple/fast so it is safe to call from sniffer paths.
+static bool IRAM_ATTR flockHasStrictIdPattern(const char *ssid) {
+#if FLOCK_STRICT_ID_PATTERN_ENABLED
+    if (!ssid) return false;
+    if (!flockStartsWithNoCase(ssid, "Flock-")) return false;
+
+    int count = 0;
+    const char *p = ssid + 6;
+    while (*p && flockIsHexChar(*p)) {
+        count++;
+        p++;
+    }
+    return count >= FLOCK_STRICT_ID_MIN_HEX_CHARS;
+#else
+    return false;
+#endif
+}
+
 static bool IRAM_ATTR containsFlockKeyword(const char *ssid) {
-    return flockContainsKeyword(ssid, FLOCK_KEYWORD_1) ||
+    return flockHasStrictIdPattern(ssid) ||
+           flockContainsKeyword(ssid, FLOCK_KEYWORD_1) ||
            flockContainsKeyword(ssid, FLOCK_KEYWORD_2) ||
            flockContainsKeyword(ssid, FLOCK_KEYWORD_3) ||
-           flockContainsKeyword(ssid, FLOCK_KEYWORD_4);
+           flockContainsKeyword(ssid, FLOCK_KEYWORD_4) ||
+           flockContainsKeyword(ssid, FLOCK_KEYWORD_5) ||
+           flockContainsKeyword(ssid, FLOCK_KEYWORD_6) ||
+           flockContainsKeyword(ssid, FLOCK_KEYWORD_7) ||
+           flockContainsKeyword(ssid, FLOCK_KEYWORD_8) ||
+           flockContainsKeyword(ssid, FLOCK_KEYWORD_9);
+}
+
+
+static uint16_t flockAdaptiveDwellMs(uint8_t channel, uint16_t baseMs) {
+#if FLOCK_ADAPTIVE_DWELL_ENABLED
+    if (channel == 1 || channel == 6 || channel == 11) {
+        return FLOCK_DWELL_MAIN_MS;
+    }
+    return FLOCK_DWELL_OTHER_MS;
+#else
+    return baseMs;
+#endif
+}
+
+// Expanded Flock / SoundThinking MAC-prefix helpers.
+// Prefixes are lowercase 3-byte OUIs in "xx:xx:xx" form.
+static const char *FLOCK_HIGH_MAC_PREFIXES[] = {
+    "58:8e:81", "cc:cc:cc", "ec:1b:bd", "90:35:ea", "04:0d:84",
+    "f0:82:c0", "1c:34:f1", "38:5b:44", "94:34:69", "b4:e3:f9",
+    "70:c9:4e", "3c:91:80", "d8:f3:bc", "80:30:49", "14:5a:fc",
+    "74:4c:a1", "08:3a:88", "9c:2f:9d", "94:08:53", "e4:aa:ea",
+    "b4:1e:52"
+};
+static const char *FLOCK_MFR_MAC_PREFIXES[] = {
+    "f4:6a:dd", "f8:a2:d6", "e0:0a:f6", "00:f4:8d", "d0:39:57", "e8:d0:fc"
+};
+static const char *SOUNDTHINKING_MAC_PREFIXES[] = {
+    "d4:11:d6"
+};
+
+static char flockLowerAscii(char c) {
+    if (c >= 'A' && c <= 'Z') return c + 32;
+    return c;
+}
+
+static bool flockPrefixEquals(const char *mac, const char *prefix) {
+    if (!mac || !prefix) return false;
+    for (int i = 0; i < 8; i++) {
+        if (!mac[i] || !prefix[i]) return false;
+        if (flockLowerAscii(mac[i]) != flockLowerAscii(prefix[i])) return false;
+    }
+    return true;
+}
+
+static bool flockMacInList(const char *mac, const char **list, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        if (flockPrefixEquals(mac, list[i])) return true;
+    }
+    return false;
+}
+
+static bool classifyFlockMac(const char *mac, char *method, size_t methodLen,
+                             char *confidence, size_t confidenceLen,
+                             char *type, size_t typeLen) {
+#if FLOCK_MAC_PREFIX_MATCH_ENABLED
+    if (flockMacInList(mac, FLOCK_HIGH_MAC_PREFIXES, sizeof(FLOCK_HIGH_MAC_PREFIXES) / sizeof(FLOCK_HIGH_MAC_PREFIXES[0]))) {
+        snprintf(method, methodLen, "MAC Prefix");
+        snprintf(confidence, confidenceLen, "High");
+        snprintf(type, typeLen, "Flock");
+        return true;
+    }
+    if (flockMacInList(mac, SOUNDTHINKING_MAC_PREFIXES, sizeof(SOUNDTHINKING_MAC_PREFIXES) / sizeof(SOUNDTHINKING_MAC_PREFIXES[0]))) {
+        snprintf(method, methodLen, "MAC Prefix");
+        snprintf(confidence, confidenceLen, "High");
+        snprintf(type, typeLen, "SoundThinking");
+        return true;
+    }
+    if (flockMacInList(mac, FLOCK_MFR_MAC_PREFIXES, sizeof(FLOCK_MFR_MAC_PREFIXES) / sizeof(FLOCK_MFR_MAC_PREFIXES[0]))) {
+        snprintf(method, methodLen, "MFR Prefix");
+        snprintf(confidence, confidenceLen, "Low");
+        snprintf(type, typeLen, "Flock MFR");
+        return true;
+    }
+#endif
+    return false;
+}
+
+static void classifyFlockNameHit(const char *ssid,
+                                 char *method, size_t methodLen,
+                                 char *confidence, size_t confidenceLen,
+                                 char *type, size_t typeLen) {
+    if (flockHasStrictIdPattern(ssid)) {
+        snprintf(method, methodLen, "Flock-ID");
+        snprintf(confidence, confidenceLen, "High");
+        snprintf(type, typeLen, "Flock");
+        return;
+    }
+
+    snprintf(method, methodLen, "Name");
+    snprintf(confidence, confidenceLen, "High");
+    snprintf(type, typeLen, "Flock");
 }
 
 static void IRAM_ATTR flock_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
@@ -5848,47 +10641,67 @@ static void IRAM_ATTR flock_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t ty
 
     if (len < 24) return;
 
-    // Frame Control byte 0: type bits [3:2], subtype bits [7:4]
     uint8_t fc0    = d[0];
-    uint8_t ftype  = (fc0 >> 2) & 0x03;  // must be 0 (management)
-    uint8_t stype  = (fc0 >> 4) & 0x0F;  // 8=beacon, 5=probe resp, 4=probe req
+    uint8_t ftype  = (fc0 >> 2) & 0x03;
+    uint8_t stype  = (fc0 >> 4) & 0x0F;
 
     if (ftype != 0) return;
     if (stype != 8 && stype != 5 && stype != 4) return;
 
-    // IE parsing starts after 24-byte MAC header
-    // Beacons/probe-responses have 12 extra fixed bytes; probe-requests don't
+    char src[18];
+    snprintf(src, sizeof(src), "%02X:%02X:%02X:%02X:%02X:%02X",
+             d[10], d[11], d[12], d[13], d[14], d[15]);
+
+    char method[18] = "";
+    char confidence[8] = "";
+    char deviceType[20] = "";
+    bool macHit = classifyFlockMac(src, method, sizeof(method), confidence, sizeof(confidence), deviceType, sizeof(deviceType));
+
+    char ssid[33];
+    ssid[0] = '\0';
+    bool nameHit = false;
+
     int ieOffset = (stype == 4) ? 24 : 36;
-    if (ieOffset >= len) return;
+    if (ieOffset < len) {
+        const uint8_t *ie  = d + ieOffset;
+        int            rem = len - ieOffset;
 
-    const uint8_t *ie  = d + ieOffset;
-    int            rem = len - ieOffset;
+        while (rem >= 2) {
+            uint8_t id   = ie[0];
+            uint8_t elen = ie[1];
+            if (elen + 2 > rem) break;
 
-    while (rem >= 2) {
-        uint8_t id   = ie[0];
-        uint8_t elen = ie[1];
-        if (elen + 2 > rem) break;
-
-        if (id == 0 && elen > 0) {   // SSID element
-            int n = elen > 32 ? 32 : elen;
-            char ssid[33];
-            memcpy(ssid, ie + 2, n);
-            ssid[n] = '\0';
-
-            if (containsFlockKeyword(ssid)) {
-                memcpy(flockPendingSSID, ssid, n + 1);
-                snprintf(flockPendingSrc, sizeof(flockPendingSrc),
-                         "%02X:%02X:%02X:%02X:%02X:%02X",
-                         d[10], d[11], d[12], d[13], d[14], d[15]);
-                flockPendingType  = (stype == 4) ? 1 : 0;
-                flockPendingRSSI  = pkt->rx_ctrl.rssi;
-                flockPendingReady = true;
-                return;
+            if (id == 0 && elen > 0) {
+                int n = elen > 32 ? 32 : elen;
+                memcpy(ssid, ie + 2, n);
+                ssid[n] = '\0';
+                if (containsFlockKeyword(ssid)) {
+                    nameHit = true;
+                    classifyFlockNameHit(ssid, method, sizeof(method), confidence, sizeof(confidence), deviceType, sizeof(deviceType));
+                    break;
+                }
             }
+            ie  += elen + 2;
+            rem -= elen + 2;
         }
-        ie  += elen + 2;
-        rem -= elen + 2;
     }
+
+    if (!nameHit && !macHit) return;
+    if (!ssid[0]) snprintf(ssid, sizeof(ssid), "<hidden/none>");
+
+    strncpy(flockPendingSSID, ssid, sizeof(flockPendingSSID) - 1);
+    flockPendingSSID[sizeof(flockPendingSSID) - 1] = '\0';
+    strncpy(flockPendingSrc, src, sizeof(flockPendingSrc) - 1);
+    flockPendingSrc[sizeof(flockPendingSrc) - 1] = '\0';
+    strncpy(flockPendingMethod, method, sizeof(flockPendingMethod) - 1);
+    flockPendingMethod[sizeof(flockPendingMethod) - 1] = '\0';
+    strncpy(flockPendingConfidence, confidence, sizeof(flockPendingConfidence) - 1);
+    flockPendingConfidence[sizeof(flockPendingConfidence) - 1] = '\0';
+    strncpy(flockPendingDeviceType, deviceType, sizeof(flockPendingDeviceType) - 1);
+    flockPendingDeviceType[sizeof(flockPendingDeviceType) - 1] = '\0';
+    flockPendingType  = (stype == 4) ? 1 : 0;
+    flockPendingRSSI  = pkt->rx_ctrl.rssi;
+    flockPendingReady = true;
 }
 
 static void flock_refresh_cb(lv_timer_t *) {
@@ -5896,11 +10709,14 @@ static void flock_refresh_cb(lv_timer_t *) {
 
     // Process any pending hit from the ISR
     if (flockPendingReady) {
-        char ssid[33], src[18];
+        char ssid[33], src[18], method[18], confidence[8], deviceType[20];
         uint8_t ft   = flockPendingType;
         int8_t  rssi = flockPendingRSSI;
         memcpy(ssid, flockPendingSSID, 33);
         memcpy(src,  flockPendingSrc,  18);
+        memcpy(method, flockPendingMethod, 18);
+        memcpy(confidence, flockPendingConfidence, 8);
+        memcpy(deviceType, flockPendingDeviceType, 20);
         flockPendingReady = false;
 
         // Deduplicate hits. MAC-based dedupe prevents repeated frames from
@@ -5916,8 +10732,13 @@ static void flock_refresh_cb(lv_timer_t *) {
             if (sameHit) {
                 strncpy(flockHits[i].ssid, ssid, 32);
                 flockHits[i].ssid[32] = '\0';
+                strncpy(flockHits[i].method, method, sizeof(flockHits[i].method) - 1);
+                strncpy(flockHits[i].confidence, confidence, sizeof(flockHits[i].confidence) - 1);
+                strncpy(flockHits[i].type, deviceType, sizeof(flockHits[i].type) - 1);
                 flockHits[i].frameType = ft;
                 flockHits[i].rssi = rssi;   // update RSSI
+                flockHits[i].count++;
+                flockHits[i].lastSeen = millis();
                 found = true;
                 break;
             }
@@ -5927,8 +10748,14 @@ static void flock_refresh_cb(lv_timer_t *) {
             flockHits[flockHitCount].ssid[32] = '\0';
             strncpy(flockHits[flockHitCount].src, src, 17);
             flockHits[flockHitCount].src[17] = '\0';
+            strncpy(flockHits[flockHitCount].method, method, sizeof(flockHits[flockHitCount].method) - 1);
+            strncpy(flockHits[flockHitCount].confidence, confidence, sizeof(flockHits[flockHitCount].confidence) - 1);
+            strncpy(flockHits[flockHitCount].type, deviceType, sizeof(flockHits[flockHitCount].type) - 1);
             flockHits[flockHitCount].frameType = ft;
             flockHits[flockHitCount].rssi      = rssi;
+            flockHits[flockHitCount].count     = 1;
+            flockHits[flockHitCount].firstSeen = millis();
+            flockHits[flockHitCount].lastSeen  = millis();
             flockHitCount++;
             playFlockChirp();
         }
@@ -5960,18 +10787,25 @@ static void flock_refresh_cb(lv_timer_t *) {
         return;
     }
     for (int i = 0; i < flockHitCount; i++) {
-        char row[104];
+        uint32_t age = (millis() - flockHits[i].lastSeen) / 1000UL;
+        char row[150];
 #if FLOCK_SHOW_SOURCE_MAC
-        snprintf(row, sizeof(row), "%s  %s  %ddBm\n%s",
+        snprintf(row, sizeof(row), "%s %s [%s] %ddBm x%u\n%s  %s  %lus",
                  flockHits[i].frameType ? "PROBE" : "BEACON",
-                 flockHits[i].ssid,
+                 flockHits[i].type[0] ? flockHits[i].type : "Flock",
+                 flockHits[i].confidence[0] ? flockHits[i].confidence : "High",
                  flockHits[i].rssi,
-                 flockHits[i].src);
+                 flockHits[i].count,
+                 flockHits[i].src,
+                 flockHits[i].method[0] ? flockHits[i].method : "Name",
+                 (unsigned long)age);
 #else
-        snprintf(row, sizeof(row), "%s  %s  %ddBm",
+        snprintf(row, sizeof(row), "%s %s [%s] %ddBm x%u",
                  flockHits[i].frameType ? "PROBE" : "BEACON",
-                 flockHits[i].ssid,
-                 flockHits[i].rssi);
+                 flockHits[i].type[0] ? flockHits[i].type : "Flock",
+                 flockHits[i].confidence[0] ? flockHits[i].confidence : "High",
+                 flockHits[i].rssi,
+                 flockHits[i].count);
 #endif
         lv_obj_t *entry = lv_list_add_text(flockList, row);
         if (entry)
@@ -5995,8 +10829,8 @@ void createFlockDetector() {
 
     flockStatusLbl = lv_label_create(wifiToolScreen);
     lv_label_set_text(flockStatusLbl,
-        "Sniffs beacons & probes for Flock keywords\n"
-        "flock / penguin / pigvision / fs battery");
+        "Sniffs beacons & probes for Flock patterns\n"
+        "Flock-XXXX / FS_ / FS- / FlockOS / FlockCam");
     lv_obj_set_style_text_color(flockStatusLbl,
         lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(flockStatusLbl, 8, 30);
@@ -6053,7 +10887,10 @@ static const char *hybridSignalQuality(int8_t rssi) {
 }
 
 static void hybridUpsertHit(const char *source, const char *name, const char *mac,
-                            int8_t rssi, const char *reason) {
+                            int8_t rssi, const char *reason,
+                            const char *method = "Name",
+                            const char *confidence = "High",
+                            const char *type = "Flock") {
     if (!source || !name || !mac || !reason) return;
 
     for (int i = 0; i < hybridHitCount; i++) {
@@ -6063,7 +10900,14 @@ static void hybridUpsertHit(const char *source, const char *name, const char *ma
             hybridHits[i].name[sizeof(hybridHits[i].name) - 1] = '\0';
             strncpy(hybridHits[i].reason, reason, sizeof(hybridHits[i].reason) - 1);
             hybridHits[i].reason[sizeof(hybridHits[i].reason) - 1] = '\0';
+            strncpy(hybridHits[i].method, method, sizeof(hybridHits[i].method) - 1);
+            hybridHits[i].method[sizeof(hybridHits[i].method) - 1] = '\0';
+            strncpy(hybridHits[i].confidence, confidence, sizeof(hybridHits[i].confidence) - 1);
+            hybridHits[i].confidence[sizeof(hybridHits[i].confidence) - 1] = '\0';
+            strncpy(hybridHits[i].type, type, sizeof(hybridHits[i].type) - 1);
+            hybridHits[i].type[sizeof(hybridHits[i].type) - 1] = '\0';
             hybridHits[i].rssi = rssi;
+            hybridHits[i].count++;
             hybridHits[i].lastSeen = millis();
             return;
         }
@@ -6076,7 +10920,12 @@ static void hybridUpsertHit(const char *source, const char *name, const char *ma
     strncpy(h.name, name, sizeof(h.name) - 1);
     strncpy(h.mac, mac, sizeof(h.mac) - 1);
     strncpy(h.reason, reason, sizeof(h.reason) - 1);
+    strncpy(h.method, method, sizeof(h.method) - 1);
+    strncpy(h.confidence, confidence, sizeof(h.confidence) - 1);
+    strncpy(h.type, type, sizeof(h.type) - 1);
     h.rssi = rssi;
+    h.count = 1;
+    h.firstSeen = millis();
     h.lastSeen = millis();
     playFlockChirp();
 }
@@ -6095,59 +10944,85 @@ static void hybridSortByRSSI() {
 
 static void hybridProcessPendingWifi() {
     if (!hybridPendingReady) return;
-    char name[33], mac[18], reason[24];
+    char name[33], mac[18], reason[24], method[24], confidence[8], type[20];
     int8_t rssi = hybridPendingRSSI;
     memcpy(name, hybridPendingName, sizeof(name));
     memcpy(mac, hybridPendingMac, sizeof(mac));
     memcpy(reason, hybridPendingReason, sizeof(reason));
+    memcpy(method, hybridPendingMethod, sizeof(method));
+    memcpy(confidence, hybridPendingConfidence, sizeof(confidence));
+    memcpy(type, hybridPendingType, sizeof(type));
     hybridPendingReady = false;
-    hybridUpsertHit("WiFi", name, mac, rssi, reason);
+    hybridUpsertHit("WiFi", name, mac, rssi, reason, method, confidence, type);
 }
 
 static void hybridRebuildList() {
     if (!hybridList) return;
     hybridSortByRSSI();
+
+    // Rebuild group so results are selectable without losing Back/Start Scan.
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    if (hybridBackBtn) lv_group_add_obj(wifiToolGroup, hybridBackBtn);
+    if (hybridScanBtn) lv_group_add_obj(wifiToolGroup, hybridScanBtn);
+
     lv_obj_clean(hybridList);
 
     if (hybridHitCount == 0) {
         lv_obj_t *e = lv_list_add_text(hybridList,
             "No combined Flock hits yet. Press Start Scan.");
         if (e) lv_obj_set_style_text_color(e, lv_color_hex(TH.textDim), LV_PART_MAIN);
+        setGroup(wifiToolGroup);
         return;
     }
 
     for (int i = 0; i < hybridHitCount; i++) {
         uint32_t age = (millis() - hybridHits[i].lastSeen) / 1000UL;
-        char row[132];
+        char row[156];
 #if FLOCK_HYBRID_SHOW_MAC
-        snprintf(row, sizeof(row), "%s  %s  %ddBm\n%s  %s  %lus",
+        snprintf(row, sizeof(row), "%s %s [%s] %ddBm x%u\n%s  %s  %lus",
                  hybridHits[i].source,
-                 hybridHits[i].name,
+                 hybridHits[i].type[0] ? hybridHits[i].type : "Flock",
+                 hybridHits[i].confidence[0] ? hybridHits[i].confidence : "High",
                  hybridHits[i].rssi,
+                 hybridHits[i].count,
                  hybridHits[i].mac,
-                 hybridHits[i].reason,
+                 hybridHits[i].method[0] ? hybridHits[i].method : hybridHits[i].reason,
                  (unsigned long)age);
 #else
-        snprintf(row, sizeof(row), "%s  %s  %ddBm  %s",
+        snprintf(row, sizeof(row), "%s %s [%s] %ddBm x%u",
                  hybridHits[i].source,
-                 hybridHits[i].name,
+                 hybridHits[i].type[0] ? hybridHits[i].type : "Flock",
+                 hybridHits[i].confidence[0] ? hybridHits[i].confidence : "High",
                  hybridHits[i].rssi,
-                 hybridHits[i].reason);
+                 hybridHits[i].count);
 #endif
-        lv_obj_t *entry = lv_list_add_text(hybridList, row);
-        if (entry) {
-            lv_obj_set_style_text_color(entry,
+        lv_obj_t *btn = lv_list_add_btn(hybridList, nullptr, row);
+        if (btn) {
+            styleListBtn(btn);
+            lv_obj_set_style_text_color(btn,
                 strcmp(hybridHits[i].source, "BLE") == 0 ? lv_color_hex(TH.accent) : lv_color_hex(TH.alert),
-                LV_PART_MAIN);
+                LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+                createFlockHybridDetail((int)(intptr_t)lv_event_get_user_data(ev));
+            }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            lv_group_add_obj(wifiToolGroup, btn);
         }
     }
+    setGroup(wifiToolGroup);
 }
 
 static const char *hybridKeywordReason(const char *name) {
+    if (flockHasStrictIdPattern(name)) return "Flock-ID";
     if (flockContainsKeyword(name, FLOCK_KEYWORD_1)) return FLOCK_KEYWORD_1;
     if (flockContainsKeyword(name, FLOCK_KEYWORD_2)) return FLOCK_KEYWORD_2;
     if (flockContainsKeyword(name, FLOCK_KEYWORD_3)) return FLOCK_KEYWORD_3;
     if (flockContainsKeyword(name, FLOCK_KEYWORD_4)) return "fs battery";
+    if (flockContainsKeyword(name, FLOCK_KEYWORD_5)) return FLOCK_KEYWORD_5;
+    if (flockContainsKeyword(name, FLOCK_KEYWORD_6)) return FLOCK_KEYWORD_6;
+    if (flockContainsKeyword(name, FLOCK_KEYWORD_7)) return "flocksafety";
+    if (flockContainsKeyword(name, FLOCK_KEYWORD_8)) return FLOCK_KEYWORD_8;
+    if (flockContainsKeyword(name, FLOCK_KEYWORD_9)) return FLOCK_KEYWORD_9;
     return "keyword";
 }
 
@@ -6160,8 +11035,20 @@ static bool hybridNameIsTenDigits(const char *name) {
     return len == 10;
 }
 
-static bool detectFlockBLE(BLEAdvertisedDevice &dev, char *reason, size_t reasonLen) {
+static bool detectFlockBLE(BLEAdvertisedDevice &dev, char *reason, size_t reasonLen,
+                            char *method, size_t methodLen,
+                            char *confidence, size_t confidenceLen,
+                            char *type, size_t typeLen) {
     if (reason && reasonLen) reason[0] = '\0';
+    if (method && methodLen) method[0] = '\0';
+    if (confidence && confidenceLen) confidence[0] = '\0';
+    if (type && typeLen) type[0] = '\0';
+
+    String macStr = dev.getAddress().toString().c_str();
+    if (classifyFlockMac(macStr.c_str(), method, methodLen, confidence, confidenceLen, type, typeLen)) {
+        snprintf(reason, reasonLen, "%s", method);
+        return true;
+    }
 
     if (dev.haveName()) {
         String nm = String(dev.getName().c_str());
@@ -6171,26 +11058,39 @@ static bool detectFlockBLE(BLEAdvertisedDevice &dev, char *reason, size_t reason
 
         if (containsFlockKeyword(nbuf)) {
             snprintf(reason, reasonLen, "Name:%s", hybridKeywordReason(nbuf));
+            if (flockHasStrictIdPattern(nbuf)) {
+                snprintf(method, methodLen, "Flock-ID");
+            } else {
+                snprintf(method, methodLen, "Name");
+            }
+            snprintf(confidence, confidenceLen, "High");
+            snprintf(type, typeLen, "Flock");
             return true;
         }
         if (hybridNameIsTenDigits(nbuf)) {
             snprintf(reason, reasonLen, "10-digit name");
+            snprintf(method, methodLen, "Name Pattern");
+            snprintf(confidence, confidenceLen, "Medium");
+            snprintf(type, typeLen, "Flock?");
             return true;
         }
     }
 
+#if FLOCK_BLE_MFR_ID_MATCH_ENABLED
     if (dev.haveManufacturerData()) {
         std::string md = dev.getManufacturerData();
         if (md.length() >= 2) {
-            uint8_t b0 = (uint8_t)md[0];
-            uint8_t b1 = (uint8_t)md[1];
-            // XUNTONG 0x09C8 may appear little-endian in manufacturer data.
-            if ((b0 == 0xC8 && b1 == 0x09) || (b0 == 0x09 && b1 == 0xC8)) {
+            uint16_t code = ((uint16_t)(uint8_t)md[1] << 8) | (uint16_t)(uint8_t)md[0];
+            if (code == FLOCK_BLE_MFR_ID_XUNTONG) {
                 snprintf(reason, reasonLen, "MFG 09C8");
+                snprintf(method, methodLen, "BLE MFR ID");
+                snprintf(confidence, confidenceLen, "High");
+                snprintf(type, typeLen, "Flock/XUNTONG");
                 return true;
             }
         }
     }
+#endif
 
     return false;
 }
@@ -6209,37 +11109,72 @@ static void hybrid_wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) 
     if (ftype != 0) return;
     if (stype != 8 && stype != 5 && stype != 4) return;
 
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             d[10], d[11], d[12], d[13], d[14], d[15]);
+
+    char reason[24] = "";
+    char method[24] = "";
+    char confidence[8] = "";
+    char deviceType[20] = "";
+    bool macHit = classifyFlockMac(mac, method, sizeof(method), confidence, sizeof(confidence), deviceType, sizeof(deviceType));
+
+    char ssid[33];
+    ssid[0] = '\0';
+    bool nameHit = false;
+
     int ieOffset = (stype == 4) ? 24 : 36;
-    if (ieOffset >= len) return;
+    if (ieOffset < len) {
+        const uint8_t *ie = d + ieOffset;
+        int rem = len - ieOffset;
+        while (rem >= 2) {
+            uint8_t id = ie[0];
+            uint8_t elen = ie[1];
+            if (elen + 2 > rem) break;
 
-    const uint8_t *ie = d + ieOffset;
-    int rem = len - ieOffset;
-    while (rem >= 2) {
-        uint8_t id = ie[0];
-        uint8_t elen = ie[1];
-        if (elen + 2 > rem) break;
+            if (id == 0 && elen > 0) {
+                int n = elen > 32 ? 32 : elen;
+                memcpy(ssid, ie + 2, n);
+                ssid[n] = '\0';
 
-        if (id == 0 && elen > 0) {
-            int n = elen > 32 ? 32 : elen;
-            char ssid[33];
-            memcpy(ssid, ie + 2, n);
-            ssid[n] = '\0';
-
-            if (containsFlockKeyword(ssid)) {
-                memcpy(hybridPendingName, ssid, n + 1);
-                snprintf(hybridPendingMac, sizeof(hybridPendingMac),
-                         "%02X:%02X:%02X:%02X:%02X:%02X",
-                         d[10], d[11], d[12], d[13], d[14], d[15]);
-                snprintf(hybridPendingReason, sizeof(hybridPendingReason),
-                         "%s", (stype == 4) ? "Probe" : "Beacon");
-                hybridPendingRSSI = pkt->rx_ctrl.rssi;
-                hybridPendingReady = true;
-                return;
+                if (containsFlockKeyword(ssid)) {
+                    nameHit = true;
+                    snprintf(reason, sizeof(reason), "%s:%s",
+                             (stype == 4) ? "Probe" : "Beacon",
+                             hybridKeywordReason(ssid));
+                    if (flockHasStrictIdPattern(ssid)) {
+                        snprintf(method, sizeof(method), "Flock-ID");
+                    } else {
+                        snprintf(method, sizeof(method), "Name");
+                    }
+                    snprintf(confidence, sizeof(confidence), "High");
+                    snprintf(deviceType, sizeof(deviceType), "Flock");
+                    break;
+                }
             }
+            ie += elen + 2;
+            rem -= elen + 2;
         }
-        ie += elen + 2;
-        rem -= elen + 2;
     }
+
+    if (!nameHit && !macHit) return;
+    if (!reason[0]) snprintf(reason, sizeof(reason), "%s", (stype == 4) ? "Probe MAC" : "Beacon MAC");
+    if (!ssid[0]) snprintf(ssid, sizeof(ssid), "<hidden/none>");
+
+    strncpy(hybridPendingName, ssid, sizeof(hybridPendingName) - 1);
+    hybridPendingName[sizeof(hybridPendingName) - 1] = '\0';
+    strncpy(hybridPendingMac, mac, sizeof(hybridPendingMac) - 1);
+    hybridPendingMac[sizeof(hybridPendingMac) - 1] = '\0';
+    strncpy(hybridPendingReason, reason, sizeof(hybridPendingReason) - 1);
+    hybridPendingReason[sizeof(hybridPendingReason) - 1] = '\0';
+    strncpy(hybridPendingMethod, method, sizeof(hybridPendingMethod) - 1);
+    hybridPendingMethod[sizeof(hybridPendingMethod) - 1] = '\0';
+    strncpy(hybridPendingConfidence, confidence, sizeof(hybridPendingConfidence) - 1);
+    hybridPendingConfidence[sizeof(hybridPendingConfidence) - 1] = '\0';
+    strncpy(hybridPendingType, deviceType, sizeof(hybridPendingType) - 1);
+    hybridPendingType[sizeof(hybridPendingType) - 1] = '\0';
+    hybridPendingRSSI = pkt->rx_ctrl.rssi;
+    hybridPendingReady = true;
 }
 
 static void runFlockHybridCycle() {
@@ -6260,13 +11195,21 @@ static void runFlockHybridCycle() {
     pScan->setWindow(140);
     BLEScanResults results = pScan->start(flockHybridBleSecs, false);
     int total = results.getCount();
+    hybridBleHeardCount += (uint32_t)total;
     for (int i = 0; i < total; i++) {
         BLEAdvertisedDevice dev = results.getDevice(i);
         char reason[24];
-        if (detectFlockBLE(dev, reason, sizeof(reason))) {
+        char method[24];
+        char confidence[8];
+        char deviceType[20];
+        if (detectFlockBLE(dev, reason, sizeof(reason),
+                           method, sizeof(method),
+                           confidence, sizeof(confidence),
+                           deviceType, sizeof(deviceType))) {
             String nm = dev.haveName() ? dev.getName().c_str() : "<unknown>";
             String mac = dev.getAddress().toString().c_str();
-            hybridUpsertHit("BLE", nm.c_str(), mac.c_str(), (int8_t)dev.getRSSI(), reason);
+            hybridUpsertHit("BLE", nm.c_str(), mac.c_str(), (int8_t)dev.getRSSI(), reason,
+                            method, confidence, deviceType);
         }
     }
     pScan->clearResults();
@@ -6284,6 +11227,7 @@ static void runFlockHybridCycle() {
     esp_wifi_set_promiscuous_rx_cb(hybrid_wifi_sniffer_cb);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     uint8_t ch = 1;
+    deauthChannel = ch;
     unsigned long startMs = millis();
     unsigned long lastHopMs = 0;
     unsigned long wifiMs = (unsigned long)flockHybridWifiSecs * 1000UL;
@@ -6293,9 +11237,11 @@ static void runFlockHybridCycle() {
             hybridProcessPendingWifi();
             hybridRebuildList();
         }
-        if (millis() - lastHopMs >= (unsigned long)flockHybridHopMs) {
+        uint16_t hybridHopMs = flockAdaptiveDwellMs(ch, flockHybridHopMs);
+        if (millis() - lastHopMs >= (unsigned long)hybridHopMs) {
             lastHopMs = millis();
             ch = (ch % 13) + 1;
+            deauthChannel = ch;  // keep shared top-level hop state aligned
             esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
         }
         lv_timer_handler();
@@ -6309,13 +11255,99 @@ static void runFlockHybridCycle() {
     hybridRebuildList();
 
     char buf[64];
-    snprintf(buf, sizeof(buf), LV_SYMBOL_WARNING "  Hybrid complete — %d hit%s",
-             hybridHitCount, hybridHitCount == 1 ? "" : "s");
+    snprintf(buf, sizeof(buf), LV_SYMBOL_WARNING "  Hybrid complete — %d hit%s / %lu heard",
+             hybridHitCount, hybridHitCount == 1 ? "" : "s", (unsigned long)hybridBleHeardCount);
     stopLEDSpinner(FLOCK_HYBRID_LED_R, FLOCK_HYBRID_LED_G, FLOCK_HYBRID_LED_B);
 
     lv_label_set_text(hybridStatusLbl, buf);
     lv_obj_set_style_text_color(hybridStatusLbl,
         hybridHitCount ? lv_color_hex(TH.alert) : lv_color_hex(TH.textDim), LV_PART_MAIN);
+}
+
+
+void createFlockHybridDetail(int idx) {
+    if (idx < 0 || idx >= hybridHitCount) return;
+
+    if (wifiDetailScreen) { lv_obj_delete(wifiDetailScreen); wifiDetailScreen = nullptr; }
+    wifiDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(wifiDetailScreen);
+
+    char hdr[64];
+    snprintf(hdr, sizeof(hdr), LV_SYMBOL_EYE_OPEN "  %.20s", hybridHits[idx].type[0] ? hybridHits[idx].type : "Flock Hit");
+    createHeader(wifiDetailScreen, hdr);
+
+    FlockHybridHit h = hybridHits[idx];
+    uint32_t age = (millis() - h.lastSeen) / 1000UL;
+    uint32_t firstAge = (millis() - h.firstSeen) / 1000UL;
+
+    lv_obj_t *card = lv_obj_create(wifiDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card,     lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,       LV_OPA_COVER,           LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,       6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,      6, LV_PART_MAIN);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
+
+    char info[760];
+    snprintf(info, sizeof(info),
+             "Source      : %s\n"
+             "Type        : %s\n"
+             "Confidence  : %s\n"
+             "Method      : %s\n"
+             "Reason      : %s\n"
+             "Name / SSID : %s\n"
+             "MAC         : %s\n"
+             "RSSI        : %d dBm (%s)\n"
+             "Seen Count  : %u\n"
+             "Last Seen   : %lus ago\n"
+             "First Seen  : %lus ago\n"
+             "BLE Heard   : %lu advs\n\n"
+             "Note: Low confidence manufacturer-prefix hits can be false positives.\n"
+             "Raven UUID detection is intentionally left for a separate Raven Detector tool.",
+             h.source,
+             h.type[0] ? h.type : "Flock",
+             h.confidence[0] ? h.confidence : "High",
+             h.method[0] ? h.method : h.reason,
+             h.reason,
+             h.name,
+             h.mac,
+             h.rssi, hybridSignalQuality(h.rssi),
+             h.count,
+             (unsigned long)age,
+             (unsigned long)firstAge,
+             (unsigned long)hybridBleHeardCount);
+
+    lv_obj_t *lbl = lv_label_create(card);
+    lv_label_set_text(lbl, info);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *bar = lv_bar_create(wifiDetailScreen);
+    lv_obj_set_size(bar, SCREEN_W - 12, 5);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
+    lv_bar_set_range(bar, -100, -30);
+    lv_bar_set_value(bar, h.rssi, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, rssiColor(h.rssi), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
+
+    lv_obj_t *backBtn = createBackBtn(wifiDetailScreen, cb_wifiDetailBack);
+    deleteGroup(&wifiDetailGroup);
+    wifiDetailGroup = lv_group_create();
+    lv_group_add_obj(wifiDetailGroup, card);
+    lv_group_add_obj(wifiDetailGroup, backBtn);
+    setGroup(wifiDetailGroup);
+    lv_group_focus_obj(card);
+
+    lv_screen_load_anim(wifiDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
 static void cb_runFlockHybrid(lv_event_t *e) {
@@ -6333,6 +11365,9 @@ void createFlockHybridScanner() {
     hybridWifiActive = false;
     hybridStatusLbl = nullptr;
     hybridList = nullptr;
+    hybridBackBtn = nullptr;
+    hybridScanBtn = nullptr;
+    hybridBleHeardCount = 0;
     memset(hybridHits, 0, sizeof(hybridHits));
 
     if (wifiToolScreen) { lv_obj_delete(wifiToolScreen); wifiToolScreen = nullptr; }
@@ -6355,16 +11390,11 @@ void createFlockHybridScanner() {
     lv_obj_set_style_border_width(hybridList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(hybridList,      2, LV_PART_MAIN);
     lv_obj_set_style_pad_row(hybridList,      1, LV_PART_MAIN);
+
+    hybridBackBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
+    hybridScanBtn = createActionBtn(wifiToolScreen, LV_SYMBOL_REFRESH "  Start Scan", cb_runFlockHybrid);
+
     hybridRebuildList();
-
-    lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
-    lv_obj_t *scanBtn = createActionBtn(wifiToolScreen, LV_SYMBOL_REFRESH "  Start Scan", cb_runFlockHybrid);
-
-    deleteGroup(&wifiToolGroup);
-    wifiToolGroup = lv_group_create();
-    lv_group_add_obj(wifiToolGroup, backBtn);
-    lv_group_add_obj(wifiToolGroup, scanBtn);
-    setGroup(wifiToolGroup);
 
     setAllLEDs(FLOCK_HYBRID_LED_R, FLOCK_HYBRID_LED_G, FLOCK_HYBRID_LED_B, LED_BRIGHTNESS);
     lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
@@ -6397,6 +11427,7 @@ static const char *BLE_TOOL_LABELS[] = {
     LV_SYMBOL_WARNING   "  Flipper Detector",
     LV_SYMBOL_BLUETOOTH "  nyanBOX Detector",
     LV_SYMBOL_BLUETOOTH "  Axon Detector",
+    LV_SYMBOL_BLUETOOTH "  Raven Detector",
     LV_SYMBOL_BLUETOOTH "  Tesla Detector",
     LV_SYMBOL_WARNING   "  Skimmer Detector",
     LV_SYMBOL_EYE_OPEN  "  Meta Detector"
@@ -6418,9 +11449,10 @@ static void cb_bleToolSelected(lv_event_t *e) {
         case 2: createFlipperScanner();  break;
         case 3: createNyanBoxDetector(); break;
         case 4: createAxonDetector();    break;
-        case 5: createTeslaDetector();   break;
-        case 6: createSkimmerScanner();  break;
-        case 7: createMetaDetector();    break;
+        case 5: createRavenDetector();   break;
+        case 6: createTeslaDetector();   break;
+        case 7: createSkimmerScanner();  break;
+        case 8: createMetaDetector();    break;
     }
 }
 
@@ -7502,6 +12534,310 @@ void createAxonLocate(int idx) {
 }
 
 
+
+// ════════════════════════════════════════════════════════════════
+//  BLE TOOL – RAVEN DETECTOR
+//
+//  Passive BLE detector for Raven / SoundThinking-style gunshot sensors.
+//  It checks advertised service UUIDs only; it does not connect to devices.
+//  UUID patterns and firmware-estimate idea are based on
+//  0xXyc/flock-you-wifi-recon.
+// ════════════════════════════════════════════════════════════════
+static lv_obj_t *ravenStatusLbl = nullptr;
+static lv_obj_t *ravenList      = nullptr;
+static lv_obj_t *ravenBackBtn   = nullptr;
+static lv_obj_t *ravenScanBtn   = nullptr;
+
+static const char *ravenSignalQuality(int8_t rssi) {
+    if (rssi >= -50) return "EXCELLENT";
+    if (rssi >= -60) return "VERY GOOD";
+    if (rssi >= -70) return "GOOD";
+    if (rssi >= -80) return "FAIR";
+    return "WEAK";
+}
+
+static int findRavenByMac(const char *mac) {
+    for (int i = 0; i < ravenEntryCount; i++) {
+        if (strcmp(ravenEntries[i].mac, mac) == 0) return i;
+    }
+    return -1;
+}
+
+static void sortRavenByRSSI() {
+    for (int i = 0; i < ravenEntryCount - 1; i++) {
+        for (int j = 0; j < ravenEntryCount - 1 - i; j++) {
+            if (ravenEntries[j].rssi < ravenEntries[j + 1].rssi) {
+                RavenEntry tmp = ravenEntries[j];
+                ravenEntries[j] = ravenEntries[j + 1];
+                ravenEntries[j + 1] = tmp;
+            }
+        }
+    }
+}
+
+static void upsertRavenDevice(BLEAdvertisedDevice &dev) {
+    String macStr = dev.getAddress().toString().c_str();
+    int idx = findRavenByMac(macStr.c_str());
+
+    if (idx < 0) {
+        if (ravenEntryCount >= MAX_RAVEN_RESULTS) return;
+        idx = ravenEntryCount++;
+        memset(&ravenEntries[idx], 0, sizeof(RavenEntry));
+        strncpy(ravenEntries[idx].mac, macStr.c_str(), sizeof(ravenEntries[idx].mac) - 1);
+        strncpy(ravenEntries[idx].name, "Raven Device", sizeof(ravenEntries[idx].name) - 1);
+    }
+
+    String nm = dev.haveName() ? dev.getName().c_str() : "Raven Device";
+    strncpy(ravenEntries[idx].name, nm.c_str(), sizeof(ravenEntries[idx].name) - 1);
+    ravenEntries[idx].name[sizeof(ravenEntries[idx].name) - 1] = '\0';
+
+    char firstUuid[41];
+    uint8_t hitCount = ravenCountUuidHits(dev, firstUuid, sizeof(firstUuid));
+    strncpy(ravenEntries[idx].matchedUuid,
+            firstUuid[0] ? firstUuid : "unknown",
+            sizeof(ravenEntries[idx].matchedUuid) - 1);
+    ravenEntries[idx].matchedUuid[sizeof(ravenEntries[idx].matchedUuid) - 1] = '\0';
+
+    strncpy(ravenEntries[idx].fwEstimate,
+            estimateRavenFW(dev),
+            sizeof(ravenEntries[idx].fwEstimate) - 1);
+    ravenEntries[idx].fwEstimate[sizeof(ravenEntries[idx].fwEstimate) - 1] = '\0';
+
+    ravenEntries[idx].uuidHitCount = hitCount;
+    ravenEntries[idx].rssi = (int8_t)dev.getRSSI();
+    ravenEntries[idx].lastSeen = millis();
+}
+
+static int doRavenScan(int durationSec) {
+    ensureBLEInit();
+    WiFi.disconnect();
+    delay(50);
+
+    BLEScan *pScan = BLEDevice::getScan();
+    pScan->setActiveScan(true);
+    pScan->setInterval(150);
+    pScan->setWindow(140);
+
+    BLEScanResults results = pScan->start(durationSec, false);
+    int total = results.getCount();
+
+    ravenEntryCount = 0;
+    memset(ravenEntries, 0, sizeof(ravenEntries));
+
+    for (int i = 0; i < total && ravenEntryCount < MAX_RAVEN_RESULTS; i++) {
+        BLEAdvertisedDevice dev = results.getDevice(i);
+        if (detectRaven(dev)) {
+            upsertRavenDevice(dev);
+        }
+    }
+
+    pScan->clearResults();
+    sortRavenByRSSI();
+    return ravenEntryCount;
+}
+
+static void rebuildRavenList() {
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    if (ravenBackBtn) lv_group_add_obj(bleToolGroup, ravenBackBtn);
+    if (ravenScanBtn) lv_group_add_obj(bleToolGroup, ravenScanBtn);
+    setGroup(bleToolGroup);
+
+    lv_obj_clean(ravenList);
+    if (ravenEntryCount == 0) {
+        lv_obj_t *empty = lv_list_add_text(ravenList, "No Raven UUID patterns found yet");
+        if (empty) lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
+        return;
+    }
+
+    for (int i = 0; i < ravenEntryCount; i++) {
+        char row[96];
+        const char *uuidLabel = ravenUuidLabel(ravenEntries[i].matchedUuid);
+        snprintf(row, sizeof(row), "%s  %ddBm  FW:%s",
+                 uuidLabel,
+                 ravenEntries[i].rssi,
+                 ravenEntries[i].fwEstimate);
+
+        lv_obj_t *btn = lv_list_add_btn(ravenList, nullptr, row);
+        styleListBtn(btn);
+        lv_obj_set_style_text_color(btn, bleRssiColor(ravenEntries[i].rssi),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            createRavenDetail((int)(intptr_t)lv_event_get_user_data(ev));
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_group_add_obj(bleToolGroup, btn);
+
+#if RAVEN_SHOW_FULL_MAC
+        char sub[64];
+        snprintf(sub, sizeof(sub), "%s  UUID hits:%u",
+                 ravenEntries[i].mac,
+                 ravenEntries[i].uuidHitCount);
+        lv_obj_t *macTxt = lv_list_add_text(ravenList, sub);
+        if (macTxt) lv_obj_set_style_text_color(macTxt, lv_color_hex(TH.textDim), LV_PART_MAIN);
+#endif
+    }
+
+    setGroup(bleToolGroup);
+}
+
+static void cb_doRavenScan(lv_event_t *e) {
+    char msg[48];
+    snprintf(msg, sizeof(msg), LV_SYMBOL_REFRESH "  Scanning %ds...", RAVEN_SCAN_SECS);
+    lv_label_set_text(ravenStatusLbl, msg);
+    lv_obj_set_style_text_color(ravenStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
+    lv_obj_clean(ravenList);
+    lv_timer_handler();
+
+    startLEDSpinner(170, 0, 220);
+    int found = doRavenScan(RAVEN_SCAN_SECS);
+    stopLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
+
+    if (found == 0) {
+        lv_label_set_text(ravenStatusLbl, LV_SYMBOL_OK "  No Raven UUID patterns detected");
+        lv_obj_set_style_text_color(ravenStatusLbl, lv_color_hex(TH.success), LV_PART_MAIN);
+    } else {
+        snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  %d Raven-like BLE device%s found!",
+                 found, found == 1 ? "" : "s");
+        lv_label_set_text(ravenStatusLbl, msg);
+        lv_obj_set_style_text_color(ravenStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+        playBLESuspiciousChirp();
+    }
+
+    rebuildRavenList();
+}
+
+void createRavenDetector() {
+    ravenStatusLbl = nullptr;
+    ravenList      = nullptr;
+    ravenBackBtn   = nullptr;
+    ravenScanBtn   = nullptr;
+
+    if (bleToolScreen) { lv_obj_delete(bleToolScreen); bleToolScreen = nullptr; }
+    bleToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleToolScreen);
+    createHeader(bleToolScreen, LV_SYMBOL_BLUETOOTH "  Raven Detector");
+
+    ravenStatusLbl = lv_label_create(bleToolScreen);
+    lv_label_set_text(ravenStatusLbl,
+                      "Detects Raven/SoundThinking BLE UUIDs\nPassive scan only; no connection");
+    lv_obj_set_style_text_color(ravenStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(ravenStatusLbl, 8, 30);
+
+    ravenList = lv_list_create(bleToolScreen);
+    lv_obj_set_size(ravenList, SCREEN_W, SCREEN_H - 80);
+    lv_obj_set_pos(ravenList, 0, 48);
+    lv_obj_set_style_bg_color(ravenList,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(ravenList,       LV_OPA_COVER,        LV_PART_MAIN);
+    lv_obj_set_style_border_width(ravenList, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(ravenList,      2, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(ravenList,      2, LV_PART_MAIN);
+
+    lv_obj_t *empty = lv_list_add_text(ravenList, "Ready to scan for Raven UUID patterns");
+    if (empty) lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
+
+    ravenBackBtn = createBackBtn(bleToolScreen, cb_bleToolBack);
+    ravenScanBtn = createActionBtn(bleToolScreen,
+                                   LV_SYMBOL_REFRESH "  Scan",
+                                   cb_doRavenScan);
+
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    lv_group_add_obj(bleToolGroup, ravenBackBtn);
+    lv_group_add_obj(bleToolGroup, ravenScanBtn);
+    setGroup(bleToolGroup);
+
+    if (ravenEntryCount > 0) {
+        char msg[56];
+        snprintf(msg, sizeof(msg), LV_SYMBOL_BLUETOOTH "  %d saved Raven result%s",
+                 ravenEntryCount, ravenEntryCount == 1 ? "" : "s");
+        lv_label_set_text(ravenStatusLbl, msg);
+        lv_obj_set_style_text_color(ravenStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+        rebuildRavenList();
+    }
+
+    setAllLEDs(170, 0, 220, LED_BRIGHTNESS);
+    lv_screen_load_anim(bleToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+static void cb_ravenDetailBack(lv_event_t *e) {
+    cb_bleDetailBack(e);
+}
+
+void createRavenDetail(int idx) {
+    if (idx < 0 || idx >= ravenEntryCount) return;
+
+    if (bleDetailScreen) { lv_obj_delete(bleDetailScreen); bleDetailScreen = nullptr; }
+    bleDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleDetailScreen);
+
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), LV_SYMBOL_BLUETOOTH "  Raven Detail");
+    createHeader(bleDetailScreen, hdr);
+
+    lv_obj_t *card = lv_obj_create(bleDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card,      lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,        LV_OPA_COVER,          LV_PART_MAIN);
+    lv_obj_set_style_border_color(card,  lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card,  1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,        6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,       6, LV_PART_MAIN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    uint32_t ageSec = (millis() - ravenEntries[idx].lastSeen) / 1000;
+    const char *uuidLabel = ravenUuidLabel(ravenEntries[idx].matchedUuid);
+
+    char info[360];
+    snprintf(info, sizeof(info),
+             "Raven / SoundThinking-like BLE\n"
+             "Name : %s\n"
+             "MAC  : %s\n"
+             "RSSI : %d dBm (%s)\n"
+             "UUID : %s\n"
+             "Svc  : %s\n"
+             "Hits : %u\n"
+             "FW   : %s\n"
+             "Age  : %lus\n"
+             "Mode : passive BLE UUID scan",
+             ravenEntries[idx].name,
+             ravenEntries[idx].mac,
+             ravenEntries[idx].rssi,
+             ravenSignalQuality(ravenEntries[idx].rssi),
+             uuidLabel,
+             ravenEntries[idx].matchedUuid,
+             ravenEntries[idx].uuidHitCount,
+             ravenEntries[idx].fwEstimate,
+             (unsigned long)ageSec);
+
+    lv_obj_t *infoLbl = lv_label_create(card);
+    lv_label_set_text(infoLbl, info);
+    lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(infoLbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(infoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(infoLbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *bar = lv_bar_create(bleDetailScreen);
+    lv_obj_set_size(bar, SCREEN_W - 12, 5);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
+    lv_bar_set_range(bar, -100, -30);
+    lv_bar_set_value(bar, ravenEntries[idx].rssi, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, bleRssiColor(ravenEntries[idx].rssi), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
+
+    lv_obj_t *backBtn = createBackBtn(bleDetailScreen, cb_ravenDetailBack);
+
+    deleteGroup(&bleDetailGroup);
+    bleDetailGroup = lv_group_create();
+    lv_group_add_obj(bleDetailGroup, backBtn);
+    setGroup(bleDetailGroup);
+
+    lv_screen_load_anim(bleDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+
 // ════════════════════════════════════════════════════════════════
 //  BLE TOOL 6 – TESLA DETECTOR
 //
@@ -7647,6 +12983,10 @@ static void cb_doTeslaScan(lv_event_t *e) {
                  found, found == 1 ? "" : "s");
         lv_label_set_text(teslaStatusLbl, msg);
         lv_obj_set_style_text_color(teslaStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+
+        // Play the same style of alert tone used by the other BLE finders
+        // when a Tesla-like BLE pattern is found.
+        playTeslaChirp();
     }
 
     rebuildTeslaList();
@@ -8014,6 +13354,12 @@ static void cleanupForAutoReturnHome(lv_obj_t *activeScr) {
     if (flockTimer)  { lv_timer_delete(flockTimer);  flockTimer  = nullptr; }
     if (hybridStartTimer) { lv_timer_delete(hybridStartTimer); hybridStartTimer = nullptr; }
     if (packetMonitorTimer) { lv_timer_delete(packetMonitorTimer); packetMonitorTimer = nullptr; }
+    if (stationScanTimer) { lv_timer_delete(stationScanTimer); stationScanTimer = nullptr; }
+    stationStatusLbl = nullptr;
+    stationList = nullptr;
+    stationStartBtn = nullptr;
+    stationStartLbl = nullptr;
+    stationBackBtn = nullptr;
 
     // Stop GPS/Wiggle Wars timers safely if one of those tools is open.
     if (gpsTimer) { lv_timer_delete(gpsTimer); gpsTimer = nullptr; }
@@ -8086,36 +13432,70 @@ void setup() {
     Serial.println();
     Serial.println("====================================");
     Serial.println("[Rogue-Radar] Boot sequence started...");
+    Serial.printf("[Rogue-Radar] Reset reason: %d\n", esp_reset_reason());
+
     gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
     // SD card on dedicated HSPI bus — must not share with TFT
     sdSPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
+
     pinMode(POWER_PIN, OUTPUT);
     delay(10);
     digitalWrite(POWER_PIN, HIGH);
     delay(10);
+
     pinMode(ENCODER_BTN, INPUT_PULLUP);
+
 #if BATTERY_METER_ENABLED
     analogReadResolution(12);
     analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+
+    // Prime the shared top-bar battery value before the first screen/header is created.
+    // This prevents early screens from briefly showing BAT 0% before the first cached
+    // ADC read has been copied into batteryDisplayPercent.
+    int bootPrimeBattRaw = 0;
+    float bootPrimeBattVolts = 0.0f;
+    int bootPrimeBattPercent = 0;
+
+    readBatterySnapshot(&bootPrimeBattRaw, &bootPrimeBattVolts, &bootPrimeBattPercent);
+
+    batteryDisplayPercent = bootPrimeBattPercent;
+    batteryDisplayLastUpdateMs = millis();
+    batteryDisplayValid = true;
 #endif
 
-// I2S sound is lazy-initialized only when a chirp plays.
+    loadPersistentSettings();
+    loadPersistentScanSettings();
+
+    // I2S sound is lazy-initialized only when a chirp plays.
+
+    // Boot-only APA102 ring animation. It runs before the TFT splash so
+    // the splash image is not competing with the LED boot sequence.
+    // Config controls on/off, speed, duration, brightness, and restore behavior.
+    // No Serial logging here; the animation is intentionally quiet during boot.
+    runBootLightsAnimation();
 
     tft.begin();
     tft.writecommand(0x11);
     delay(120);
+
     applyDisplayRotation(false);
+
     // Backlight PWM via LEDC — allows smooth brightness control
     ledcSetup(LCD_BL_CH, LCD_BL_FREQ, LCD_BL_RES);
     ledcAttachPin(LCD_BL_PIN, LCD_BL_CH);
     applyBacklightLevel((uint8_t)lcdBrightness);
     resetInactivityTimer();
+
     applyFlockHybridPreset();
+
     tft.fillScreen(TFT_BLACK);
     showSplashScreen();  // Splash Screen Call
 
     lv_init();
-    lv_tick_set_cb([]() -> uint32_t { return (uint32_t)millis(); });
+    lv_tick_set_cb([]() -> uint32_t {
+        return (uint32_t)millis();
+    });
 
     lvDisp = lv_display_create(SCREEN_W, SCREEN_H);
     lv_display_set_flush_cb(lvDisp, lvgl_flush_cb);
@@ -8128,16 +13508,18 @@ void setup() {
 
     ledStartupFlash();
     createMainMenu();
+    updateTopbarWifiOverlay(true);
 
-    Serial.printf("[Rogue-Radar] Device: %s\n", DEVICE_NAME);
+    Serial.printf("[Rogue-Radar] Device: %s\n", DEVICE_TYPE);
     Serial.printf("[Rogue-Radar] Firmware: %s\n", FIRMWARE_VERSION);
+    Serial.printf("[Rogue-Radar] Persistent Settings: %s\n", PERSISTENT_SETTINGS_ENABLED ? "ON" : "OFF");
     Serial.printf("[Rogue-Radar] Chip: %s rev %d\n", ESP.getChipModel(), ESP.getChipRevision());
     Serial.printf("[Rogue-Radar] CPU: %u MHz\n", ESP.getCpuFreqMHz());
     Serial.printf("[Rogue-Radar] Free heap: %u bytes\n", ESP.getFreeHeap());
     Serial.printf("[Rogue-Radar] Flash size: %u bytes\n", ESP.getFlashChipSize());
     Serial.printf("[Rogue-Radar] Sketch size: %u bytes\n", ESP.getSketchSize());
     Serial.printf("[Rogue-Radar] Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
-    Serial.printf("[Rogue-Radar] WiFi STA MAC: %s\n", WiFi.macAddress().c_str());
+    Serial.printf("[Rogue-Radar] WiFi STA MAC %s\n", WiFi.macAddress().c_str());
     Serial.printf("[Rogue-Radar] WiFi AP MAC: %s\n", WiFi.softAPmacAddress().c_str());
 
 #if BATTERY_METER_ENABLED
@@ -8148,7 +13530,7 @@ void setup() {
     readBatterySnapshot(&bootBattRaw, &bootBattVolts, &bootBattPercent);
 
     Serial.printf("[Rogue-Radar] Battery: %.2f V / %d%%  raw:%d\n",
-                bootBattVolts, bootBattPercent, bootBattRaw);
+                  bootBattVolts, bootBattPercent, bootBattRaw);
 #endif
 
     Serial.println("[Rogue-Radar] Boot complete.");
@@ -8166,60 +13548,44 @@ void loop() {
 
     lv_timer_handler();
 
+    // Keyboard OK/Back safety: finish after LVGL event handling and after
+    // the encoder button has physically released.
+    processKeyboardDeferredFinish();
+
+    // Keyboard key sound safety: play delayed click only after GPIO0 is released.
+    processKeyboardClickFeedback();
+
+    // Connect to AP watchdog: plays the disconnect tone when an AP drops unexpectedly.
+    processConnectApConnectionWatchdog();
+
+    // Persistent top-bar WiFi icon: keep it visible on every page while connected.
+    updateTopbarWifiOverlay();
+
     // Safe inactivity behavior: dim backlight + APA102 brightness only, no ESP32 sleep yet.
     updateInactivityDimmer();
 
     // Optional UI auto-return: after inactivity, jump back to the main home menu.
     updateAutoReturnHome();
 
-    // Channel hopping: deauth detector and pwnagotchi watch both need it
+    // Channel hopping: deauth detector and pwnagotchi watch use the normal
+    // hop delay. Flock modes can optionally use adaptive dwell, giving
+    // channels 1/6/11 a longer listen window and other channels a quicker pass.
     static unsigned long lastHop = 0;
-    if ((deauthActive || pwnActive || flockActive || hybridWifiActive) && (millis() - lastHop >= (unsigned long)deauthHopMs)) {
-        lastHop       = millis();
-        deauthChannel = (deauthChannel % 13) + 1;
-        esp_wifi_set_channel(deauthChannel, WIFI_SECOND_CHAN_NONE);
-    }
+    if (deauthActive || pwnActive || flockActive || hybridWifiActive) {
+        uint16_t hopMs = (flockActive || hybridWifiActive)
+                       ? flockAdaptiveDwellMs(deauthChannel, deauthHopMs)
+                       : deauthHopMs;
 
-    // Long-press power-off (hold encoder 5 s)
-    // Safety latch: ignore any boot-time LOW reading until the button has been
-    // seen released once. This prevents accidental shutdowns after peripheral init.
-    if (!powerOffTriggered) {
-        int encoderBtnState = digitalRead(ENCODER_BTN);
-
-        if (encoderBtnState == HIGH) {
-            powerButtonReleasedAfterBoot = true;
-            btnHoldStart = 0;
-        } else if (powerButtonReleasedAfterBoot) {
-            if (btnHoldStart == 0) btnHoldStart = millis();
-            if ((millis() - btnHoldStart) > POWER_HOLD_MS) {
-                powerOffTriggered = true;
-                if (deauthActive) {
-                    deauthActive = false;
-                    esp_wifi_set_promiscuous(false);
-                }
-                if (deauthTimer) { lv_timer_delete(deauthTimer); deauthTimer = nullptr; }
-
-                lv_obj_t *offScr = lv_obj_create(nullptr);
-                lv_obj_set_style_bg_color(offScr, lv_color_hex(0x000000), LV_PART_MAIN);
-                lv_obj_t *msg = lv_label_create(offScr);
-                lv_label_set_text(msg, LV_SYMBOL_POWER "  Powering off...");
-                lv_obj_set_style_text_color(msg, lv_color_hex(0xff4444), LV_PART_MAIN);
-                lv_obj_center(msg);
-                lv_screen_load(offScr);
-                lv_timer_handler();
-
-                setAllLEDs(0, 0, 0, 0);
-                if (soundReady) {
-                    stopSoundDriverAfterChirp();
-                }
-                delay(1500);
-                digitalWrite(POWER_PIN, LOW);
-            }
-        } else {
-            // Button appears LOW before first release after boot; ignore it.
-            btnHoldStart = 0;
+        if (millis() - lastHop >= (unsigned long)hopMs) {
+            lastHop       = millis();
+            deauthChannel = (deauthChannel % 13) + 1;
+            esp_wifi_set_channel(deauthChannel, WIFI_SECOND_CHAN_NONE);
         }
     }
+
+    // Software power-off now lives at Misc Tools > Power Off.
+    // GPIO0 is no longer watched in the background for long-hold shutdown.
+
 
     delay(5);
 }

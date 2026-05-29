@@ -1,5 +1,5 @@
 // ============================================================
-//  config.h — Rogue Radar T-Embed v1.0.3
+//  config.h — Rogue Radar T-Embed v1.0.4
 //  Edit this file to customise pins, limits, themes, and behaviour.
 //  Do not edit rogue-radar.ino unless you know what you're doing.
 // ============================================================
@@ -7,7 +7,30 @@
 
 // ─── Device Name / Firmware Version ─────────────────────────────
 #define DEVICE_NAME       "Rogue Radar"
-#define FIRMWARE_VERSION  "RR v1.0.3"
+#define FIRMWARE_VERSION  "RR v1.0.4"
+
+// ─── Device Type ─────────────────────────────
+#define DEVICE_TYPE       "T-Embed Non CC1101"
+
+// ─── Splash Screen ──────────────────────────────────────────────
+#define SPLASH_DURATION_MS  2600
+
+// ─── Display ────────────────────────────────────────────────────
+#define SCREEN_W  320
+#define SCREEN_H  170
+
+// ─── Display Rotation ──────────────────────────────────────────
+// Landscape-only runtime toggle used by Misc > Rotation.
+// This build stays in 320x170 landscape mode, so only rotations 3 and 1
+// are used. Normal is the current known-good T-Embed orientation.
+#define DISPLAY_ROTATION_NORMAL   3
+#define DISPLAY_ROTATION_FLIPPED  1
+#define DISPLAY_ROTATION_DEFAULT  DISPLAY_ROTATION_NORMAL
+
+// ─── Persistent Settings / NVS ─────────────────────────────────
+// Saved in ESP32 NVS so settings survive reboot without an SD card.
+#define PERSISTENT_SETTINGS_ENABLED  1
+#define PREFS_NAMESPACE             "rogueradar"
 
 // ─── Pin Definitions ────────────────────────────────────────────
 #define POWER_PIN       46
@@ -44,6 +67,22 @@
 // 1 = APA102 ring starts enabled | 0 = APA102 ring starts disabled
 #define LEDS_ENABLED_DEFAULT       1
 
+// ─── Boot APA102 Ring Animation ────────────────────────────────
+// Plays a red, green, then blue circling animation during boot.
+// This is separate from the runtime Misc > LEDs ON/OFF toggle.
+// Set BOOT_LIGHTS_ENABLED to 0 to disable the boot animation.
+#define BOOT_LIGHTS_ENABLED              1
+#define BOOT_LIGHTS_COLOR_MS           960   // How long each color spins
+#define BOOT_LIGHTS_STEP_MS             74   // Lower = faster circle
+#define BOOT_LIGHTS_MIN_REVOLUTIONS      1   // Minimum full circles per color
+#define BOOT_LIGHTS_COLOR_GAP_MS       110   // Short dark gap between colors
+#define BOOT_LIGHTS_END_HOLD_MS        215   // Hold final restored/dark state before splash
+#define BOOT_LIGHTS_BRIGHTNESS          10   // 0-31 APA102 brightness
+#define BOOT_LIGHTS_TAIL_PERCENT        20   // trailing LED brightness percent
+#define BOOT_LIGHTS_RESTORE_MENU_COLOR   1   // 1 = end on WiFi/menu color, 0 = end dark
+#define BOOT_LIGHTS_RESPECT_LED_TOGGLE   0   // 1 = skip if runtime LEDs are OFF
+
+
 // ─── I2S Speaker / Alert Chirps ────────────────────────────────
 // Uses the T-Embed speaker connector / onboard I2S amp pins.
 // 1 = alert chirps enabled | 0 = alert chirps disabled.
@@ -79,7 +118,6 @@
 // Set AUTO_RETURN_HOME_TIMEOUT_MS to 0 to disable auto-return.
 #define AUTO_RETURN_HOME_TIMEOUT_MS  120000  // 2 minutes
 
-
 // ─── Battery Meter ──────────────────────────────────────────────
 // T-Embed LiPo battery monitor. GPIO4 is the expected ADC battery pin.
 // If your board revision uses a different ADC pin, change BATTERY_ADC_PIN here.
@@ -95,22 +133,61 @@
 #define BATTERY_CRITICAL_PERCENT   10
 #define BATTERY_AVG_SAMPLES         8
 
-// ─── Display ────────────────────────────────────────────────────
-#define SCREEN_W  320
-#define SCREEN_H  170
-
-// ─── Display Rotation ──────────────────────────────────────────
-// Landscape-only runtime toggle used by Misc > Rotation.
-// This build stays in 320x170 landscape mode, so only rotations 3 and 1
-// are used. Normal is the current known-good T-Embed orientation.
-#define DISPLAY_ROTATION_NORMAL   3
-#define DISPLAY_ROTATION_FLIPPED  1
-#define DISPLAY_ROTATION_DEFAULT  DISPLAY_ROTATION_NORMAL
-
 // ─── GPS ────────────────────────────────────────────────────────
 #define GPS_RX_PIN  44
 #define GPS_TX_PIN  43
 #define GPS_BAUD  9600
+
+// ─── Audio Tools / Sound Recorder ──────────────────────────────
+// First-pass record/playback tool for the T-Embed ES7210 microphone.
+// Mic pins are from the T-Embed pinout image: ES_BCLK=IO47, ES_LRCK=IO21,
+// ES_DIN=IO14, ES_MCLK=IO48. Speaker playback reuses SOUND_I2S_* pins.
+#define AUDIO_TOOLS_ENABLED                 1
+#define AUDIO_RECORDER_MIC_BCLK           47
+#define AUDIO_RECORDER_MIC_LRCK           21
+#define AUDIO_RECORDER_MIC_DIN            14
+#define AUDIO_RECORDER_MIC_MCLK           48
+
+// ES7210 control bus. LilyGO's official T-Embed mic example uses SDA=IO18 and SCL=IO8.
+// The ES7210 must be configured over I2C before useful mic audio appears on I2S.
+#define AUDIO_RECORDER_USE_ES7210_I2C       1
+#define AUDIO_RECORDER_I2C_SDA             18
+#define AUDIO_RECORDER_I2C_SCL              8
+#define AUDIO_RECORDER_ES7210_ADDR       0x40
+
+// ES7210 mic gain values use the same scale as LilyGO's mic example.
+// 0 = 0dB, 8 = 24dB, 10 = 30dB, 14 = 37.5dB.
+#define AUDIO_RECORDER_ES7210_GAIN_MIC12   14
+#define AUDIO_RECORDER_ES7210_GAIN_MIC34   14
+
+// Set to 1 to require an ES7210 I2C control/probe hit before recording.
+// Set to 0 to continue anyway and try raw I2S RX using the mic pins.
+// Useful while testing because the pinout lists the I2S mic pins but may not
+// expose the ES7210 control bus on the same pins we first tested.
+#define AUDIO_RECORDER_REQUIRE_ES7210_I2C   1
+
+// RAM recorder settings. Keep this small while testing the mic path.
+#define AUDIO_RECORD_SAMPLE_RATE        16000
+#define AUDIO_RECORD_SECONDS                5
+
+// If full clip allocation fails, the recorder can fall back to a shorter
+// RAM buffer instead of showing "No audio buffer". This keeps LVGL stable.
+#define AUDIO_RECORD_ALLOW_SHORT_BUFFER     1
+#define AUDIO_RECORD_BUFFER_SAFETY_BYTES 24576
+
+#define AUDIO_RECORD_PLAYBACK_VOLUME_PERCENT 35
+
+// Playback speed percent for Sound Recorder.
+// 100 = normal 16 kHz playback. If recordings sound slow-motion,
+// try 200 first. Lower/higher values are useful while tuning the ES7210/I2S path.
+#define AUDIO_RECORD_PLAYBACK_SPEED_PERCENT 200
+
+// Manual Stop button tuning for Sound Recorder.
+// Poll = how often the blocking recorder loop checks the encoder button.
+// Guard = how long to ignore the leftover Record/Stop click after a manual stop,
+// so the button does not immediately start a new recording from bounce/release.
+#define AUDIO_RECORD_STOP_POLL_MS            20
+#define AUDIO_RECORD_STOP_RESTART_GUARD_MS  900
 
 // ─── SD Card (HSPI — separate bus from TFT) ─────────────────────
 #define SD_CS    39
@@ -129,18 +206,122 @@
 #define LED_COLOR_BLE     {  0,   0, 220 }
 #define LED_COLOR_MISC    { 220, 220,   0 }
 #define LED_COLOR_GPS     { 160,   0, 200 }
+#define LED_COLOR_AUDIO   { 100,   0, 180 }
 
-// ─── Splash Screen ──────────────────────────────────────────────
-#define SPLASH_DURATION_MS  3000
-
-// ─── Power-off Hold ─────────────────────────────────────────────
-#define POWER_HOLD_MS  5000
+// ─── Power Off Menu ─────────────────────────────────────────────
+// Software power-off is now triggered from Misc Tools > Power Off.
+// GPIO0/encoder long-hold shutdown was removed because GPIO0 is also
+// the ESP32-S3 boot/download strap pin used during flashing.
+#define POWER_OFF_DELAY_MS  1200
 
 // ─── WiFi Scanner ───────────────────────────────────────────────
 // WiFi scan time is session-adjustable from Misc > Scan Defaults.
-// It resets to this value after reboot.
 #define WIFI_SCAN_SECS    10
 #define MAX_WIFI_RESULTS  30
+
+// ─── Connect to AP Tool ────────────────────────────────────────
+// Runtime tool: WiFi Tools > Connect to AP.
+// Scans nearby APs, lets you select one, opens the LVGL keyboard for
+// the password, then keeps the station connection alive for future
+// safe LAN tools such as gateway checks, simple port checks, or SSH banners.
+#define CONNECT_AP_TIMEOUT_MS     15000
+#define CONNECT_AP_KEEP_RESULTS       1
+
+// Connected Status page internet reachability check.
+// Uses a lightweight TCP connection test after WiFi connects.
+// Set to 0 if you want faster status-page loading with no internet check.
+#define CONNECT_AP_INTERNET_CHECK_ENABLED     1
+#define CONNECT_AP_INTERNET_CHECK_HOST        "1.1.1.1"
+#define CONNECT_AP_INTERNET_CHECK_PORT        80
+#define CONNECT_AP_INTERNET_CHECK_TIMEOUT_MS  1200
+
+// ─── Gateway Info / Router Check Tool ──────────────────────────
+// Connected-only WiFi tool. It appears dimmed in WiFi Tools until
+// Rogue Radar is connected to an AP, then opens a router-focused page
+// with a Refresh button. Uses lightweight TCP checks only.
+#define GATEWAY_INFO_ENABLED                 1
+#define GATEWAY_INFO_TCP_TIMEOUT_MS        450
+// Horizontal scrolling speed for the one-line Gateway Info status banner.
+// Higher = faster marquee scroll. Lower = slower/easier to read.
+// Horizontal status marquee speed. Higher = faster, lower = slower.
+#define GATEWAY_INFO_STATUS_SCROLL_SPEED   28
+#define GATEWAY_INFO_PORT_COUNT              3
+static const uint16_t GATEWAY_INFO_PORTS[GATEWAY_INFO_PORT_COUNT] = {
+    80,   // HTTP/router admin
+    443,  // HTTPS/router admin
+    53    // DNS/router service
+};
+
+// Top-bar WiFi connection icon.
+// Shows only while the device is connected to an AP.
+// Leave TOPBAR_WIFI_ICON_CUSTOM_TEXT blank to use LVGL's built-in WiFi symbol.
+// Put custom text here if your font/theme ever needs a different marker.
+#define TOPBAR_WIFI_ICON_ENABLED          1
+#define TOPBAR_WIFI_ICON_CUSTOM_TEXT      ""
+
+// ─── LAN Host Discovery Tool ───────────────────────────────────
+// Connected-only WiFi tool. It appears dimmed in WiFi Tools until
+// Rogue Radar is connected to an AP.
+// Uses lightweight TCP connection probes on the current LAN subnet.
+// The scan range is built from WiFi.localIP() + WiFi.subnetMask(),
+// then capped by LAN_DISCOVERY_START_HOST and LAN_DISCOVERY_MAX_HOSTS.
+// This is safe host discovery only; it does not run service scripts,
+// brute force, exploit checks, or deep port scans.
+#define LAN_DISCOVERY_ENABLED              1
+#define LAN_DISCOVERY_START_HOST           1
+#define LAN_DISCOVERY_MAX_HOSTS          254
+#define LAN_DISCOVERY_MAX_RESULTS         40
+#define LAN_DISCOVERY_TCP_TIMEOUT_MS      85
+#define LAN_DISCOVERY_SHOW_CLOSED_SUMMARY  1
+
+// Rainbow APA102 spinner while LAN Host Discovery is actively probing.
+// This gives visible feedback because TCP probes can make the UI feel paused.
+#define LAN_DISCOVERY_RAINBOW_LED_ENABLED   1
+#define LAN_DISCOVERY_RAINBOW_LED_DELAY_MS 70
+
+// Dedicated LAN Discovery completion sound.
+// Different from connect/disconnect and detector chirps.
+// Follows Misc > Menu Sounds ON/OFF, and can also be disabled here.
+#define LAN_DISCOVERY_DONE_SOUND_ENABLED   1
+#define LAN_DISCOVERY_DONE_SOUND_VOLUME_PERCENT  16
+
+#define LAN_DISCOVERY_PORT_COUNT           4
+static const uint16_t LAN_DISCOVERY_PORTS[LAN_DISCOVERY_PORT_COUNT] = {
+    80,   // HTTP / router/admin pages
+    443,  // HTTPS
+    22,   // SSH
+    53    // DNS/router
+};
+
+
+// Dedicated Connect to AP event sounds.
+// These use the same small I2S speaker path as menu feedback, but with
+// a different tone pattern so connection/disconnect events stand out.
+// They follow Misc > Menu Sounds ON/OFF because they are UI feedback sounds.
+#define CONNECT_AP_EVENT_SOUNDS_ENABLED     1
+#define CONNECT_AP_EVENT_VOLUME_PERCENT    14
+
+// Save successful AP passwords in ESP32 NVS so selecting the same
+// secured AP later can reconnect without opening the keyboard again.
+#define CONNECT_AP_SAVE_PASSWORDS     1
+#define CONNECT_AP_SAVED_SLOT_COUNT   5
+
+// Optional hard-coded fallback credentials.
+// Leave SSID/password entries blank if you do not want to use this.
+// These are checked only if no saved NVS password is found.
+#define CONNECT_AP_USE_CONFIG_CREDENTIALS  1
+#define CONNECT_AP_CONFIG_CRED_COUNT       3
+static const char* CONNECT_AP_CONFIG_SSIDS[CONNECT_AP_CONFIG_CRED_COUNT] = {
+    "",
+    "",
+    ""
+};
+static const char* CONNECT_AP_CONFIG_PASSWORDS[CONNECT_AP_CONFIG_CRED_COUNT] = {
+    "",
+    "",
+    ""
+};
+
 
 // ─── Packet Monitor ─────────────────────────────────────────────
 // Display-only packet monitor inspired by https://github.com/spacehuhn/PacketMonitor32.
@@ -159,10 +340,29 @@
 #define PACKET_MONITOR_HOP_PRESET_3_MS   1000
 #define PACKET_MONITOR_HOP_PRESET_4_MS   1500
 
+
+// ─── Station Scanner ───────────────────────────────────────────
+// Passive client/station scanner inspired by GhostESP station scan logic.
+// Runtime tool: WiFi Tools > Station Scanner.
+#define MAX_STATION_RESULTS        30
+#define MAX_STATION_APS            20
+#define STATION_SCAN_HOP_MS       250
+#define STATION_SCAN_MAX_CHANNEL   13
+
+// ─── WiFi Mapper ───────────────────────────────────────────────
+// Visual WiFi packet map inspired by Raymond-exe/wifi-mapper.
+// Runtime tool: WiFi Tools > WiFi Mapper.
+#define WIFI_MAPPER_MAX_POINTS       80
+#define WIFI_MAPPER_RSSI_MIN        -90
+#define WIFI_MAPPER_RSSI_MAX        -10
+#define WIFI_MAPPER_HOP_SLOW_MS     500
+#define WIFI_MAPPER_HOP_NORMAL_MS   250
+#define WIFI_MAPPER_HOP_FAST_MS     120
+#define WIFI_MAPPER_DEFAULT_SPEED     1   // 0=Slow, 1=Normal, 2=Fast
+
 // ─── Deauth Detector ────────────────────────────────────────────
 #define MAX_DEAUTH        12
-// Channel hop delay is session-adjustable from Misc > Scan Defaults.
-// It resets to this value after reboot.
+// Channel hop delay is adjustable from Misc > Scan Defaults.
 #define DEAUTH_HOP_MS    200
 
 // ─── PineAP Hunter ──────────────────────────────────────────────
@@ -183,6 +383,23 @@
 #define FLOCK_KEYWORD_2  "penguin"
 #define FLOCK_KEYWORD_3  "pigvision"
 #define FLOCK_KEYWORD_4  "fs ext battery"
+#define FLOCK_KEYWORD_5  "FS_"
+#define FLOCK_KEYWORD_6  "FlockOS"
+#define FLOCK_KEYWORD_7  "flocksafety"
+#define FLOCK_KEYWORD_8  "FlockCam"
+#define FLOCK_KEYWORD_9  "FS-"
+
+// Stronger SSID/name pattern check for IDs like Flock-1A2B.
+// This is more specific than the generic "flock" keyword.
+#define FLOCK_STRICT_ID_PATTERN_ENABLED  1
+#define FLOCK_STRICT_ID_MIN_HEX_CHARS    4
+
+// Adaptive WiFi dwell for Flock sniffing.
+// Channels 1, 6, and 11 get a longer dwell because many 2.4GHz networks
+// sit there. Other channels use a shorter dwell for quicker coverage.
+#define FLOCK_ADAPTIVE_DWELL_ENABLED     1
+#define FLOCK_DWELL_MAIN_MS            500
+#define FLOCK_DWELL_OTHER_MS           180
 
 // 1 = dedupe Flock hits mainly by source MAC, 0 = dedupe by SSID only.
 #define FLOCK_DEDUPE_BY_MAC  1
@@ -190,9 +407,17 @@
 // 1 = show source MAC under each Flock hit row, 0 = compact one-line rows.
 #define FLOCK_SHOW_SOURCE_MAC  1
 
+// ─── Flock Upgrade Pass 1 ─────────────────────────────────────
+// Adds expanded MAC/OUI matching, BLE manufacturer ID matching,
+// confidence labels, method labels, and richer hit details.
+#define FLOCK_MAC_PREFIX_MATCH_ENABLED      1
+#define FLOCK_BLE_MFR_ID_MATCH_ENABLED      1
+#define FLOCK_BLE_MFR_ID_XUNTONG       0x09C8
+#define FLOCK_HYBRID_SHOW_HEARD_COUNT       1
+
 // ─── Flock Hybrid Scanner ──────────────────────────────────────
 // Combined BLE + WiFi scanner. It runs BLE first, then WiFi sniffing,
-// and merges both hit types into one list. Values reset after reboot.
+// and merges both hit types into one list.
 #define MAX_FLOCK_HYBRID_HITS      30
 #define FLOCK_HYBRID_BLE_SECS       8
 #define FLOCK_HYBRID_WIFI_SECS     10
@@ -200,7 +425,7 @@
 #define FLOCK_HYBRID_PRESET_DEFAULT  1   // 0=Quick, 1=Balanced, 2=Wide, 3=Deep, 4=Patient
 
 // Presets used by Misc > Scan Defaults > Flock Hybrid.
-// Each click cycles to the next set. These reset after reboot.
+// Each click cycles to the next set. 
 #define FLOCK_HYBRID_PRESET_0_NAME  "Quick"
 #define FLOCK_HYBRID_PRESET_0_BLE    5
 #define FLOCK_HYBRID_PRESET_0_WIFI   6
@@ -235,7 +460,6 @@
 // ─── BLE Scanner ────────────────────────────────────────────────
 #define MAX_BLE_RESULTS   30
 // BLE scan time is session-adjustable from Misc > Scan Defaults.
-// It resets to this value after reboot.
 #define BLE_SCAN_SECS      8
 
 
@@ -284,7 +508,6 @@ static const char* SKIMMER_NAME_MATCHES[SKIMMER_NAME_MATCH_COUNT] = {
 
 // ─── nyanBOX Detector ─────────────────────────────────────────── (Credit to https://github.com/jbohack/nyanBOX)
 // BLE-only detector for nyanBOX / Nyan Devices badges.
-// Scan values reset after reboot and do not use Preferences.
 #define MAX_NYANBOX_RESULTS       30
 #define NYANBOX_SCAN_SECS          8
 #define NYANBOX_LOCATE_SCAN_SECS   2
@@ -292,12 +515,27 @@ static const char* SKIMMER_NAME_MATCHES[SKIMMER_NAME_MATCH_COUNT] = {
 
 // ─── Axon Detector ────────────────────────────────────────────── (Credit to https://github.com/jbohack/nyanBOX)
 // BLE-only detector for Axon-style BLE devices using the configured MAC/OUI prefix.
-// Scan values reset after reboot and do not use Preferences.
 #define MAX_AXON_RESULTS          30
 #define AXON_SCAN_SECS             8
 #define AXON_LOCATE_SCAN_SECS      2
 #define AXON_MAC_PREFIX           "00:25:df"
 #define AXON_SHOW_FULL_MAC         1
+
+// ─── Raven Detector ────────────────────────────────────────────
+// BLE-only detector for Raven / SoundThinking-style gunshot sensors.
+// Uses service UUID patterns from 0xXyc/flock-you-wifi-recon.
+// Runtime tool: BLE Tools > Raven Detector.
+#define MAX_RAVEN_RESULTS         30
+#define RAVEN_SCAN_SECS            8
+#define RAVEN_SHOW_FULL_MAC        1
+#define RAVEN_DEVICE_INFO_SERVICE "0000180a-0000-1000-8000-00805f9b34fb"
+#define RAVEN_GPS_SERVICE         "00003100-0000-1000-8000-00805f9b34fb"
+#define RAVEN_POWER_SERVICE       "00003200-0000-1000-8000-00805f9b34fb"
+#define RAVEN_NETWORK_SERVICE     "00003300-0000-1000-8000-00805f9b34fb"
+#define RAVEN_UPLOAD_SERVICE      "00003400-0000-1000-8000-00805f9b34fb"
+#define RAVEN_ERROR_SERVICE       "00003500-0000-1000-8000-00805f9b34fb"
+#define RAVEN_OLD_HEALTH_SERVICE  "00001809-0000-1000-8000-00805f9b34fb"
+#define RAVEN_OLD_LOCATION_SERVICE "00001819-0000-1000-8000-00805f9b34fb"
 
 // ─── Flipper Detector ───────────────────────────────────────────
 // Name matching stays enabled, and UUID detection adds the GhostESP-style
