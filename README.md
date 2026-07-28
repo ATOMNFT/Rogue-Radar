@@ -9,13 +9,14 @@
 
 | Version | Status | Notes |
 |--------|--------|-------|
+| v1.0.5 | Stable | Adds Smart Charger Monitor, expands Audio Tools with SD WAV saving, on-device recordings browser, selected-file playback, on-device delete, improved Sound Recorder SD diagnostics, and Sound Recorder UI/stability cleanup |
 | v1.0.4 | Stable | Adds Audio Tools with Sound Recorder, Connect to AP, LAN Host Discovery, Gateway Info, WiFi Mapper, Station Scanner, Raven Detector, improved Flock detection, menu-based Power Off, and general UI/stability cleanup |
 | v1.0.3 | Stable | Adds battery display, adds Menu Feedback Volume and Alert Sound Volume controls, adds Deauth Stats, expands Pwnagotchi Watch details, improves Device Info and other features, and fixes theme focus styling |
 | v1.0.2 | Stable | Adds Packet Monitor with live graph and hop presets, Flock Hybrid, nyanBOX/Axon/Tesla detectors, improved AirTag/Flipper/Skimmer detection, extra themes, and menu cleanup |
 | v1.0.1 | Stable | Adds display/LED dimming controls, scan defaults, rotation toggle, audio feedback, and improved Flock detection |
 | v1.0.0 | Stable | Initial public release of the Rogue Radar Firmware |
 
-> **Latest Release:** `v1.0.4` — Rogue Radar Firmware
+> **Latest Release:** `v1.0.5` — Rogue Radar Firmware
 ---
 
 ## Overview
