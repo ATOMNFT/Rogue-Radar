@@ -1,5 +1,5 @@
 // ============================================================
-//  config.h — Rogue Radar T-Embed v1.0.4
+//  config.h — Rogue Radar T-Embed v1.0.5
 //  Edit this file to customise pins, limits, themes, and behaviour.
 //  Do not edit rogue-radar.ino unless you know what you're doing.
 // ============================================================
@@ -7,7 +7,7 @@
 
 // ─── Device Name / Firmware Version ─────────────────────────────
 #define DEVICE_NAME       "Rogue Radar"
-#define FIRMWARE_VERSION  "RR v1.0.4"
+#define FIRMWARE_VERSION  "RR v1.0.5"
 
 // ─── Device Type ─────────────────────────────
 #define DEVICE_TYPE       "T-Embed Non CC1101"
@@ -188,6 +188,17 @@
 // so the button does not immediately start a new recording from bounce/release.
 #define AUDIO_RECORD_STOP_POLL_MS            20
 #define AUDIO_RECORD_STOP_RESTART_GUARD_MS  900
+
+
+// SD WAV save / file browser settings for Sound Recorder.
+// Saves recordings as mono 16-bit WAV files. If folder save fails,
+// root fallback helps diagnose whether the issue is folder path or file write.
+#define AUDIO_RECORD_SD_SAVE_ENABLED      1
+#define AUDIO_RECORD_SD_FOLDER            "/rr_audio"
+#define AUDIO_RECORD_SD_PREFIX            "REC"
+#define AUDIO_RECORD_SD_MAX_FILES         24
+#define AUDIO_RECORD_SD_ROOT_FALLBACK     1
+#define AUDIO_RECORD_SD_DEBUG_STATUS      1
 
 // ─── SD Card (HSPI — separate bus from TFT) ─────────────────────
 #define SD_CS    39
@@ -536,6 +547,32 @@ static const char* SKIMMER_NAME_MATCHES[SKIMMER_NAME_MATCH_COUNT] = {
 #define RAVEN_ERROR_SERVICE       "00003500-0000-1000-8000-00805f9b34fb"
 #define RAVEN_OLD_HEALTH_SERVICE  "00001809-0000-1000-8000-00805f9b34fb"
 #define RAVEN_OLD_LOCATION_SERVICE "00001819-0000-1000-8000-00805f9b34fb"
+
+
+// ─── Smart Charger Monitor ─────────────────────────────────────
+// BLE Tools > Smart Charger Monitor.
+// First-pass passive BLE detector for car USB / cigarette-lighter smart chargers.
+// It does not connect, subscribe, or write to the charger yet.
+// Matches by advertised name, optional MAC prefix, and advertised FFF0 service UUID when present.
+#define MAX_CHARGER_RESULTS        20
+#define CHARGER_SCAN_SECS           8
+#define CHARGER_SHOW_FULL_MAC       1
+#define CHARGER_NAME_MATCH_COUNT    2
+
+#define CHARGER_SERVICE_UUID       "0000fff0-0000-1000-8000-00805f9b34fb"
+#define CHARGER_NOTIFY_FFF4        "0000fff4-0000-1000-8000-00805f9b34fb"
+#define CHARGER_NOTIFY_FFF6        "0000fff6-0000-1000-8000-00805f9b34fb"
+#define CHARGER_NOTIFY_FFF7        "0000fff7-0000-1000-8000-00805f9b34fb"
+#define CHARGER_NOTIFY_FFF8        "0000fff8-0000-1000-8000-00805f9b34fb"
+
+// Optional known MAC/OUI prefix from the nRF Connect sample logs.
+// Leave blank ("") to disable MAC-prefix matching.
+#define CHARGER_MAC_PREFIX         "A1:5A"
+
+static const char* CHARGER_NAME_MATCHES[CHARGER_NAME_MATCH_COUNT] = {
+    "Smart Charger",
+    "charger"
+};
 
 // ─── Flipper Detector ───────────────────────────────────────────
 // Name matching stays enabled, and UUID detection adds the GhostESP-style

@@ -1,5 +1,5 @@
 // ============================================================
-//  Rogue Radar v1.0.4 Firmware
+//  Rogue Radar v1.0.5 Firmware
 //  Check config.h for adjustable settings
 // ============================================================
 //
@@ -7,7 +7,8 @@
 //  WiFi Tools: Network Scanner | Connect to AP | LAN Host Discovery (simple) | Gateway Info | Station Scanner | Deauth Detector | Channel Analyzer 
 //              Packet Monitor | WiFi Mapper | PineAP Hunter | Pwnagotchi Watch | Flock Detector | Flock Hybrid
 //  BLE Tools:  BLE Scanner | AirTag Detector | Flipper Zero Detector | Tesla BLE Detector
-//              nyanBOX Detector | Axon Detector | Raven Detector | Skimmer Detector | Meta Detector
+//              nyanBOX Detector | Axon Detector | Raven Detector | Smart Charger Monitor
+//              Skimmer Detector | Meta Detector
 //  GPS Tools:  GPS Stats | Wiggle Wars
 //  Audio Tools: Sound Recorder
 //  Misc Tools: Device Info | SD Update | Brightness ADJ | Themes | Dimming | Scan Times | LEDs | Detection Sounds | Menu Sounds | Rotation | Power Off
@@ -54,12 +55,33 @@
 #include <Arduino.h>
 #include "config.h"
 
+
 #ifndef AUDIO_RECORD_STOP_POLL_MS
 #define AUDIO_RECORD_STOP_POLL_MS 20
 #endif
 
 #ifndef AUDIO_RECORD_STOP_RESTART_GUARD_MS
 #define AUDIO_RECORD_STOP_RESTART_GUARD_MS 900
+#endif
+
+
+#ifndef AUDIO_RECORD_SD_SAVE_ENABLED
+#define AUDIO_RECORD_SD_SAVE_ENABLED 1
+#endif
+#ifndef AUDIO_RECORD_SD_FOLDER
+#define AUDIO_RECORD_SD_FOLDER "/rr_audio"
+#endif
+#ifndef AUDIO_RECORD_SD_PREFIX
+#define AUDIO_RECORD_SD_PREFIX "REC"
+#endif
+#ifndef AUDIO_RECORD_SD_MAX_FILES
+#define AUDIO_RECORD_SD_MAX_FILES 24
+#endif
+#ifndef AUDIO_RECORD_SD_ROOT_FALLBACK
+#define AUDIO_RECORD_SD_ROOT_FALLBACK 1
+#endif
+#ifndef AUDIO_RECORD_SD_DEBUG_STATUS
+#define AUDIO_RECORD_SD_DEBUG_STATUS 1
 #endif
 
 #include <WiFi.h>
@@ -829,6 +851,24 @@ static RavenEntry ravenEntries[MAX_RAVEN_RESULTS];
 static int        ravenEntryCount = 0;
 
 
+// Smart Charger Monitor entries. First pass is passive only: no GATT connection,
+// no notify subscription, and no writes. It matches the charger by advertised
+// name, optional MAC prefix, and FFF0 service UUID if the UUID is advertised.
+struct SmartChargerEntry {
+    char     name[33];
+    char     mac[18];
+    int8_t   rssi;
+    char     matchMethod[24];
+    char     advUuid[41];
+    char     mfgPreview[33];
+    uint8_t  confidence;  // 3=High, 2=Medium, 1=Low
+    uint32_t lastSeen;
+};
+
+static SmartChargerEntry chargerEntries[MAX_CHARGER_RESULTS];
+static int               chargerEntryCount = 0;
+
+
 // ════════════════════════════════════════════════════════════════
 //  FORWARD DECLARATIONS
 // ════════════════════════════════════════════════════════════════
@@ -869,6 +909,7 @@ void createGPSStats();
 void createWiggleWars();
 void createAudioMenu();
 void createSoundRecorder();
+static void createSoundRecorderFileMenu();
 
 // Reusable Rogue Radar LVGL keyboard.
 // Callback receives (text, true) on OK and ("", false) on Back/Cancel.
@@ -893,6 +934,8 @@ void createAxonDetail(int idx);
 void createAxonLocate(int idx);
 void createRavenDetector();
 void createRavenDetail(int idx);
+void createSmartChargerMonitor();
+void createSmartChargerDetail(int idx);
 void createTeslaDetector();
 void createTeslaDetail(int idx);
 void createSkimmerScanner();
@@ -3564,7 +3607,6 @@ void createBrightnessControl() {
 }
 
 
-
 // ════════════════════════════════════════════════════════════════
 //  MISC TOOL 3A – ALERT SOUND VOLUME
 //
@@ -3989,6 +4031,25 @@ static lv_obj_t *soundRecorderRecordBtn = nullptr;
 static lv_obj_t *soundRecorderPlayBtn   = nullptr;
 static lv_obj_t *soundRecorderRecordBtnLbl = nullptr;
 static lv_obj_t *soundRecorderPlayBtnLbl   = nullptr;
+static lv_obj_t *soundRecorderFilesInfoLbl = nullptr;
+static lv_obj_t *soundRecorderFilesList    = nullptr;
+static lv_obj_t *soundRecorderFileMenuScreen = nullptr;
+static lv_obj_t *soundRecorderRecordPanel  = nullptr;
+
+// One-shot rebuild helper used by the SD file action popup.
+// Rebuilding from a timer keeps us from deleting/recreating the active
+// Sound Recorder screen while LVGL is still inside a button/list callback.
+static lv_timer_t *soundRecorderRebuildTimer = nullptr;
+
+// SD recording browser state.
+// File buttons store only the visible filename, while these arrays keep the
+// full path used by the playback callback.
+static char soundRecorderFilePaths[AUDIO_RECORD_SD_MAX_FILES][80];
+static char soundRecorderFileNames[AUDIO_RECORD_SD_MAX_FILES][32];
+static int  soundRecorderFileCount = 0;
+static int  soundRecorderSelectedFile = -1;
+static char soundRecorderSelectedPath[80] = {0};
+static char soundRecorderSelectedName[32] = {0};
 
 static int16_t *soundRecorderBuffer = nullptr;
 static size_t   soundRecorderSamples = 0;
@@ -4005,6 +4066,15 @@ static volatile bool soundRecorderStopRequested = false;
 // not immediately start again.
 static volatile bool soundRecorderIgnoreNextRecordClick = false;
 static volatile uint32_t soundRecorderIgnoreRecordClickUntilMs = 0;
+
+static void soundRecorderRefreshFileList();
+static bool soundRecorderPlayWavFile(const char *path, const char *name);
+static bool soundRecorderDeleteSelectedFile();
+static void cb_soundRecorderFileMenuBack(lv_event_t *e);
+static void cb_soundRecorderFileMenuPlay(lv_event_t *e);
+static void cb_soundRecorderFileMenuDelete(lv_event_t *e);
+static void soundRecorderRebuildTimerCb(lv_timer_t *timer);
+static void soundRecorderQueueRebuild(uint32_t delayMs = 30);
 
 static void soundRecorderSetStatus(const char *text, uint32_t color) {
     if (!soundRecorderStatusLbl) return;
@@ -4105,6 +4175,594 @@ static bool soundRecorderAllocBuffer() {
     soundRecorderCapacitySamples = bytesToAlloc / sizeof(int16_t);
     memset(soundRecorderBuffer, 0, bytesToAlloc);
     return true;
+}
+
+
+static void soundRecorderSetFilesText(const char *text) {
+    if (!soundRecorderFilesInfoLbl) return;
+    lv_label_set_text(soundRecorderFilesInfoLbl, text ? text : "");
+    lv_refr_now(lvDisp);
+}
+
+static void soundRecorderSelectFile(int idx) {
+    if (idx < 0 || idx >= soundRecorderFileCount) return;
+    soundRecorderSelectedFile = idx;
+    strncpy(soundRecorderSelectedPath, soundRecorderFilePaths[idx], sizeof(soundRecorderSelectedPath) - 1);
+    soundRecorderSelectedPath[sizeof(soundRecorderSelectedPath) - 1] = '\0';
+    strncpy(soundRecorderSelectedName, soundRecorderFileNames[idx], sizeof(soundRecorderSelectedName) - 1);
+    soundRecorderSelectedName[sizeof(soundRecorderSelectedName) - 1] = '\0';
+
+    char status[64];
+    snprintf(status, sizeof(status), LV_SYMBOL_PLAY "  %s", soundRecorderSelectedName);
+    soundRecorderSetStatus(status, TH.warn);
+}
+
+static void cb_soundRecorderFileClicked(lv_event_t *e) {
+    resetInactivityTimer();
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    soundRecorderSelectFile(idx);
+
+    // Stable file actions:
+    // Earlier popup-based builds could reboot on some ESP32-S3/LVGL setups
+    // when Back/Delete changed focus or rebuilt UI objects from inside the
+    // popup callback. Keep actions on the existing Sound Recorder page instead:
+    // select a file, then use Play to play it or Delete to remove it.
+    if (soundRecorderRecordBtnLbl) lv_label_set_text(soundRecorderRecordBtnLbl, "Delete");
+    if (soundRecorderPlayBtnLbl)   lv_label_set_text(soundRecorderPlayBtnLbl, LV_SYMBOL_PLAY "  Play");
+    soundRecorderSetFilesText("Selected. Play or Delete.");
+}
+
+static bool soundRecorderEnsureSD(char *diag, size_t diagLen) {
+#if AUDIO_RECORD_SD_SAVE_ENABLED
+    if (diag && diagLen) snprintf(diag, diagLen, "Mounting SD...");
+    if (!SD.begin(SD_CS, sdSPI)) {
+        if (diag && diagLen) snprintf(diag, diagLen, "SD mount failed");
+        return false;
+    }
+    if (diag && diagLen) snprintf(diag, diagLen, "SD mounted");
+    return true;
+#else
+    if (diag && diagLen) snprintf(diag, diagLen, "SD save disabled");
+    return false;
+#endif
+}
+
+static void soundRecorderWriteLE16(File &f, uint16_t v) {
+    uint8_t b[2] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF) };
+    f.write(b, 2);
+}
+
+static void soundRecorderWriteLE32(File &f, uint32_t v) {
+    uint8_t b[4] = {
+        (uint8_t)(v & 0xFF),
+        (uint8_t)((v >> 8) & 0xFF),
+        (uint8_t)((v >> 16) & 0xFF),
+        (uint8_t)((v >> 24) & 0xFF)
+    };
+    f.write(b, 4);
+}
+
+static bool soundRecorderWriteWavFile(const char *path, char *diag, size_t diagLen) {
+#if AUDIO_RECORD_SD_SAVE_ENABLED
+    if (!path || !soundRecorderBuffer || soundRecorderSamples == 0) {
+        if (diag && diagLen) snprintf(diag, diagLen, "No audio data");
+        return false;
+    }
+
+    if (diag && diagLen) snprintf(diag, diagLen, "Opening %s", path);
+    soundRecorderSetFilesText(diag);
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) {
+        if (diag && diagLen) snprintf(diag, diagLen, "Open failed:\n%s", path);
+        return false;
+    }
+
+    const uint32_t dataBytes = (uint32_t)(soundRecorderSamples * sizeof(int16_t));
+    const uint32_t byteRate = (uint32_t)AUDIO_RECORD_SAMPLE_RATE * 1U * 16U / 8U;
+    const uint16_t blockAlign = 1U * 16U / 8U;
+
+    f.write((const uint8_t *)"RIFF", 4);
+    soundRecorderWriteLE32(f, 36U + dataBytes);
+    f.write((const uint8_t *)"WAVE", 4);
+    f.write((const uint8_t *)"fmt ", 4);
+    soundRecorderWriteLE32(f, 16);       // PCM fmt chunk size
+    soundRecorderWriteLE16(f, 1);        // PCM
+    soundRecorderWriteLE16(f, 1);        // mono
+    soundRecorderWriteLE32(f, AUDIO_RECORD_SAMPLE_RATE);
+    soundRecorderWriteLE32(f, byteRate);
+    soundRecorderWriteLE16(f, blockAlign);
+    soundRecorderWriteLE16(f, 16);       // 16-bit
+    f.write((const uint8_t *)"data", 4);
+    soundRecorderWriteLE32(f, dataBytes);
+
+    size_t bytesWritten = f.write((const uint8_t *)soundRecorderBuffer, dataBytes);
+    f.flush();
+    size_t finalSize = f.size();
+    f.close();
+
+    const size_t expectedSize = (size_t)dataBytes + 44U;
+    if (bytesWritten != dataBytes || finalSize < expectedSize) {
+        if (diag && diagLen) {
+            snprintf(diag, diagLen,
+                     "Write failed:\n%s\nWrote %u/%u\nSize %u/%u",
+                     path,
+                     (unsigned)bytesWritten,
+                     (unsigned)dataBytes,
+                     (unsigned)finalSize,
+                     (unsigned)expectedSize);
+        }
+        return false;
+    }
+
+    if (diag && diagLen) {
+        snprintf(diag, diagLen, "Saved:\n%s\n%u bytes", path, (unsigned)finalSize);
+    }
+    return true;
+#else
+    (void)path; (void)diag; (void)diagLen;
+    return false;
+#endif
+}
+
+static bool soundRecorderMakeFolder(char *diag, size_t diagLen) {
+#if AUDIO_RECORD_SD_SAVE_ENABLED
+    if (SD.exists(AUDIO_RECORD_SD_FOLDER)) {
+        if (diag && diagLen) snprintf(diag, diagLen, "Folder OK:\n%s", AUDIO_RECORD_SD_FOLDER);
+        return true;
+    }
+    if (diag && diagLen) snprintf(diag, diagLen, "Creating folder:\n%s", AUDIO_RECORD_SD_FOLDER);
+    soundRecorderSetFilesText(diag);
+    if (!SD.mkdir(AUDIO_RECORD_SD_FOLDER)) {
+        if (diag && diagLen) snprintf(diag, diagLen, "Folder create failed:\n%s", AUDIO_RECORD_SD_FOLDER);
+        return false;
+    }
+    if (diag && diagLen) snprintf(diag, diagLen, "Folder created:\n%s", AUDIO_RECORD_SD_FOLDER);
+    return true;
+#else
+    (void)diag; (void)diagLen;
+    return false;
+#endif
+}
+
+static bool soundRecorderNextPath(char *path, size_t pathLen, bool inFolder) {
+#if AUDIO_RECORD_SD_SAVE_ENABLED
+    if (!path || pathLen == 0) return false;
+    for (int i = 1; i <= 9999; i++) {
+        if (inFolder) {
+            snprintf(path, pathLen, "%s/%s%04d.WAV", AUDIO_RECORD_SD_FOLDER, AUDIO_RECORD_SD_PREFIX, i);
+        } else {
+            snprintf(path, pathLen, "/%s%04d.WAV", AUDIO_RECORD_SD_PREFIX, i);
+        }
+        if (!SD.exists(path)) return true;
+    }
+#endif
+    return false;
+}
+
+static bool soundRecorderSaveToSD() {
+#if AUDIO_RECORD_SD_SAVE_ENABLED
+    char diag[192];
+    char path[80];
+
+    if (!soundRecorderEnsureSD(diag, sizeof(diag))) {
+        soundRecorderSetFilesText(diag);
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  SD mount failed", TH.alert);
+        return false;
+    }
+    soundRecorderSetFilesText(diag);
+
+    bool folderReady = soundRecorderMakeFolder(diag, sizeof(diag));
+    soundRecorderSetFilesText(diag);
+
+    if (folderReady && soundRecorderNextPath(path, sizeof(path), true)) {
+        if (soundRecorderWriteWavFile(path, diag, sizeof(diag))) {
+            soundRecorderSetFilesText(diag);
+            soundRecorderSetStatus(LV_SYMBOL_OK "  Saved SD", TH.success);
+            return true;
+        }
+        soundRecorderSetFilesText(diag);
+#if AUDIO_RECORD_SD_ROOT_FALLBACK
+        delay(250);
+#endif
+    }
+
+#if AUDIO_RECORD_SD_ROOT_FALLBACK
+    if (soundRecorderNextPath(path, sizeof(path), false)) {
+        snprintf(diag, sizeof(diag), "Trying root fallback...");
+        soundRecorderSetFilesText(diag);
+        if (soundRecorderWriteWavFile(path, diag, sizeof(diag))) {
+            soundRecorderSetFilesText(diag);
+            soundRecorderSetStatus(LV_SYMBOL_OK "  Saved root", TH.success);
+            return true;
+        }
+        soundRecorderSetFilesText(diag);
+    }
+#endif
+
+    soundRecorderSetStatus(LV_SYMBOL_WARNING "  SD write failed", TH.alert);
+    return false;
+#else
+    return false;
+#endif
+}
+
+static void soundRecorderRefreshFileList() {
+#if AUDIO_RECORD_SD_SAVE_ENABLED
+    soundRecorderFileCount = 0;
+
+    if (soundRecorderFilesList) {
+        lv_obj_clean(soundRecorderFilesList);
+    }
+
+    char diag[80];
+    if (!soundRecorderEnsureSD(diag, sizeof(diag))) {
+        soundRecorderSetFilesText("SD not mounted");
+        return;
+    }
+
+    File dir = SD.open(AUDIO_RECORD_SD_FOLDER);
+    if (dir && dir.isDirectory()) {
+        File entry = dir.openNextFile();
+        while (entry && soundRecorderFileCount < AUDIO_RECORD_SD_MAX_FILES) {
+            if (!entry.isDirectory()) {
+                const char *fullName = entry.name();
+                const char *name = strrchr(fullName, '/');
+                name = name ? name + 1 : fullName;
+
+                // Only show WAV files in the browser.
+                String upper = String(name);
+                upper.toUpperCase();
+                if (upper.endsWith(".WAV")) {
+                    snprintf(soundRecorderFileNames[soundRecorderFileCount],
+                             sizeof(soundRecorderFileNames[soundRecorderFileCount]),
+                             "%s", name);
+                    snprintf(soundRecorderFilePaths[soundRecorderFileCount],
+                             sizeof(soundRecorderFilePaths[soundRecorderFileCount]),
+                             "%s/%s", AUDIO_RECORD_SD_FOLDER, name);
+
+                    if (soundRecorderFilesList) {
+                        lv_obj_t *btn = lv_list_add_btn(soundRecorderFilesList, nullptr,
+                                                        soundRecorderFileNames[soundRecorderFileCount]);
+                        styleListBtn(btn);
+                        lv_obj_set_height(btn, 24);
+                        lv_obj_add_event_cb(btn, cb_soundRecorderFileClicked, LV_EVENT_CLICKED,
+                                            (void *)(intptr_t)soundRecorderFileCount);
+
+                        // Add file buttons to the encoder group as selectable items.
+                        // They are added before the bottom controls during initial page build.
+                        if (audioToolGroup) lv_group_add_obj(audioToolGroup, btn);
+                    }
+
+                    soundRecorderFileCount++;
+                }
+            }
+            entry.close();
+            entry = dir.openNextFile();
+        }
+        dir.close();
+    }
+
+    if (soundRecorderFileCount == 0) {
+        soundRecorderSelectedFile = -1;
+        soundRecorderSelectedPath[0] = '\0';
+        soundRecorderSelectedName[0] = '\0';
+        if (soundRecorderRecordBtnLbl) lv_label_set_text(soundRecorderRecordBtnLbl, LV_SYMBOL_AUDIO "  Record");
+        if (soundRecorderPlayBtnLbl)   lv_label_set_text(soundRecorderPlayBtnLbl, LV_SYMBOL_PLAY "  Play");
+        soundRecorderSetFilesText("No WAV files yet");
+    } else {
+        soundRecorderSetFilesText("");
+    }
+#else
+    soundRecorderSetFilesText("SD save disabled");
+#endif
+}
+
+
+// ─── Sound Recorder selected-file action popup ──────────────────
+// NOTE: Earlier builds opened a separate LVGL screen from inside the list
+// click callback. On some ESP32-S3/LVGL builds, deleting/loading screens
+// while the focused list button is still processing can cause a reboot.
+// This version uses an in-place popup and defers any page rebuild to a
+// one-shot timer after the event callback has returned.
+static bool soundRecorderDeleteSelectedFile() {
+#if AUDIO_RECORD_SD_SAVE_ENABLED
+    if (!soundRecorderSelectedPath[0]) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  No file selected", TH.warn);
+        return false;
+    }
+
+    char diag[80];
+    if (!soundRecorderEnsureSD(diag, sizeof(diag))) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  SD mount failed", TH.alert);
+        return false;
+    }
+
+    if (!SD.exists(soundRecorderSelectedPath)) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  File missing", TH.alert);
+        return false;
+    }
+
+    if (!SD.remove(soundRecorderSelectedPath)) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  Delete failed", TH.alert);
+        return false;
+    }
+
+    soundRecorderSetStatus(LV_SYMBOL_OK "  Deleted", TH.success);
+    soundRecorderSelectedFile = -1;
+    soundRecorderSelectedPath[0] = '\0';
+    soundRecorderSelectedName[0] = '\0';
+    return true;
+#else
+    soundRecorderSetStatus(LV_SYMBOL_WARNING "  SD save disabled", TH.warn);
+    return false;
+#endif
+}
+
+static void soundRecorderRebuildTimerCb(lv_timer_t *timer) {
+    if (timer) lv_timer_delete(timer);
+    soundRecorderRebuildTimer = nullptr;
+    createSoundRecorder();
+}
+
+static void soundRecorderQueueRebuild(uint32_t delayMs) {
+    if (soundRecorderRebuildTimer) {
+        lv_timer_delete(soundRecorderRebuildTimer);
+        soundRecorderRebuildTimer = nullptr;
+    }
+    if (delayMs < 10) delayMs = 10;
+    soundRecorderRebuildTimer = lv_timer_create(soundRecorderRebuildTimerCb, delayMs, nullptr);
+}
+
+static void cb_soundRecorderFileMenuBack(lv_event_t *e) {
+    (void)e;
+    resetInactivityTimer();
+
+    // Close the popup by rebuilding after LVGL finishes this button event.
+    soundRecorderQueueRebuild(30);
+}
+
+static void cb_soundRecorderFileMenuPlay(lv_event_t *e) {
+    (void)e;
+    resetInactivityTimer();
+
+    // Keep the popup visible while playing so the selected filename remains clear.
+    if (soundRecorderSelectedPath[0]) {
+        soundRecorderPlayWavFile(soundRecorderSelectedPath, soundRecorderSelectedName);
+    } else {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  No file selected", TH.warn);
+    }
+}
+
+static void cb_soundRecorderFileMenuDelete(lv_event_t *e) {
+    (void)e;
+    resetInactivityTimer();
+
+    // Delete from SD, then rebuild after the callback returns so the list refreshes
+    // without deleting the active screen during the current LVGL event.
+    if (soundRecorderDeleteSelectedFile()) {
+        soundRecorderQueueRebuild(250);
+    }
+}
+
+static lv_obj_t *soundRecorderMakePopupButton(lv_obj_t *parent,
+                                              int x,
+                                              int y,
+                                              int w,
+                                              int h,
+                                              const char *label,
+                                              lv_event_cb_t cb,
+                                              bool danger = false) {
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_pos(btn, x, y);
+    lv_obj_set_style_bg_color(btn, danger ? TC(stopRed) : TC(actionBg), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn, danger ? TC(alert)   : TC(actionFoc), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(btn, TC(btnPress), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(btn, danger ? TC(alert) : TC(actionBdr), LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 6, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, label);
+    lv_obj_set_style_text_color(lbl, TC(text), LV_PART_MAIN);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+static void createSoundRecorderFileMenu() {
+    if (!soundRecorderSelectedName[0] || !soundRecorderSelectedPath[0]) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  No file selected", TH.warn);
+        return;
+    }
+
+    if (!audioToolScreen) return;
+
+    // Remove any stale popup object only. Do not delete/load the whole screen here.
+    if (soundRecorderFileMenuScreen) {
+        lv_obj_delete(soundRecorderFileMenuScreen);
+        soundRecorderFileMenuScreen = nullptr;
+    }
+
+    // Full-screen dimmed popup container over the existing Sound Recorder page.
+    soundRecorderFileMenuScreen = lv_obj_create(audioToolScreen);
+    lv_obj_remove_style_all(soundRecorderFileMenuScreen);
+    lv_obj_set_size(soundRecorderFileMenuScreen, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(soundRecorderFileMenuScreen, 0, 0);
+    lv_obj_set_style_bg_color(soundRecorderFileMenuScreen, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(soundRecorderFileMenuScreen, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_add_flag(soundRecorderFileMenuScreen, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *card = lv_obj_create(soundRecorderFileMenuScreen);
+    lv_obj_set_size(card, SCREEN_W - 16, SCREEN_H - 18);
+    lv_obj_set_pos(card, 8, 9);
+    lv_obj_set_style_bg_color(card,     lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,       LV_OPA_COVER,          LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,       8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,      8, LV_PART_MAIN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_AUDIO "  Recording");
+    lv_obj_set_style_text_color(title, lv_color_hex(TH.accent), LV_PART_MAIN);
+    lv_obj_set_pos(title, 0, 0);
+
+    lv_obj_t *nameLbl = lv_label_create(card);
+    lv_label_set_text(nameLbl, soundRecorderSelectedName);
+    lv_label_set_long_mode(nameLbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(nameLbl, SCREEN_W - 40);
+    lv_obj_set_style_text_color(nameLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_set_pos(nameLbl, 0, 28);
+
+    lv_obj_t *hintLbl = lv_label_create(card);
+    lv_label_set_text(hintLbl, "Choose an action for this saved WAV.");
+    lv_label_set_long_mode(hintLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hintLbl, SCREEN_W - 40);
+    lv_obj_set_style_text_color(hintLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(hintLbl, 0, 52);
+
+    const int btnY = SCREEN_H - 43;
+    const int btnW = 88;
+    const int btnH = 27;
+
+    lv_obj_t *backBtn = soundRecorderMakePopupButton(soundRecorderFileMenuScreen, 13,  btnY, btnW, btnH,
+                                                     LV_SYMBOL_LEFT "  Back",
+                                                     cb_soundRecorderFileMenuBack, false);
+    lv_obj_t *playBtn = soundRecorderMakePopupButton(soundRecorderFileMenuScreen, 116, btnY, btnW, btnH,
+                                                     LV_SYMBOL_PLAY "  Play",
+                                                     cb_soundRecorderFileMenuPlay, false);
+    lv_obj_t *deleteBtn = soundRecorderMakePopupButton(soundRecorderFileMenuScreen, 219, btnY, btnW, btnH,
+                                                       "Delete",
+                                                       cb_soundRecorderFileMenuDelete, true);
+
+    deleteGroup(&audioToolGroup);
+    audioToolGroup = lv_group_create();
+    lv_group_add_obj(audioToolGroup, backBtn);
+    lv_group_add_obj(audioToolGroup, playBtn);
+    lv_group_add_obj(audioToolGroup, deleteBtn);
+    setGroup(audioToolGroup);
+    lv_group_focus_obj(playBtn);
+
+    setAllLEDs(MENU_COLORS[3].r, MENU_COLORS[3].g, MENU_COLORS[3].b, LED_BRIGHTNESS);
+    lv_obj_move_foreground(soundRecorderFileMenuScreen);
+    lv_refr_now(lvDisp);
+}
+
+// ─── WAV playback from SD browser ────────────────────────────────
+static uint16_t soundRecorderReadLE16(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t soundRecorderReadLE32(const uint8_t *p) {
+    return (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+static bool soundRecorderPlayWavFile(const char *path, const char *name) {
+#if AUDIO_RECORD_SD_SAVE_ENABLED
+    if (!path || !path[0]) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  No file selected", TH.warn);
+        return false;
+    }
+
+    char diag[96];
+    if (!soundRecorderEnsureSD(diag, sizeof(diag))) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  SD mount failed", TH.alert);
+        soundRecorderSetFilesText(diag);
+        return false;
+    }
+
+    File f = SD.open(path, FILE_READ);
+    if (!f) {
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  File open failed", TH.alert);
+        return false;
+    }
+
+    uint8_t header[44];
+    if (f.read(header, sizeof(header)) != sizeof(header)) {
+        f.close();
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  Bad WAV", TH.alert);
+        return false;
+    }
+
+    if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) {
+        f.close();
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  Not WAV", TH.alert);
+        return false;
+    }
+
+    uint16_t channels = soundRecorderReadLE16(header + 22);
+    uint32_t sampleRate = soundRecorderReadLE32(header + 24);
+    uint16_t bitsPerSample = soundRecorderReadLE16(header + 34);
+    uint32_t dataBytes = soundRecorderReadLE32(header + 40);
+
+    if (channels != 1 || bitsPerSample != 16 || sampleRate == 0) {
+        f.close();
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  WAV format unsupported", TH.alert);
+        return false;
+    }
+
+    if (soundReady) stopSoundDriverAfterChirp();
+    if (!ensureSoundReady(false)) {
+        f.close();
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  Speaker init failed", TH.alert);
+        return false;
+    }
+
+    uint32_t playbackRate = ((uint32_t)sampleRate * (uint32_t)AUDIO_RECORD_PLAYBACK_SPEED_PERCENT) / 100U;
+    if (playbackRate < 8000U) playbackRate = 8000U;
+    if (playbackRate > 48000U) playbackRate = 48000U;
+    i2s_set_clk(I2S_NUM_0, playbackRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+
+    if (soundRecorderPlayBtnLbl) lv_label_set_text(soundRecorderPlayBtnLbl, LV_SYMBOL_STOP "  Playing");
+    char status[80];
+    snprintf(status, sizeof(status), LV_SYMBOL_PLAY "  %s", name ? name : "Playing file");
+    soundRecorderSetStatus(status, TH.warn);
+
+    const size_t framesPerChunk = 128;
+    int16_t mono[framesPerChunk];
+    int16_t stereo[framesPerChunk * 2];
+    uint8_t volumePct = AUDIO_RECORD_PLAYBACK_VOLUME_PERCENT;
+    if (volumePct > 100) volumePct = 100;
+
+    uint32_t remaining = dataBytes;
+    while (remaining > 0) {
+        size_t want = sizeof(mono);
+        if (want > remaining) want = remaining;
+        size_t got = f.read((uint8_t *)mono, want);
+        if (got == 0) break;
+        remaining -= got;
+
+        size_t frames = got / sizeof(int16_t);
+        for (size_t i = 0; i < frames; i++) {
+            int32_t s = mono[i];
+            s = (s * volumePct) / 100;
+            if (s > 32767) s = 32767;
+            if (s < -32768) s = -32768;
+            stereo[i * 2]     = (int16_t)s;
+            stereo[i * 2 + 1] = (int16_t)s;
+        }
+
+        size_t bytesWritten = 0;
+        i2s_write(I2S_NUM_0, stereo, frames * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
+        lv_timer_handler();
+    }
+
+    f.close();
+    stopSoundDriverAfterChirp();
+    if (soundRecorderPlayBtnLbl) lv_label_set_text(soundRecorderPlayBtnLbl, LV_SYMBOL_PLAY "  Play");
+    soundRecorderSetStatus(LV_SYMBOL_OK "  File done", TH.success);
+    pinMode(ENCODER_BTN, INPUT_PULLUP);
+    return true;
+#else
+    (void)path; (void)name;
+    soundRecorderSetStatus(LV_SYMBOL_WARNING "  SD save disabled", TH.warn);
+    return false;
+#endif
 }
 
 // ─── Minimal ES7210 ADC init for the T-Embed microphone ───────────────
@@ -4319,6 +4977,18 @@ static bool soundRecorderInitInput() {
 static void cb_soundRecorderRecord(lv_event_t *) {
     resetInactivityTimer();
 
+    // If a saved WAV is selected, the center button becomes Delete.
+    // This avoids the popup delete path that was causing reboots on hardware.
+    if (!soundRecorderRecording && soundRecorderSelectedPath[0]) {
+        if (soundRecorderDeleteSelectedFile()) {
+            soundRecorderRefreshFileList();
+            if (soundRecorderRecordBtnLbl) lv_label_set_text(soundRecorderRecordBtnLbl, LV_SYMBOL_AUDIO "  Record");
+            if (soundRecorderPlayBtnLbl)   lv_label_set_text(soundRecorderPlayBtnLbl, LV_SYMBOL_PLAY "  Play");
+            soundRecorderSetFilesText("Deleted. List refreshed.");
+        }
+        return;
+    }
+
     // Debounce/restart guard after a manual Stop press.
     // The recorder loop polls the physical encoder button while LVGL is busy.
     // Without this guard, the same release/click can be delivered after the
@@ -4441,18 +5111,38 @@ static void cb_soundRecorderRecord(lv_event_t *) {
 
     if (stoppedManually) {
         soundRecorderUpdateInfo();
-        soundRecorderSetStatus(LV_SYMBOL_OK "  Stopped", TH.success);
+        if (soundRecorderSamples > 0) {
+            bool savedToSD = soundRecorderSaveToSD();
+            if (!savedToSD) {
+                soundRecorderSetStatus(LV_SYMBOL_OK "  Stopped RAM", TH.success);
+            }
+            soundRecorderRefreshFileList();
+        } else {
+            soundRecorderSetStatus(LV_SYMBOL_OK "  Stopped", TH.success);
+        }
     } else {
         soundRecorderUpdateInfo();
-        soundRecorderSetStatus(usingShortBuffer ? LV_SYMBOL_OK "  Short save" : LV_SYMBOL_OK "  Saved RAM", TH.success);
+        bool savedToSD = soundRecorderSaveToSD();
+        if (!savedToSD) {
+            soundRecorderSetStatus(usingShortBuffer ? LV_SYMBOL_OK "  Short RAM" : LV_SYMBOL_OK "  Saved RAM", TH.success);
+        }
+        soundRecorderRefreshFileList();
     }
     pinMode(ENCODER_BTN, INPUT_PULLUP);
 }
 
 static void cb_soundRecorderPlay(lv_event_t *) {
     resetInactivityTimer();
+
+    // If a recording in the right-side browser is selected, the bottom Play
+    // button plays that file. Otherwise it falls back to the most recent RAM clip.
+    if (soundRecorderSelectedPath[0]) {
+        soundRecorderPlayWavFile(soundRecorderSelectedPath, soundRecorderSelectedName);
+        return;
+    }
+
     if (!soundRecorderBuffer || soundRecorderSamples == 0) {
-        soundRecorderSetStatus(LV_SYMBOL_WARNING "  Nothing recorded yet", TH.warn);
+        soundRecorderSetStatus(LV_SYMBOL_WARNING "  Select file or record", TH.warn);
         return;
     }
 
@@ -4582,6 +5272,12 @@ void createSoundRecorder() {
     soundRecorderPlayBtn = nullptr;
     soundRecorderRecordBtnLbl = nullptr;
     soundRecorderPlayBtnLbl = nullptr;
+    soundRecorderFilesList = nullptr;
+    soundRecorderFileMenuScreen = nullptr;
+    soundRecorderRecordPanel = nullptr;
+    soundRecorderSelectedFile = -1;
+    soundRecorderSelectedPath[0] = '\0';
+    soundRecorderSelectedName[0] = '\0';
 
     if (audioToolScreen) { lv_obj_delete(audioToolScreen); audioToolScreen = nullptr; }
     audioToolScreen = lv_obj_create(nullptr);
@@ -4598,6 +5294,7 @@ void createSoundRecorder() {
     const int rightX = leftX + panelW + panelGap;
 
     lv_obj_t *recordPanel = lv_obj_create(audioToolScreen);
+    soundRecorderRecordPanel = recordPanel;
     lv_obj_set_size(recordPanel, panelW, panelH);
     lv_obj_set_pos(recordPanel, leftX, panelY);
     lv_obj_set_style_bg_color(recordPanel,     lv_color_hex(TH.card), LV_PART_MAIN);
@@ -4669,12 +5366,26 @@ void createSoundRecorder() {
     lv_obj_set_style_text_color(filesTitle, lv_color_hex(TH.accent), LV_PART_MAIN);
     lv_obj_set_pos(filesTitle, 0, 0);
 
-    lv_obj_t *filesInfo = lv_label_create(filesPanel);
-    lv_label_set_text(filesInfo, "File browser\ncoming soon.");
-    lv_label_set_long_mode(filesInfo, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(filesInfo, panelW - 14);
-    lv_obj_set_style_text_color(filesInfo, lv_color_hex(TH.textDim), LV_PART_MAIN);
-    lv_obj_set_pos(filesInfo, 0, 24);
+    soundRecorderFilesList = lv_list_create(filesPanel);
+    // Leave a little more room for the footer/status label so the bottom
+    // status text is not clipped by the recordings panel edge.
+    lv_obj_set_size(soundRecorderFilesList, panelW - 12, panelH - 44);
+    lv_obj_set_pos(soundRecorderFilesList, 0, 22);
+    lv_obj_set_style_bg_opa(soundRecorderFilesList, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(soundRecorderFilesList, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(soundRecorderFilesList, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(soundRecorderFilesList, 3, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(soundRecorderFilesList, lv_color_hex(TH.accent), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(soundRecorderFilesList, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(soundRecorderFilesList, 4, LV_PART_SCROLLBAR);
+
+    soundRecorderFilesInfoLbl = lv_label_create(filesPanel);
+    lv_label_set_text(soundRecorderFilesInfoLbl, "Checking SD...");
+    lv_label_set_long_mode(soundRecorderFilesInfoLbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(soundRecorderFilesInfoLbl, panelW - 14);
+    lv_obj_set_style_text_color(soundRecorderFilesInfoLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    // Lift the footer/status text slightly so the full letters remain visible.
+    lv_obj_set_pos(soundRecorderFilesInfoLbl, 0, panelH - 22);
 
     // Page-specific button row. These do not use createBackBtn() or
     // createActionBtn(), so their size and placement can be tuned here only.
@@ -4731,17 +5442,19 @@ void createSoundRecorder() {
     audioToolGroup = lv_group_create();
 
     // Encoder focus order for this page:
-    // Recorder panel -> Recordings panel -> Back -> Record -> Play.
-    // Adding the two scroll panels to the group lets you move up to them
-    // with the encoder instead of being trapped on the bottom buttons.
+    // Recorder panel -> saved WAV file buttons -> Back -> Record -> Play.
+    // Clicking a saved WAV now opens a Play/Delete action screen.
     lv_group_add_obj(audioToolGroup, recordPanel);
-    lv_group_add_obj(audioToolGroup, filesPanel);
+
+    // Refresh now so the generated file buttons get inserted into the group
+    // before the bottom controls.
+    soundRecorderUpdateInfo();
+    soundRecorderRefreshFileList();
+
     lv_group_add_obj(audioToolGroup, backBtn);
     lv_group_add_obj(audioToolGroup, soundRecorderRecordBtn);
     lv_group_add_obj(audioToolGroup, soundRecorderPlayBtn);
     setGroup(audioToolGroup);
-
-    soundRecorderUpdateInfo();
     setAllLEDs(MENU_COLORS[3].r, MENU_COLORS[3].g, MENU_COLORS[3].b, LED_BRIGHTNESS);
     lv_screen_load_anim(audioToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
@@ -8167,7 +8880,6 @@ void createChannelAnalyzer() {
 }
 
 
-
 // ════════════════════════════════════════════════════════════════
 //  TOOL 4 – PACKET MONITOR
 //
@@ -9799,6 +10511,130 @@ static const char *estimateRavenFW(BLEAdvertisedDevice &dev) {
 }
 
 
+// Smart Charger passive detector helpers.
+// The nRF Connect logs for the test charger showed the name "Smart Charger"
+// and the FFF0 GATT service with FFF1/FFF3 write and FFF4/FFF6/FFF7/FFF8 notify
+// characteristics. This first-pass tool stays passive and only uses advertising data.
+static bool chargerUuidIsMatch(const String &uuidStr) {
+    return uuidStr.equalsIgnoreCase(CHARGER_SERVICE_UUID);
+}
+
+static bool chargerHasServiceUuid(BLEAdvertisedDevice &dev, char *firstUuid, size_t firstUuidLen) {
+    if (firstUuid && firstUuidLen) firstUuid[0] = '\0';
+    if (!dev.haveServiceUUID()) return false;
+
+    int uuidCount = dev.getServiceUUIDCount();
+    for (int i = 0; i < uuidCount; i++) {
+        String uuidStr = String(dev.getServiceUUID(i).toString().c_str());
+        uuidStr.toLowerCase();
+        if (chargerUuidIsMatch(uuidStr)) {
+            if (firstUuid && firstUuidLen) {
+                strncpy(firstUuid, uuidStr.c_str(), firstUuidLen - 1);
+                firstUuid[firstUuidLen - 1] = '\0';
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool chargerNameMatches(BLEAdvertisedDevice &dev) {
+    if (!dev.haveName()) return false;
+    String n = String(dev.getName().c_str());
+    n.toLowerCase();
+
+    for (int i = 0; i < CHARGER_NAME_MATCH_COUNT; i++) {
+        String token = String(CHARGER_NAME_MATCHES[i]);
+        token.toLowerCase();
+        if (token.length() > 0 && n.indexOf(token) >= 0) return true;
+    }
+    return false;
+}
+
+static bool chargerMacPrefixMatches(const String &macStr) {
+    String prefix = String(CHARGER_MAC_PREFIX);
+    prefix.trim();
+    if (prefix.length() == 0) return false;
+
+    String macLower = macStr;
+    String prefixLower = prefix;
+    macLower.toLowerCase();
+    prefixLower.toLowerCase();
+    return macLower.startsWith(prefixLower);
+}
+
+static void chargerManufacturerPreview(BLEAdvertisedDevice &dev, char *out, size_t outLen) {
+    if (!out || outLen == 0) return;
+    out[0] = '\0';
+
+    if (!dev.haveManufacturerData()) {
+        strncpy(out, "none", outLen - 1);
+        out[outLen - 1] = '\0';
+        return;
+    }
+
+    std::string m = dev.getManufacturerData();
+    size_t maxBytes = m.length();
+    if (maxBytes > 8) maxBytes = 8;
+
+    char tmp[4];
+    for (size_t i = 0; i < maxBytes; i++) {
+        snprintf(tmp, sizeof(tmp), "%02X", (uint8_t)m[i]);
+        strncat(out, tmp, outLen - strlen(out) - 1);
+        if (i + 1 < maxBytes) strncat(out, "-", outLen - strlen(out) - 1);
+    }
+
+    if (m.length() > maxBytes) {
+        strncat(out, "...", outLen - strlen(out) - 1);
+    }
+}
+
+static bool detectSmartCharger(BLEAdvertisedDevice &dev, char *method, size_t methodLen,
+                               char *advUuid, size_t advUuidLen, uint8_t *confidence) {
+    if (method && methodLen) method[0] = '\0';
+    if (advUuid && advUuidLen) advUuid[0] = '\0';
+    if (confidence) *confidence = 0;
+
+    String macStr = dev.getAddress().toString().c_str();
+    bool nameHit = chargerNameMatches(dev);
+    bool uuidHit = chargerHasServiceUuid(dev, advUuid, advUuidLen);
+    bool macHit  = chargerMacPrefixMatches(macStr);
+
+    if (!nameHit && !uuidHit && !macHit) return false;
+
+    const char *m = "Unknown";
+    uint8_t conf = 1;
+    if (nameHit && uuidHit) {
+        m = "Name+UUID";
+        conf = 3;
+    } else if (nameHit && macHit) {
+        m = "Name+MAC";
+        conf = 3;
+    } else if (uuidHit) {
+        m = "FFF0 UUID";
+        conf = 2;
+    } else if (nameHit) {
+        m = "Name";
+        conf = 2;
+    } else if (macHit) {
+        m = "MAC Prefix";
+        conf = 1;
+    }
+
+    if (method && methodLen) {
+        strncpy(method, m, methodLen - 1);
+        method[methodLen - 1] = '\0';
+    }
+    if (confidence) *confidence = conf;
+    return true;
+}
+
+static const char *chargerConfidenceLabel(uint8_t c) {
+    if (c >= 3) return "High";
+    if (c == 2) return "Medium";
+    return "Low";
+}
+
 static void parseNyanBoxManufacturer(BLEAdvertisedDevice &dev, uint16_t &level, char *version, size_t versionLen) {
     level = 0;
     if (version && versionLen) {
@@ -10875,7 +11711,6 @@ void createFlockDetector() {
 }
 
 
-
 // ════════════════════════════════════════════════════════════════
 //  FLOCK HYBRID SCANNER — BLE phase + WiFi phase, merged list
 // ════════════════════════════════════════════════════════════════
@@ -11428,6 +12263,7 @@ static const char *BLE_TOOL_LABELS[] = {
     LV_SYMBOL_BLUETOOTH "  nyanBOX Detector",
     LV_SYMBOL_BLUETOOTH "  Axon Detector",
     LV_SYMBOL_BLUETOOTH "  Raven Detector",
+    LV_SYMBOL_BLUETOOTH "  Smart Charger",
     LV_SYMBOL_BLUETOOTH "  Tesla Detector",
     LV_SYMBOL_WARNING   "  Skimmer Detector",
     LV_SYMBOL_EYE_OPEN  "  Meta Detector"
@@ -11449,10 +12285,11 @@ static void cb_bleToolSelected(lv_event_t *e) {
         case 2: createFlipperScanner();  break;
         case 3: createNyanBoxDetector(); break;
         case 4: createAxonDetector();    break;
-        case 5: createRavenDetector();   break;
-        case 6: createTeslaDetector();   break;
-        case 7: createSkimmerScanner();  break;
-        case 8: createMetaDetector();    break;
+        case 5: createRavenDetector();          break;
+        case 6: createSmartChargerMonitor();    break;
+        case 7: createTeslaDetector();          break;
+        case 8: createSkimmerScanner();         break;
+        case 9: createMetaDetector();           break;
     }
 }
 
@@ -11727,7 +12564,9 @@ void createBLEDetail(int idx) {
 
     deleteGroup(&bleDetailGroup);
     bleDetailGroup = lv_group_create();
+    lv_group_add_obj(bleDetailGroup, card);
     lv_group_add_obj(bleDetailGroup, backBtn);
+    lv_group_focus_obj(card);
     setGroup(bleDetailGroup);
 
     lv_screen_load_anim(bleDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
@@ -12534,7 +13373,6 @@ void createAxonLocate(int idx) {
 }
 
 
-
 // ════════════════════════════════════════════════════════════════
 //  BLE TOOL – RAVEN DETECTOR
 //
@@ -12833,6 +13671,328 @@ void createRavenDetail(int idx) {
     bleDetailGroup = lv_group_create();
     lv_group_add_obj(bleDetailGroup, backBtn);
     setGroup(bleDetailGroup);
+
+    lv_screen_load_anim(bleDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+
+// ════════════════════════════════════════════════════════════════
+//  BLE TOOL – SMART CHARGER MONITOR
+//
+//  First-pass passive scanner for BLE smart car USB/cigarette-lighter chargers.
+//  It matches "Smart Charger", optional MAC prefix, and the FFF0 service UUID
+//  when the charger advertises it. No BLE connection or writes are performed.
+// ════════════════════════════════════════════════════════════════
+static lv_obj_t *chargerStatusLbl = nullptr;
+static lv_obj_t *chargerList      = nullptr;
+static lv_obj_t *chargerBackBtn   = nullptr;
+static lv_obj_t *chargerScanBtn   = nullptr;
+
+static const char *chargerSignalQuality(int8_t rssi) {
+    if (rssi >= -50) return "EXCELLENT";
+    if (rssi >= -60) return "VERY GOOD";
+    if (rssi >= -70) return "GOOD";
+    if (rssi >= -80) return "FAIR";
+    return "WEAK";
+}
+
+static int findChargerByMac(const char *mac) {
+    for (int i = 0; i < chargerEntryCount; i++) {
+        if (strcmp(chargerEntries[i].mac, mac) == 0) return i;
+    }
+    return -1;
+}
+
+static void sortChargersByRSSI() {
+    for (int i = 0; i < chargerEntryCount - 1; i++) {
+        for (int j = 0; j < chargerEntryCount - 1 - i; j++) {
+            if (chargerEntries[j].rssi < chargerEntries[j + 1].rssi) {
+                SmartChargerEntry tmp = chargerEntries[j];
+                chargerEntries[j] = chargerEntries[j + 1];
+                chargerEntries[j + 1] = tmp;
+            }
+        }
+    }
+}
+
+static void upsertSmartCharger(BLEAdvertisedDevice &dev) {
+    String macStr = dev.getAddress().toString().c_str();
+    int idx = findChargerByMac(macStr.c_str());
+
+    if (idx < 0) {
+        if (chargerEntryCount >= MAX_CHARGER_RESULTS) return;
+        idx = chargerEntryCount++;
+        memset(&chargerEntries[idx], 0, sizeof(SmartChargerEntry));
+        strncpy(chargerEntries[idx].mac, macStr.c_str(), sizeof(chargerEntries[idx].mac) - 1);
+        strncpy(chargerEntries[idx].name, "Smart Charger", sizeof(chargerEntries[idx].name) - 1);
+    }
+
+    String nm = dev.haveName() ? dev.getName().c_str() : "Smart Charger";
+    strncpy(chargerEntries[idx].name, nm.c_str(), sizeof(chargerEntries[idx].name) - 1);
+    chargerEntries[idx].name[sizeof(chargerEntries[idx].name) - 1] = '\0';
+
+    char method[24];
+    char advUuid[41];
+    uint8_t conf = 0;
+    detectSmartCharger(dev, method, sizeof(method), advUuid, sizeof(advUuid), &conf);
+
+    strncpy(chargerEntries[idx].matchMethod, method[0] ? method : "Unknown",
+            sizeof(chargerEntries[idx].matchMethod) - 1);
+    chargerEntries[idx].matchMethod[sizeof(chargerEntries[idx].matchMethod) - 1] = '\0';
+
+    strncpy(chargerEntries[idx].advUuid, advUuid[0] ? advUuid : "not advertised",
+            sizeof(chargerEntries[idx].advUuid) - 1);
+    chargerEntries[idx].advUuid[sizeof(chargerEntries[idx].advUuid) - 1] = '\0';
+
+    chargerManufacturerPreview(dev, chargerEntries[idx].mfgPreview,
+                               sizeof(chargerEntries[idx].mfgPreview));
+
+    chargerEntries[idx].confidence = conf;
+    chargerEntries[idx].rssi = (int8_t)dev.getRSSI();
+    chargerEntries[idx].lastSeen = millis();
+}
+
+static int doSmartChargerScan(int durationSec) {
+    ensureBLEInit();
+    WiFi.disconnect();
+    delay(50);
+
+    BLEScan *pScan = BLEDevice::getScan();
+    pScan->setActiveScan(true);
+    pScan->setInterval(150);
+    pScan->setWindow(140);
+
+    BLEScanResults results = pScan->start(durationSec, false);
+    int total = results.getCount();
+
+    chargerEntryCount = 0;
+    memset(chargerEntries, 0, sizeof(chargerEntries));
+
+    for (int i = 0; i < total && chargerEntryCount < MAX_CHARGER_RESULTS; i++) {
+        BLEAdvertisedDevice dev = results.getDevice(i);
+        char method[24];
+        char advUuid[41];
+        uint8_t conf = 0;
+        if (detectSmartCharger(dev, method, sizeof(method), advUuid, sizeof(advUuid), &conf)) {
+            upsertSmartCharger(dev);
+        }
+    }
+
+    pScan->clearResults();
+    sortChargersByRSSI();
+    return chargerEntryCount;
+}
+
+static void rebuildSmartChargerList() {
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    if (chargerBackBtn) lv_group_add_obj(bleToolGroup, chargerBackBtn);
+    if (chargerScanBtn) lv_group_add_obj(bleToolGroup, chargerScanBtn);
+    setGroup(bleToolGroup);
+
+    lv_obj_clean(chargerList);
+    if (chargerEntryCount == 0) {
+        lv_obj_t *empty = lv_list_add_text(chargerList, "No smart charger matches found yet");
+        if (empty) lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
+        return;
+    }
+
+    for (int i = 0; i < chargerEntryCount; i++) {
+        char row[112];
+        snprintf(row, sizeof(row), "%s  %ddBm  %s",
+                 chargerEntries[i].name,
+                 chargerEntries[i].rssi,
+                 chargerConfidenceLabel(chargerEntries[i].confidence));
+
+        lv_obj_t *btn = lv_list_add_btn(chargerList, nullptr, row);
+        styleListBtn(btn);
+        lv_obj_set_style_text_color(btn, bleRssiColor(chargerEntries[i].rssi),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            createSmartChargerDetail((int)(intptr_t)lv_event_get_user_data(ev));
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_group_add_obj(bleToolGroup, btn);
+
+#if CHARGER_SHOW_FULL_MAC
+        char sub[88];
+        snprintf(sub, sizeof(sub), "%s  Match:%s",
+                 chargerEntries[i].mac,
+                 chargerEntries[i].matchMethod);
+        lv_obj_t *macTxt = lv_list_add_text(chargerList, sub);
+        if (macTxt) lv_obj_set_style_text_color(macTxt, lv_color_hex(TH.textDim), LV_PART_MAIN);
+#endif
+    }
+
+    setGroup(bleToolGroup);
+}
+
+static void cb_doSmartChargerScan(lv_event_t *e) {
+    char msg[56];
+    snprintf(msg, sizeof(msg), LV_SYMBOL_REFRESH "  Scanning %ds...", CHARGER_SCAN_SECS);
+    lv_label_set_text(chargerStatusLbl, msg);
+    lv_obj_set_style_text_color(chargerStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
+    lv_obj_clean(chargerList);
+    lv_timer_handler();
+
+    startLEDSpinner(80, 80, 255);
+    int found = doSmartChargerScan(CHARGER_SCAN_SECS);
+    stopLEDSpinner(MENU_COLORS[1].r, MENU_COLORS[1].g, MENU_COLORS[1].b);
+
+    if (found == 0) {
+        lv_label_set_text(chargerStatusLbl, LV_SYMBOL_OK "  No smart charger matches detected");
+        lv_obj_set_style_text_color(chargerStatusLbl, lv_color_hex(TH.success), LV_PART_MAIN);
+    } else {
+        snprintf(msg, sizeof(msg), LV_SYMBOL_BLUETOOTH "  %d smart charger match%s found",
+                 found, found == 1 ? "" : "es");
+        lv_label_set_text(chargerStatusLbl, msg);
+        lv_obj_set_style_text_color(chargerStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+        playBLESuspiciousChirp();
+    }
+
+    rebuildSmartChargerList();
+}
+
+void createSmartChargerMonitor() {
+    chargerStatusLbl = nullptr;
+    chargerList      = nullptr;
+    chargerBackBtn   = nullptr;
+    chargerScanBtn   = nullptr;
+
+    if (bleToolScreen) { lv_obj_delete(bleToolScreen); bleToolScreen = nullptr; }
+    bleToolScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleToolScreen);
+    createHeader(bleToolScreen, LV_SYMBOL_BLUETOOTH "  Smart Charger");
+
+    chargerStatusLbl = lv_label_create(bleToolScreen);
+    lv_label_set_text(chargerStatusLbl,
+                      "Passive scan for Smart Charger / FFF0");
+    lv_obj_set_style_text_color(chargerStatusLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    lv_obj_set_pos(chargerStatusLbl, 8, 30);
+
+    chargerList = lv_list_create(bleToolScreen);
+    lv_obj_set_size(chargerList, SCREEN_W, SCREEN_H - 80);
+    lv_obj_set_pos(chargerList, 0, 48);
+    lv_obj_set_style_bg_color(chargerList,     lv_color_hex(TH.bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(chargerList,       LV_OPA_COVER,        LV_PART_MAIN);
+    lv_obj_set_style_border_width(chargerList, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(chargerList,      2, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(chargerList,      2, LV_PART_MAIN);
+
+    lv_obj_t *empty = lv_list_add_text(chargerList, "Ready to scan for smart charger advertisements");
+    if (empty) lv_obj_set_style_text_color(empty, lv_color_hex(TH.textDim), LV_PART_MAIN);
+
+    chargerBackBtn = createBackBtn(bleToolScreen, cb_bleToolBack);
+    chargerScanBtn = createActionBtn(bleToolScreen,
+                                     LV_SYMBOL_REFRESH "  Scan",
+                                     cb_doSmartChargerScan);
+
+    deleteGroup(&bleToolGroup);
+    bleToolGroup = lv_group_create();
+    lv_group_add_obj(bleToolGroup, chargerBackBtn);
+    lv_group_add_obj(bleToolGroup, chargerScanBtn);
+    setGroup(bleToolGroup);
+
+    if (chargerEntryCount > 0) {
+        char msg[60];
+        snprintf(msg, sizeof(msg), LV_SYMBOL_BLUETOOTH "  %d saved charger result%s",
+                 chargerEntryCount, chargerEntryCount == 1 ? "" : "s");
+        lv_label_set_text(chargerStatusLbl, msg);
+        lv_obj_set_style_text_color(chargerStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
+        rebuildSmartChargerList();
+    }
+
+    setAllLEDs(80, 80, 255, LED_BRIGHTNESS);
+    lv_screen_load_anim(bleToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
+static void cb_smartChargerDetailBack(lv_event_t *e) {
+    cb_bleDetailBack(e);
+}
+
+void createSmartChargerDetail(int idx) {
+    if (idx < 0 || idx >= chargerEntryCount) return;
+
+    if (bleDetailScreen) { lv_obj_delete(bleDetailScreen); bleDetailScreen = nullptr; }
+    bleDetailScreen = lv_obj_create(nullptr);
+    applyScreenStyle(bleDetailScreen);
+    createHeader(bleDetailScreen, LV_SYMBOL_BLUETOOTH "  Charger Detail");
+
+    lv_obj_t *card = lv_obj_create(bleDetailScreen);
+    lv_obj_set_size(card, SCREEN_W - 12, SCREEN_H - 28 - 14 - 34);
+    lv_obj_set_pos(card, 6, 30);
+    lv_obj_set_style_bg_color(card,      lv_color_hex(TH.card), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card,        LV_OPA_COVER,          LV_PART_MAIN);
+    lv_obj_set_style_border_color(card,  lv_color_hex(TH.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card,  1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card,        6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card,       6, LV_PART_MAIN);
+
+    // Smart Charger details can run taller than the compact 320x170 screen,
+    // so keep this card vertically scrollable and focusable by the encoder.
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_border_color(card, lv_color_hex(TH.accent), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(card, 2, LV_PART_MAIN | LV_STATE_FOCUSED);
+
+    uint32_t ageSec = (millis() - chargerEntries[idx].lastSeen) / 1000;
+
+    char info[520];
+    snprintf(info, sizeof(info),
+             "Smart Charger BLE Match\n"
+             "Name : %s\n"
+             "MAC  : %s\n"
+             "RSSI : %d dBm (%s)\n"
+             "Conf : %s\n"
+             "Match: %s\n"
+             "Svc  : %s\n"
+             "MFR  : %s\n"
+             "Age  : %lus\n\n"
+             "Known GATT from nRF logs:\n"
+             "FFF0 service\n"
+             "FFF1 Write | FFF3 WNR\n"
+             "FFF4/FFF6/FFF7/FFF8 Notify\n\n"
+             "Mode : passive scan only",
+             chargerEntries[idx].name,
+             chargerEntries[idx].mac,
+             chargerEntries[idx].rssi,
+             chargerSignalQuality(chargerEntries[idx].rssi),
+             chargerConfidenceLabel(chargerEntries[idx].confidence),
+             chargerEntries[idx].matchMethod,
+             chargerEntries[idx].advUuid,
+             chargerEntries[idx].mfgPreview,
+             (unsigned long)ageSec);
+
+    lv_obj_t *infoLbl = lv_label_create(card);
+    lv_label_set_text(infoLbl, info);
+    lv_label_set_long_mode(infoLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(infoLbl, SCREEN_W - 28);
+    lv_obj_set_style_text_color(infoLbl, lv_color_hex(TH.text), LV_PART_MAIN);
+    lv_obj_align(infoLbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *bar = lv_bar_create(bleDetailScreen);
+    lv_obj_set_size(bar, SCREEN_W - 12, 5);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
+    lv_bar_set_range(bar, -100, -30);
+    lv_bar_set_value(bar, chargerEntries[idx].rssi, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, bleRssiColor(chargerEntries[idx].rssi), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
+
+    lv_obj_t *backBtn = createBackBtn(bleDetailScreen, cb_smartChargerDetailBack);
+
+    deleteGroup(&bleDetailGroup);
+    bleDetailGroup = lv_group_create();
+
+    // Focus the scrollable info card first so the encoder scrolls Charger Detail.
+    // Back remains the next encoder item. This matches the other scrollable
+    // detail pages and gives the card its focused border/highlight.
+    lv_group_add_obj(bleDetailGroup, card);
+    lv_group_add_obj(bleDetailGroup, backBtn);
+    setGroup(bleDetailGroup);
+    lv_group_focus_obj(card);
 
     lv_screen_load_anim(bleDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
@@ -13330,6 +14490,7 @@ static void deleteIfInactiveScreen(lv_obj_t *&scr, lv_obj_t *activeScr) {
 }
 
 static void cleanupForAutoReturnHome(lv_obj_t *activeScr) {
+
     // Stop any WiFi promiscuous tools cleanly before jumping home.
     if (deauthActive || pwnActive || flockActive || hybridWifiActive || packetMonitorActive) {
         deauthActive = false;
